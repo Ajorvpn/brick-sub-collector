@@ -1,0 +1,55 @@
+name: Update subscription
+
+on:
+  schedule:
+    # Run every 12 hours.
+    - cron: "0 */12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run collector
+        run: python collector.py
+
+      - name: Check for active nodes
+        id: check
+        run: |
+          if [ -s sub/proxies.txt ]; then
+            echo "has_content=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_content=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push to subscription branch
+        if: steps.check.outputs.has_content == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Start a fresh orphan branch so history never bloats.
+          git branch -D sub 2>/dev/null || true
+          git checkout --orphan sub
+
+          # Keep only the generated subscription files.
+          git rm -rf --cached .
+          git add sub/proxies.txt sub/base64.txt
+          git commit -m "Update subscription proxies [skip ci]"
+
+          # Force push to keep the branch clean and the repo small.
+          git push origin sub --force
