@@ -300,5 +300,113 @@ class TestExtractLinks(unittest.TestCase):
         self.assertEqual(collector.extract_links(""), [])
 
 
+class TestEndToEndPipeline(unittest.IsolatedAsyncioTestCase):
+    """End-to-end pipeline test: parse → dedup → probe → GeoIP → rename.
+
+    Uses mocks for all network I/O to verify no AttributeError can occur
+    between pipeline stages.
+    """
+
+    async def test_full_pipeline_end_to_end(self):
+        # --- Build a set of real NodeInfo objects via parse_node_info ---
+        links = [
+            "vless://uuid@1.1.1.1:443?security=tls#remark",
+            "trojan://pass@2.2.2.2:443#remark",
+            "ss://aes-256-gcm:pw@3.3.3.3:8388#remark",
+            "vless://uuid@1.1.1.1:443?security=tls#dup",  # same IP:Port as first
+            "vless://uuid@4.4.4.4:443?security=none#remark",
+        ]
+        nodes = []
+        seen_keys = set()
+        for link in links:
+            node = collector.parse_node_info(link)
+            self.assertIsNotNone(node, f"Failed to parse {link}")
+            k = node.key
+            if k in seen_keys:
+                continue
+            seen_keys.add(k)
+            nodes.append(node)
+        self.assertEqual(len(nodes), 4)  # 5 links, 1 duplicate removed
+
+        # --- Stage: resolve_and_dedup_nodes ---
+        # Mock DNS resolution to return public IPs
+        async def fake_resolve(host):
+            ip_map = {
+                "1.1.1.1": "1.1.1.1",
+                "2.2.2.2": "2.2.2.2",
+                "3.3.3.3": "3.3.3.3",
+                "4.4.4.4": "4.4.4.4",
+            }
+            return ip_map.get(host, host)
+
+        with mock.patch.object(collector, "resolve_hostname", side_effect=fake_resolve):
+            resolved = await collector.resolve_and_dedup_nodes(nodes)
+        self.assertEqual(len(resolved), 4)
+        for n in resolved:
+            self.assertIsNotNone(n.resolved_ip, f"resolved_ip missing for {n.host}")
+            self.assertIsNotNone(n.ip_key, f"ip_key missing for {n.host}")
+
+        # --- Stage: verify_node_stability ---
+        # Mock _single_probe to return True (all nodes pass)
+        with mock.patch.object(collector, "_single_probe", return_value=True):
+            for n in resolved:
+                result = await collector.verify_node_stability(n)
+                self.assertIsNotNone(result, f"stability check failed for {n.host}")
+                self.assertIsNotNone(n.quality_score)
+
+        passed = [n for n in resolved if n.quality_score is not None]
+        self.assertEqual(len(passed), 4)
+
+        # Sort by quality score (stable sort preserves insertion order for ties)
+        passed.sort(key=lambda n: (n.quality_score or float("inf")))
+
+        # --- Stage: filter_by_geoip ---
+        # Mock _batch_geoip_with_retry to return DE for all IPs
+        async def fake_batch_geoip(session, ips):
+            return {ip: "DE" for ip in ips}
+
+        with mock.patch.object(
+            collector, "_batch_geoip_with_retry", side_effect=fake_batch_geoip
+        ):
+            # filter_by_geoip only uses session for _batch_geoip_with_retry (mocked),
+            # so a dummy object suffices.
+            class _DummySession:
+                pass
+
+            allowed = await collector.filter_by_geoip(_DummySession(), passed)
+        # filter_by_geoip sets country_code directly on nodes
+        allowed_direct = [
+            n for n in allowed if n.country_code in collector.ALLOWED_COUNTRIES
+        ]
+        self.assertEqual(len(allowed_direct), 4)
+
+        # --- Stage: rename_node ---
+        for idx, n in enumerate(allowed_direct[:5], start=1):
+            link = collector.rename_node(n, "DE", idx)
+            self.assertIsNotNone(link)
+            self.assertIn("🇩🇪 Germany", link)
+            self.assertIn("| BrickVPN", link)
+
+        # --- Verify no AttributeError on ip_key anywhere ---
+        for n in allowed_direct:
+            _ = n.ip_key  # must not raise
+            _ = n.resolved_ip  # must not raise
+
+    def test_ip_key_property(self):
+        """Verify ip_key property exists and works on NodeInfo."""
+        node = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443,
+            tls_enabled=False, network="tcp", resolved_ip="1.1.1.1",
+        )
+        self.assertEqual(node.ip_key, "1.1.1.1:443")
+
+        # When resolved_ip is None, fall back to host
+        node2 = collector.NodeInfo(
+            protocol="vless", host="example.com", port=8080,
+            tls_enabled=False, network="tcp", resolved_ip=None,
+        )
+        self.assertEqual(node2.ip_key, "example.com:8080")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -118,6 +119,10 @@ class NodeInfo:
     @property
     def key(self) -> Tuple[str, int]:
         return (self.host.lower(), self.port)
+
+    @property
+    def ip_key(self) -> str:
+        return f"{self.resolved_ip or self.host}:{self.port}"
 
 
 # ---------------------------------------------------------------------------
@@ -355,32 +360,44 @@ async def batch_geoip(
 async def filter_by_geoip(
     session: aiohttp.ClientSession, nodes: List[NodeInfo]
 ) -> List[NodeInfo]:
-    sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+    """Filter nodes by GeoIP (country code).
 
-    async def _resolve(node: NodeInfo) -> None:
-        async with sem:
-            ip = await resolve_hostname(node.host)
-            node.resolved_ip = ip
-
-    await asyncio.gather(*(_resolve(n) for n in nodes))
-
-    resolved = [n for n in nodes if n.resolved_ip]
-
-    seen_ips: Set[Tuple[Optional[str], int]] = set()
+    Nodes must already have resolved_ip set. Deduplicates by (resolved_ip, port),
+    queries ip-api.com in batches of 100 with polite delays between batches,
+    and handles HTTP 429 / non-200 responses gracefully without raising.
+    """
+    # Deduplicate by (resolved_ip, port)
+    seen_ips: Set[str] = set()
     unique: List[NodeInfo] = []
-    for n in resolved:
+    for n in nodes:
+        if not n.resolved_ip:
+            continue
         k = n.ip_key
         if k in seen_ips:
             continue
         seen_ips.add(k)
         unique.append(n)
 
-    all_ips = [n.resolved_ip for n in unique if n.resolved_ip]
+    # Deduplicate IP list so each unique IP is queried only once
+    unique_ips: List[str] = []
+    seen_unique_ips: Set[str] = set()
+    for n in unique:
+        if n.resolved_ip not in seen_unique_ips:
+            seen_unique_ips.add(n.resolved_ip)
+            unique_ips.append(n.resolved_ip)
+
+    # Batch GeoIP with polite delays and 429 handling
     ip_to_country: Dict[str, Optional[str]] = {}
-    for i in range(0, len(all_ips), GEOIP_CHUNK):
-        chunk = all_ips[i : i + GEOIP_CHUNK]
-        part = await batch_geoip(session, chunk)
+    GEOIP_BATCH_DELAY = 1.5  # seconds between batches
+
+    for i in range(0, len(unique_ips), GEOIP_CHUNK):
+        chunk = unique_ips[i : i + GEOIP_CHUNK]
+        part = await _batch_geoip_with_retry(session, chunk)
         ip_to_country.update(part)
+
+        # Polite delay between batches to respect rate limits
+        if i + GEOIP_CHUNK < len(unique_ips):
+            await asyncio.sleep(GEOIP_BATCH_DELAY)
 
     allowed: List[NodeInfo] = []
     for n in unique:
@@ -393,10 +410,99 @@ async def filter_by_geoip(
             n.error = f"blocked country {cc or 'unknown'}"
     return allowed
 
-    @property
-    def ip_key(self) -> Tuple[Optional[str], int]:
-        return (self.resolved_ip, self.port)
 
+async def _batch_geoip_with_retry(
+    session: aiohttp.ClientSession, ips: List[str], max_retries: int = 1
+) -> Dict[str, Optional[str]]:
+    """Query ip-api.com/batch with one retry on 429 or failure."""
+    result: Dict[str, Optional[str]] = {ip: None for ip in ips}
+    if not ips:
+        return result
+
+    payload = [{"query": ip, "fields": "status,countryCode,query"} for ip in ips]
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.post(
+                "http://ip-api.com/batch",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=20.0),
+            ) as resp:
+                if resp.status == 429:
+                    # Rate limited: wait and retry once
+                    await asyncio.sleep(3.0)
+                    continue
+                if resp.status != 200:
+                    return result
+                data = await resp.json(content_type=None)
+        except Exception:
+            return result
+
+        if isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, dict):
+                    q = entry.get("query")
+                    status = entry.get("status")
+                    cc = entry.get("countryCode")
+                    if q and status == "success":
+                        result[q] = cc
+                    elif q:
+                        result[q] = None
+        for ip in ips:
+            result.setdefault(ip, None)
+        return result
+
+    return result
+
+
+async def resolve_and_dedup_nodes(nodes: List[NodeInfo]) -> List[NodeInfo]:
+    """Resolve hostnames to IPs and deduplicate by (resolved_ip, port).
+
+    Drops private/loopback/unresolvable hosts. Sets node.resolved_ip
+    on each surviving node.
+    """
+    sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+
+    async def _resolve(node: NodeInfo) -> None:
+        async with sem:
+            ip = await resolve_hostname(node.host)
+            node.resolved_ip = ip
+
+    await asyncio.gather(*(_resolve(n) for n in nodes))
+
+    # Drop nodes that failed to resolve
+    resolved = [n for n in nodes if n.resolved_ip]
+
+    # Drop private/loopback IPs
+    public = []
+    for n in resolved:
+        ip = n.resolved_ip
+        if ip and _is_public_ip(ip):
+            public.append(n)
+
+    # Deduplicate by (resolved_ip, port)
+    seen_ips: Set[str] = set()
+    unique: List[NodeInfo] = []
+    for n in public:
+        k = n.ip_key
+        if k in seen_ips:
+            continue
+        seen_ips.add(k)
+        unique.append(n)
+
+    return unique
+
+
+def _is_public_ip(ip: str) -> bool:
+    """Return True if *ip* is a public IPv4/IPv6 address (not private/loopback)."""
+    try:
+        addr = ipaddress.ip_address(ip)
+        return not (addr.is_private or addr.is_loopback or addr.is_reserved or addr.is_unspecified)
+    except ValueError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Dual-probe stability & real handshake test
 
 
 
@@ -736,6 +842,19 @@ def load_sources() -> List[str]:
 
 
 async def main() -> int:
+    try:
+        return await _main_impl()
+    except Exception as exc:
+        print(f"[fatal] Unexpected error: {exc}", file=sys.stderr)
+        # Still write empty outputs so the workflow doesn't break downstream
+        try:
+            write_all_outputs({}, {}, [])
+        except Exception:
+            pass
+        return 0
+
+
+async def _main_impl() -> int:
     urls = load_sources()
     if not urls:
         print("[info] No source URLs found in sources.txt.")
@@ -771,25 +890,30 @@ async def main() -> int:
 
     print(f"[info] After parse + dedup: {len(parsed)} node(s)")
 
-    # --- Stage 3: DNS + GeoIP filter --------------------------------------
+    # --- Stage 3: DNS resolution + IP:Port deduplication ------------------
+    parsed = await resolve_and_dedup_nodes(parsed)
+    print(f"[info] After DNS + IP:Port dedup: {len(parsed)} node(s)")
+
+    # --- Stage 4: Dual-probe stability (BEFORE GeoIP to save rate limits) -
     connector = aiohttp.TCPConnector(limit_per_host=10)
     async with aiohttp.ClientSession(connector=connector) as session:
-        allowed = await filter_by_geoip(session, parsed)
-    print(f"[info] After GeoIP (allowed countries): {len(allowed)} node(s)")
+        sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
-    # --- Stage 4: Dual-probe stability ------------------------------------
-    sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+        async def _probe(node: NodeInfo) -> None:
+            async with sem:
+                await verify_node_stability(node)
 
-    async def _probe(node: NodeInfo) -> None:
-        async with sem:
-            await verify_node_stability(node)
+        await asyncio.gather(*(_probe(n) for n in parsed))
 
-    await asyncio.gather(*(_probe(n) for n in allowed))
-
-    passed = [n for n in allowed if n.quality_score is not None]
+    passed = [n for n in parsed if n.quality_score is not None]
     print(f"[info] After dual-probe stability: {len(passed)} node(s)")
 
-    # --- Stage 5: Group by country & sort by quality ----------------------
+    # --- Stage 5: GeoIP filtering (on live nodes only) --------------------
+    async with aiohttp.ClientSession(connector=connector) as session:
+        allowed = await filter_by_geoip(session, passed)
+    print(f"[info] After GeoIP (allowed countries): {len(allowed)} node(s)")
+
+    # --- Stage 6: Group by country & sort by quality ----------------------
     by_country: Dict[str, List[NodeInfo]] = {code: [] for code in ALLOWED_COUNTRIES}
     by_protocol: Dict[str, List[NodeInfo]] = {proto: [] for proto in PROXY_SCHEMES}
 
@@ -805,7 +929,7 @@ async def main() -> int:
     for proto in by_protocol:
         by_protocol[proto].sort(key=lambda n: (n.quality_score or float("inf")))
 
-    # --- Stage 6: Rename nodes --------------------------------------------
+    # --- Stage 7: Rename nodes --------------------------------------------
     for code, nodes in by_country.items():
         for idx, n in enumerate(nodes, start=1):
             rename_node(n, code, idx)
@@ -815,17 +939,17 @@ async def main() -> int:
             cc = n.country_code or "DE"
             rename_node(n, cc, idx)
 
-    # --- Stage 7: Build main subscription (max 5 per country) -------------
+    # --- Stage 8: Build main subscription (max 5 per country) -------------
     main_links: List[str] = []
     for code in sorted(ALLOWED_COUNTRIES.keys()):
         nodes = by_country.get(code, [])
         for n in nodes[:MAIN_QUOTA_PER_COUNTRY]:
             main_links.append(n.renamed_link or n.original_link)
 
-    # --- Stage 8: Write outputs -------------------------------------------
+    # --- Stage 9: Write outputs -------------------------------------------
     report = write_all_outputs(by_country, by_protocol, main_links)
 
-    # --- Stage 9: GitHub Actions annotations + summary --------------------
+    # --- Stage 10: GitHub Actions annotations + summary --------------------
     emit_annotations(report["countries"])
     write_step_summary(report["countries"])
 
