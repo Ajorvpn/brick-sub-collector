@@ -31,17 +31,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python collector.py
       - name: Publish generated files to the subscription branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
+          if [ ! -d "output" ]; then
+            echo "No output directory found. Skipping push."
+            exit 0
+          fi
+          PUBLISH_DIR=/tmp/sub-publish
+          rm -rf "$PUBLISH_DIR"
+          mkdir -p "$PUBLISH_DIR"
+          # Only the generated subscription files ever reach the sub branch:
+          # source files, tests, workflows and caches stay out of the temp repo.
+          cp -a output/. "$PUBLISH_DIR"/
+          cd "$PUBLISH_DIR"
+          git init -q -b sub
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout --orphan sub-temp
-          git rm -rf --cached .
-          if [ -d "output" ]; then
-            cp -r output/* .
-            rm -rf output/
-            git add .
-            git commit -m "Update generated subscriptions"
-            git push --force origin HEAD:sub
-          else
-            echo "No output directory found. Skipping push."
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No generated changes to publish."
+            exit 0
           fi
+          git commit -q -m "Update generated subscriptions"
+          REMOTE_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force "$REMOTE_URL" HEAD:refs/heads/sub

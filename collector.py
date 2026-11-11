@@ -9,8 +9,8 @@ multi-stage strict health pipeline:
 
   1. Deep config parsing (VLESS / VMess / Trojan / SS)
   2. DNS resolution + per-(IP,Port) deduplication
-  3. Batch GeoIP filtering (10 allowed top-tier countries only)
-  4. Dual-probe stability + real TLS/SNI handshake (2.5s timeout x 2)
+  3. Offline MaxMind GeoIP pre-filter (10 allowed countries, ~0.05s per 6k IPs)
+  4. Dual-probe stability: TLS/SNI handshake + active payload/TTFB download
   5. Jitter/latency quality scoring & ranking
   6. Clean node renaming & per-country quota enforcement
 
@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import ipaddress
 import json
 import os
@@ -41,6 +42,7 @@ import socket
 import ssl
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs
@@ -63,14 +65,45 @@ STATUS_FILE = os.path.join(OUTPUT_DIR, "status.json")
 FETCH_TIMEOUT = 15.0
 DNS_TIMEOUT = 5.0
 GEOIP_CHUNK = 100
+GEOIP_BATCH_DELAY = 1.5
+# Upper bound on IPs sent to ip-api.com when the offline .mmdb is usable
+# (the free endpoint allows 15 req/min, i.e. 1,500 IPs per minute).
+GEOIP_API_FALLBACK_LIMIT = 200
 PROBE_TIMEOUT = 2.5
 PROBE_GAP = 0.1
-MAX_CONCURRENT_PROBES = 60
+# Active payload read budget (was 2.5s: silent endpoints burned the whole wait).
+PAYLOAD_READ_TIMEOUT = 0.8
+SS_PROBE_READ_TIMEOUT = 0.4
+MAX_LATENCY_MS = 500
+NON_TLS_PENALTY_MS = 150.0
+MAX_CONCURRENT_PROBES = 240
+MAX_CONCURRENT_DNS = 200
+
+# Offline MaxMind GeoLite2 Country database (free, cached locally).
+CACHE_DIR = ".cache"
+MMDB_CACHE_PATH = os.path.join(CACHE_DIR, "Country.mmdb")
+MMDB_TMP_PATH = os.path.join("/tmp", "Country.mmdb")
+MMDB_MIN_BYTES = 100_000
+MMDB_CANDIDATE_URLS: List[str] = [
+    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
+    "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb",
+    "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/Country.mmdb",
+]
 
 MAIN_QUOTA_PER_COUNTRY = 5
 COUNTRY_FILE_QUOTA = 20
 
 PROXY_SCHEMES = ("vless", "vmess", "trojan", "ss")
+
+# Service/OS ports that must never be probed as proxy endpoints.
+BLOCKED_PORTS: Set[int] = {
+    21, 22, 23, 25, 53, 110, 135, 137, 138, 139, 143, 445,
+    1433, 3306, 3389, 5432, 6379, 27017,
+}
+
+# Non-TLS transports/protocols that must answer the HTTP payload probe.
+HTTP_PROBE_NETWORKS = ("ws", "http", "h2")
+HTTP_PROBE_PROTOCOLS = ("vless", "vmess", "trojan")
 
 PROXY_LINK_RE = re.compile(
     r"(?i)\b(" + "|".join(PROXY_SCHEMES) + r")://[^\s\"'<>()[\]\{\}]+"
@@ -103,6 +136,7 @@ class NodeInfo:
     sni: Optional[str] = None
     network: str = "tcp"
     original_link: str = ""
+    raw_link: str = ""
 
     resolved_ip: Optional[str] = None
     country_code: Optional[str] = None
@@ -121,7 +155,17 @@ class NodeInfo:
         return (self.host.lower(), self.port)
 
     @property
+    def pure_ip(self) -> str:
+        """Raw IP (or hostname) without the port.
+
+        GeoIP lookups MUST use this value: ``ip_key`` contains ``:port`` and
+        therefore matches nothing in an IP-keyed database or batch API.
+        """
+        return self.resolved_ip or self.host
+
+    @property
     def ip_key(self) -> str:
+        """(IP, Port) identity, used ONLY for network-endpoint deduplication."""
         return f"{self.resolved_ip or self.host}:{self.port}"
 
 
@@ -167,14 +211,30 @@ def try_base64_decode(text: str) -> Optional[str]:
         return None
 
 
+_TRAILING_ARTIFACT_CHARS = ".,;:)]}>'\"`"
+
+
+def _clean_link(link: str) -> str:
+    """Unescape HTML entities (``&amp;``) and strip markdown/HTML artifacts.
+
+    Scraped feeds routinely escape ``&`` as ``&amp;``; without unescaping it,
+    ``parse_qs`` yields keys like ``amp;security`` and nodes lose their TLS/SNI
+    classification while emitting broken URIs into the subscription files.
+    """
+    cleaned = html.unescape(html.unescape(link.strip()))
+    cleaned = cleaned.replace("&amp;", "&")
+    return cleaned.rstrip(_TRAILING_ARTIFACT_CHARS)
+
+
 def extract_links(text: str) -> List[str]:
     found: List[str] = []
     decoded = try_base64_decode(text)
     candidates = [decoded] if decoded is not None else []
     candidates.append(text)
     for candidate in candidates:
-        for m in PROXY_LINK_RE.finditer(candidate):
-            link = m.group(0).strip().rstrip('.,;:)]}\'"`>')
+        unescaped = html.unescape(candidate)
+        for m in PROXY_LINK_RE.finditer(unescaped):
+            link = _clean_link(m.group(0))
             if link:
                 found.append(link)
     return found
@@ -186,6 +246,11 @@ def extract_links(text: str) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
+def _port_allowed(port: int) -> bool:
+    """Valid TCP port that is not a service/OS port we must never probe."""
+    return 1 <= port <= 65535 and port not in BLOCKED_PORTS
+
+
 def _extract_query_params(query: str) -> Dict[str, str]:
     if not query:
         return {}
@@ -194,15 +259,17 @@ def _extract_query_params(query: str) -> Dict[str, str]:
 
 
 def parse_node_info(link: str) -> Optional[NodeInfo]:
+    # B1: unescape HTML entities (``&amp;``) before any URI/query parsing.
+    clean = _clean_link(link)
     try:
-        scheme, rest = link.split("://", 1)
+        scheme, rest = clean.split("://", 1)
     except ValueError:
         return None
     scheme = scheme.lower()
     if scheme not in PROXY_SCHEMES:
         return None
 
-    node = NodeInfo(protocol=scheme, original_link=link)
+    node = NodeInfo(protocol=scheme, original_link=clean, raw_link=clean)
 
     if scheme == "vmess":
         b64 = rest.split("#", 1)[0]
@@ -223,7 +290,7 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
             port = int(port_raw)
         except (TypeError, ValueError):
             return None
-        if not host or port <= 0 or port > 65535:
+        if not host or not _port_allowed(port):
             return None
         node.host = host
         node.port = port
@@ -271,7 +338,7 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         port = int(port_str)
     except (TypeError, ValueError):
         return None
-    if not host or port <= 0 or port > 65535:
+    if not host or not _port_allowed(port):
         return None
 
     node.host = host
@@ -318,90 +385,208 @@ async def resolve_hostname(host: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Batch GeoIP filtering (ip-api.com)
+# Offline MaxMind GeoIP (GeoLite2-Country .mmdb) with ip-api.com fallback
 # ---------------------------------------------------------------------------
 
+_mmdb_reader: Any = None
+_mmdb_init_done = False
 
-async def batch_geoip(
-    session: aiohttp.ClientSession, ips: List[str]
-) -> Dict[str, Optional[str]]:
-    result: Dict[str, Optional[str]] = {}
-    if not ips:
-        return result
 
-    payload = [{"query": ip, "fields": "status,countryCode,query"} for ip in ips]
+def _open_mmdb(path: str) -> Any:
     try:
-        async with session.post(
-            "http://ip-api.com/batch",
-            json=payload,
-            timeout=aiohttp.ClientTimeout(total=20.0),
+        import maxminddb
+    except Exception:
+        return None
+    try:
+        return maxminddb.open_database(path)
+    except Exception:
+        return None
+
+
+def mmdb_available() -> bool:
+    return _mmdb_reader is not None
+
+
+def reset_mmdb_state() -> None:
+    """Reset the cached .mmdb reader (used by tests)."""
+    global _mmdb_reader, _mmdb_init_done
+    _mmdb_reader = None
+    _mmdb_init_done = False
+
+
+def mmdb_lookup(ip: str) -> Optional[str]:
+    """Look up an ISO country code for *ip* locally (microseconds).
+
+    *ip* must be a raw IP address — never an ``ip:port`` pair.
+    """
+    reader = _mmdb_reader
+    if reader is None or not ip:
+        return None
+    try:
+        record = reader.get(ip)
+    except Exception:
+        return None
+    if not isinstance(record, dict):
+        return None
+    for section_name in ("country", "registered_country"):
+        section = record.get(section_name)
+        if isinstance(section, dict):
+            cc = section.get("iso_code")
+            if isinstance(cc, str) and cc:
+                return cc.upper()
+    return None
+
+
+async def _download_file(
+    session: aiohttp.ClientSession, url: str, target: str
+) -> bool:
+    tmp = target + ".part"
+    try:
+        directory = os.path.dirname(target)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        async with session.get(
+            url, timeout=aiohttp.ClientTimeout(total=60.0)
         ) as resp:
             if resp.status != 200:
-                return {ip: None for ip in ips}
-            data = await resp.json(content_type=None)
+                return False
+            data = await resp.read()
+        if not data or len(data) < MMDB_MIN_BYTES:
+            return False
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+        return True
     except Exception:
-        return {ip: None for ip in ips}
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+        return False
 
-    if isinstance(data, list):
-        for entry in data:
-            if isinstance(entry, dict):
-                q = entry.get("query")
-                status = entry.get("status")
-                cc = entry.get("countryCode")
-                if q and status == "success":
-                    result[q] = cc
-                elif q:
-                    result[q] = None
-    for ip in ips:
-        result.setdefault(ip, None)
-    return result
 
+async def ensure_mmdb_database(
+    session: Optional[aiohttp.ClientSession] = None,
+) -> bool:
+    """Load (or download + cache) the offline GeoLite2 Country database.
+
+    Tries ``.cache/Country.mmdb``, then ``/tmp/Country.mmdb``, and finally
+    downloads from the candidate mirrors. Returns ``True`` when a usable
+    reader is available.
+    """
+    global _mmdb_reader, _mmdb_init_done
+    if _mmdb_init_done:
+        return _mmdb_reader is not None
+    _mmdb_init_done = True
+
+    for path in (MMDB_CACHE_PATH, MMDB_TMP_PATH):
+        if os.path.exists(path):
+            reader = _open_mmdb(path)
+            if reader is not None:
+                _mmdb_reader = reader
+                print(f"[info] GeoIP offline database loaded from {path}")
+                return True
+
+    try:
+        import maxminddb  # noqa: F401
+    except Exception:
+        print("[warn] maxminddb not installed; GeoIP falls back to ip-api.com")
+        return False
+
+    own_session = session is None
+    if session is None:
+        session = aiohttp.ClientSession()
+    try:
+        for url in MMDB_CANDIDATE_URLS:
+            for target in (MMDB_CACHE_PATH, MMDB_TMP_PATH):
+                if not await _download_file(session, url, target):
+                    continue
+                reader = _open_mmdb(target)
+                if reader is not None:
+                    _mmdb_reader = reader
+                    print(f"[info] GeoIP offline database downloaded from {url}")
+                    return True
+                print(f"[warn] Downloaded GeoIP database from {url} is unusable")
+    finally:
+        if own_session:
+            await session.close()
+
+    print("[warn] Could not obtain an offline GeoIP database")
+    return False
 
 async def filter_by_geoip(
-    session: aiohttp.ClientSession, nodes: List[NodeInfo]
+    session: aiohttp.ClientSession,
+    nodes: List[NodeInfo],
+    api_fallback_limit: Optional[int] = None,
 ) -> List[NodeInfo]:
     """Filter nodes by GeoIP (country code).
 
-    Nodes must already have resolved_ip set. Deduplicates by (resolved_ip, port),
-    queries ip-api.com in batches of 100 with polite delays between batches,
-    and handles HTTP 429 / non-200 responses gracefully without raising.
+    Nodes must already have ``resolved_ip`` set. ``ip_key`` (which contains
+    ``:port``) is used ONLY to deduplicate network endpoints; every country
+    lookup uses ``node.pure_ip`` (a raw IP, never ``ip:port``).
+
+    Primary resolver: local offline ``Country.mmdb`` (microseconds per node).
+    Fallback: ``http://ip-api.com/batch`` for IPs the database does not know.
     """
     # Deduplicate by (resolved_ip, port)
-    seen_ips: Set[str] = set()
+    seen_keys: Set[str] = set()
     unique: List[NodeInfo] = []
     for n in nodes:
         if not n.resolved_ip:
             continue
         k = n.ip_key
-        if k in seen_ips:
+        if k in seen_keys:
             continue
-        seen_ips.add(k)
+        seen_keys.add(k)
         unique.append(n)
 
-    # Deduplicate IP list so each unique IP is queried only once
-    unique_ips: List[str] = []
-    seen_unique_ips: Set[str] = set()
-    for n in unique:
-        if n.resolved_ip not in seen_unique_ips:
-            seen_unique_ips.add(n.resolved_ip)
-            unique_ips.append(n.resolved_ip)
-
-    # Batch GeoIP with polite delays and 429 handling
     ip_to_country: Dict[str, Optional[str]] = {}
-    GEOIP_BATCH_DELAY = 1.5  # seconds between batches
+    offline_hits = 0
 
-    for i in range(0, len(unique_ips), GEOIP_CHUNK):
-        chunk = unique_ips[i : i + GEOIP_CHUNK]
+    # --- Primary: offline .mmdb lookup on the raw IP ---------------------
+    if mmdb_available():
+        for n in unique:
+            ip = n.pure_ip
+            if not ip or ip in ip_to_country:
+                continue
+            cc = mmdb_lookup(ip)
+            if cc:
+                ip_to_country[ip] = cc
+                offline_hits += 1
+
+    # --- Fallback: ip-api.com/batch for IPs missing from the database -----
+    missing_ips: List[str] = []
+    seen_missing: Set[str] = set()
+    for n in unique:
+        ip = n.pure_ip
+        if not ip or ip in ip_to_country or ip in seen_missing:
+            continue
+        seen_missing.add(ip)
+        missing_ips.append(ip)
+
+    if api_fallback_limit is not None and len(missing_ips) > api_fallback_limit:
+        print(
+            f"[info] GeoIP ip-api.com fallback capped at {api_fallback_limit} of "
+            f"{len(missing_ips)} unknown IP(s) to respect the rate limit"
+        )
+        missing_ips = missing_ips[:api_fallback_limit]
+
+    for i in range(0, len(missing_ips), GEOIP_CHUNK):
+        chunk = missing_ips[i : i + GEOIP_CHUNK]
         part = await _batch_geoip_with_retry(session, chunk)
         ip_to_country.update(part)
-
-        # Polite delay between batches to respect rate limits
-        if i + GEOIP_CHUNK < len(unique_ips):
+        if i + GEOIP_CHUNK < len(missing_ips):
             await asyncio.sleep(GEOIP_BATCH_DELAY)
+
+    if offline_hits:
+        print(f"[info] GeoIP offline .mmdb resolved {offline_hits} IP(s)")
+    if missing_ips:
+        print(f"[info] GeoIP ip-api.com fallback queried {len(missing_ips)} IP(s)")
 
     allowed: List[NodeInfo] = []
     for n in unique:
-        cc = ip_to_country.get(n.resolved_ip or "")
+        cc = ip_to_country.get(n.pure_ip)
         n.country_code = cc
         if cc in ALLOWED_COUNTRIES:
             n.country_name = ALLOWED_COUNTRIES[cc][1]
@@ -460,7 +645,7 @@ async def resolve_and_dedup_nodes(nodes: List[NodeInfo]) -> List[NodeInfo]:
     Drops private/loopback/unresolvable hosts. Sets node.resolved_ip
     on each surviving node.
     """
-    sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
+    sem = asyncio.Semaphore(MAX_CONCURRENT_DNS)
 
     async def _resolve(node: NodeInfo) -> None:
         async with sem:
@@ -502,97 +687,180 @@ def _is_public_ip(ip: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Dual-probe stability & real handshake test
-
-
-
-# ---------------------------------------------------------------------------
-# Dual-probe stability & real handshake test
+# Dual-probe stability: real handshake + active payload (TTFB) verification
 # ---------------------------------------------------------------------------
 
 _SSL_CTX = ssl.create_default_context()
 _SSL_CTX.check_hostname = False
 _SSL_CTX.verify_mode = ssl.CERT_NONE
 
+PAYLOAD_READ_BYTES = 4096
+PAYLOAD_REQUEST_TEMPLATE = (
+    "GET / HTTP/1.1\r\n"
+    "Host: {host}\r\n"
+    "User-Agent: Mozilla/5.0\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "\r\n"
+)
 
-async def _single_probe(node: NodeInfo) -> bool:
-    ip = node.resolved_ip
-    port = node.port
-    if not ip:
-        return False
 
+def _build_payload_request(node: NodeInfo) -> bytes:
+    """Active HTTP/WebSocket upgrade request used by the payload probe."""
+    return PAYLOAD_REQUEST_TEMPLATE.format(host=node.sni or node.host).encode()
+
+
+async def _close_writer(writer: asyncio.StreamWriter) -> None:
     try:
-        if node.tls_enabled:
-            sni = node.sni or node.host
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    ip, port, ssl=_SSL_CTX, server_hostname=sni
-                ),
-                timeout=PROBE_TIMEOUT,
-            )
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return True
+        writer.close()
+    except Exception:
+        pass
+    try:
+        await writer.wait_closed()
+    except Exception:
+        pass
 
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(ip, port), timeout=PROBE_TIMEOUT
+
+async def _open_connection(
+    node: NodeInfo,
+) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Connect to the node, completing a full TLS handshake when required.
+
+    Raises on refused/reset connections and TLS failures, and refuses to return
+    a TLS transport that negotiated no usable cipher.
+    """
+    ip = node.resolved_ip
+    if not ip:
+        raise ConnectionError("node has no resolved IP")
+
+    if not node.tls_enabled:
+        return await asyncio.wait_for(
+            asyncio.open_connection(ip, node.port), timeout=PROBE_TIMEOUT
         )
 
-        if node.network == "ws":
-            probe = (
-                f"GET / HTTP/1.1\r\nHost: {node.host}\r\nConnection: close\r\n\r\n"
-            ).encode()
-            writer.write(probe)
-            try:
-                await writer.drain()
-            except Exception:
-                writer.close()
-                return False
-            try:
-                data = await asyncio.wait_for(reader.read(1), timeout=PROBE_TIMEOUT)
-            except Exception:
-                data = b""
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
-            return bool(data)
+    sni = node.sni or node.host
+    reader, writer = await asyncio.wait_for(
+        asyncio.open_connection(ip, node.port, ssl=_SSL_CTX, server_hostname=sni),
+        timeout=PROBE_TIMEOUT,
+    )
+    ssl_object = writer.get_extra_info("ssl_object")
+    if ssl_object is None or ssl_object.cipher() is None:
+        await _close_writer(writer)
+        raise ssl.SSLError("TLS transport negotiated no valid cipher")
+    return reader, writer
 
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return True
+
+async def _handshake_probe(node: NodeInfo) -> bool:
+    """Probe 1: TCP connect + full TLS handshake with SNI and cipher check."""
+    try:
+        _reader, writer = await _open_connection(node)
     except Exception:
         return False
+    await _close_writer(writer)
+    return True
+
+
+def _requires_http_response(node: NodeInfo) -> bool:
+    """Non-TLS proxy endpoints that must answer the HTTP probe with bytes."""
+    return not node.tls_enabled and (
+        node.network in HTTP_PROBE_NETWORKS
+        or node.protocol in HTTP_PROBE_PROTOCOLS
+    )
+
+
+async def _payload_probe(node: NodeInfo) -> Tuple[bool, int, float]:
+    """Probe 2: active payload download / TTFB verification.
+
+    Returns ``(ok, payload_bytes, latency)``. Latency is the connection (and
+    TLS handshake) establishment time, replaced by real TTFB when payload
+    flows, so healthy-but-silent reality endpoints are not penalised by the
+    read wait.
+
+    Strictness:
+      * TLS endpoints must handshake with a valid cipher. Payload bytes or a
+        clean read timeout pass; EOF, reset and TLS alerts drop the node.
+      * Non-TLS vless/vmess/trojan (and ws/http/h2 transports) must answer the
+        HTTP probe with payload starting ``HTTP/`` inside PAYLOAD_READ_TIMEOUT.
+      * Non-TLS ``ss://`` endpoints receive 32 random bytes; only an immediate
+        reset drops them.
+    """
+    started = time.monotonic()
+    try:
+        reader, writer = await _open_connection(node)
+    except Exception:
+        return False, 0, (time.monotonic() - started) * 1000.0
+
+    established_ms = (time.monotonic() - started) * 1000.0
+
+    if not node.tls_enabled and node.protocol == "ss":
+        request = os.urandom(32)
+        read_timeout = SS_PROBE_READ_TIMEOUT
+    else:
+        request = _build_payload_request(node)
+        read_timeout = PAYLOAD_READ_TIMEOUT
+
+    try:
+        writer.write(request)
+        await asyncio.wait_for(writer.drain(), timeout=read_timeout)
+    except (ssl.SSLError, OSError, asyncio.TimeoutError):
+        await _close_writer(writer)
+        return False, 0, established_ms
+    except Exception:
+        await _close_writer(writer)
+        return False, 0, established_ms
+
+    try:
+        chunk = await asyncio.wait_for(
+            reader.read(PAYLOAD_READ_BYTES), timeout=read_timeout
+        )
+    except asyncio.TimeoutError:
+        await _close_writer(writer)
+        # Silent peer: acceptable only where HTTP is not expected.
+        if _requires_http_response(node):
+            return False, 0, established_ms
+        return True, 0, established_ms
+    except (ssl.SSLError, OSError):
+        await _close_writer(writer)
+        return False, 0, established_ms
+
+    await _close_writer(writer)
+
+    payload = chunk or b""
+    ttfb_ms = (time.monotonic() - started) * 1000.0
+    if not payload:
+        # Clean EOF without a single payload byte.
+        if node.tls_enabled or _requires_http_response(node):
+            return False, 0, established_ms
+        return True, 0, established_ms
+    if _requires_http_response(node) and not payload.startswith(b"HTTP/"):
+        return False, len(payload), ttfb_ms
+    return True, len(payload), ttfb_ms
 
 
 async def verify_node_stability(node: NodeInfo) -> Optional[Dict[str, Any]]:
-    results: List[Optional[bool]] = []
-    latencies: List[float] = []
-
-    for i in range(2):
-        start = time.monotonic()
-        ok = await _single_probe(node)
-        elapsed_ms = (time.monotonic() - start) * 1000.0
-        results.append(ok)
-        latencies.append(elapsed_ms)
-        if i == 0:
-            await asyncio.sleep(PROBE_GAP)
-
-    if not all(results):
-        node.error = "dual probe failed"
+    """Probe 1 (handshake latency) then probe 2 (payload/TTFB), 0.1s apart."""
+    start = time.monotonic()
+    handshake_ok = await _handshake_probe(node)
+    latency_1 = (time.monotonic() - start) * 1000.0
+    if not handshake_ok:
+        node.error = "handshake probe failed"
         return None
 
-    latency_1, latency_2 = latencies
+    await asyncio.sleep(PROBE_GAP)
+
+    payload_ok, payload_bytes, latency_2 = await _payload_probe(node)
+    if not payload_ok:
+        node.error = "payload probe failed"
+        return None
+
     avg_ms = round((latency_1 + latency_2) / 2)
+    if avg_ms > MAX_LATENCY_MS:
+        node.error = f"latency {avg_ms}ms above {MAX_LATENCY_MS}ms cap"
+        return None
+
     jitter_ms = round(abs(latency_1 - latency_2))
-    quality = avg_ms + (jitter_ms * 1.5)
+    penalty = 0.0 if node.tls_enabled else NON_TLS_PENALTY_MS
+    quality = avg_ms + (jitter_ms * 1.5) + penalty
 
     node.latency_1 = latency_1
     node.latency_2 = latency_2
@@ -605,7 +873,21 @@ async def verify_node_stability(node: NodeInfo) -> Optional[Dict[str, Any]]:
         "avg_latency_ms": avg_ms,
         "jitter_ms": jitter_ms,
         "quality_score": quality,
+        "payload_bytes": payload_bytes,
     }
+
+
+def dedupe_by_pure_ip(nodes: List[NodeInfo]) -> List[NodeInfo]:
+    """Keep only the best-ranked node per unique IP (input must be sorted)."""
+    seen: Set[str] = set()
+    unique: List[NodeInfo] = []
+    for n in nodes:
+        ip = n.pure_ip
+        if not ip or ip in seen:
+            continue
+        seen.add(ip)
+        unique.append(n)
+    return unique
 
 
 
@@ -689,9 +971,17 @@ def _write_b64(path: str, links: List[str]) -> None:
 def write_all_outputs(
     by_country: Dict[str, List[NodeInfo]],
     by_protocol: Dict[str, List[NodeInfo]],
-    main_links: List[str],
+    total_tested: int = 0,
+    total_passed: int = 0,
 ) -> Dict[str, Any]:
     _ensure_dirs()
+
+    # servers.txt / sub.txt: each country numbered independently 01..05.
+    main_links: List[str] = []
+    for code in sorted(ALLOWED_COUNTRIES.keys()):
+        nodes = by_country.get(code, [])
+        for idx, n in enumerate(nodes[:MAIN_QUOTA_PER_COUNTRY], start=1):
+            main_links.append(rename_node(n, code, idx))
 
     _write_plain(SERVERS_FILE, main_links)
     _write_b64(SUB_FILE, main_links)
@@ -699,7 +989,11 @@ def write_all_outputs(
     country_report: Dict[str, Any] = {}
     for code in sorted(ALLOWED_COUNTRIES.keys()):
         nodes = by_country.get(code, [])
-        country_links = [n.renamed_link or n.original_link for n in nodes]
+        # countries/{CODE}.txt: numbered independently 01..20 per country.
+        top_nodes = nodes[:COUNTRY_FILE_QUOTA]
+        country_links = [
+            rename_node(n, code, idx) for idx, n in enumerate(top_nodes, start=1)
+        ]
         flag, name = ALLOWED_COUNTRIES[code]
         count = len(nodes)
 
@@ -734,14 +1028,15 @@ def write_all_outputs(
 
     for proto in PROXY_SCHEMES:
         nodes = by_protocol.get(proto, [])
-        proto_links = [n.renamed_link or n.original_link for n in nodes]
+        proto_links = [
+            rename_node(n, n.country_code or "DE", idx)
+            for idx, n in enumerate(nodes, start=1)
+        ]
         ppath = os.path.join(PROTOCOLS_DIR, f"{proto}.txt")
         pbpath = os.path.join(PROTOCOLS_DIR, f"{proto}_base64.txt")
         _write_plain(ppath, proto_links)
         _write_b64(pbpath, proto_links)
 
-    total_tested = sum(len(v) for v in by_country.values())
-    total_passed = sum(len(v) for v in by_country.values())
     main_count = len(main_links)
 
     alerts = [
@@ -848,21 +1143,37 @@ async def main() -> int:
         print(f"[fatal] Unexpected error: {exc}", file=sys.stderr)
         # Still write empty outputs so the workflow doesn't break downstream
         try:
-            write_all_outputs({}, {}, [])
+            write_all_outputs({}, {}, 0, 0)
         except Exception:
             pass
         return 0
 
 
 async def _main_impl() -> int:
+    started = time.monotonic()
+    mark_at = started
+
+    def _mark(label: str) -> None:
+        nonlocal mark_at
+        now = time.monotonic()
+        print(f"[time] {label}: {now - mark_at:.1f}s")
+        mark_at = now
+
+    # getaddrinfo runs in the loop's default executor, so give it enough worker
+    # threads to keep the DNS semaphore busy during the resolution stage.
+    asyncio.get_running_loop().set_default_executor(
+        ThreadPoolExecutor(max_workers=MAX_CONCURRENT_DNS, thread_name_prefix="dns")
+    )
+
     urls = load_sources()
     if not urls:
         print("[info] No source URLs found in sources.txt.")
-        write_all_outputs({}, {}, [])
+        write_all_outputs({}, {}, 0, 0)
         return 0
 
     print(f"[info] Fetching {len(urls)} source URL(s) ...")
     pages = await fetch_all(urls)
+    _mark("fetch")
 
     # --- Stage 1: Extract links -------------------------------------------
     all_links: List[str] = []
@@ -889,67 +1200,74 @@ async def _main_impl() -> int:
         parsed.append(node)
 
     print(f"[info] After parse + dedup: {len(parsed)} node(s)")
+    _mark("parse")
 
     # --- Stage 3: DNS resolution + IP:Port deduplication ------------------
     parsed = await resolve_and_dedup_nodes(parsed)
     print(f"[info] After DNS + IP:Port dedup: {len(parsed)} node(s)")
+    _mark("dns")
 
-    # --- Stage 4: Dual-probe stability (BEFORE GeoIP to save rate limits) -
     connector = aiohttp.TCPConnector(limit_per_host=10)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # --- Stage 4: GeoIP pre-filter (offline .mmdb = microseconds) ------
+        # Filtering by country BEFORE probing keeps network work limited to the
+        # 10 target countries instead of thousands of unrelated nodes.
+        mmdb_ready = await ensure_mmdb_database(session)
+        if mmdb_ready:
+            candidates = await filter_by_geoip(
+                session, parsed, api_fallback_limit=GEOIP_API_FALLBACK_LIMIT
+            )
+            print(f"[info] After GeoIP (allowed countries): {len(candidates)} node(s)")
+            _mark("geoip pre-filter")
+        else:
+            candidates = parsed
+
+        # --- Stage 5: Dual-probe stability + payload/TTFB verification -----
         sem = asyncio.Semaphore(MAX_CONCURRENT_PROBES)
 
         async def _probe(node: NodeInfo) -> None:
             async with sem:
                 await verify_node_stability(node)
 
-        await asyncio.gather(*(_probe(n) for n in parsed))
+        await asyncio.gather(*(_probe(n) for n in candidates))
 
-    passed = [n for n in parsed if n.quality_score is not None]
-    print(f"[info] After dual-probe stability: {len(passed)} node(s)")
+        passed = [n for n in candidates if n.quality_score is not None]
+        print(f"[info] After dual-probe stability: {len(passed)} node(s)")
+        _mark("probe")
 
-    # --- Stage 5: GeoIP filtering (on live nodes only) --------------------
-    async with aiohttp.ClientSession(connector=connector) as session:
-        allowed = await filter_by_geoip(session, passed)
-    print(f"[info] After GeoIP (allowed countries): {len(allowed)} node(s)")
+        # --- Stage 6: GeoIP filtering (only when the offline DB was unusable)
+        if mmdb_ready:
+            allowed = passed
+        else:
+            allowed = await filter_by_geoip(session, passed)
+            print(f"[info] After GeoIP (allowed countries): {len(allowed)} node(s)")
 
-    # --- Stage 6: Group by country & sort by quality ----------------------
+    # --- Stage 7: Group by country, sort by quality, one node per IP ------
     by_country: Dict[str, List[NodeInfo]] = {code: [] for code in ALLOWED_COUNTRIES}
     by_protocol: Dict[str, List[NodeInfo]] = {proto: [] for proto in PROXY_SCHEMES}
 
-    for n in passed:
+    for n in allowed:
         cc = n.country_code
         if cc and cc in by_country:
             by_country[cc].append(n)
         by_protocol[n.protocol].append(n)
 
-    for code in by_country:
-        by_country[code].sort(key=lambda n: (n.quality_score or float("inf")))
+    for code, nodes in by_country.items():
+        nodes.sort(key=lambda n: (n.quality_score or float("inf")))
+        by_country[code] = dedupe_by_pure_ip(nodes)
 
     for proto in by_protocol:
         by_protocol[proto].sort(key=lambda n: (n.quality_score or float("inf")))
 
-    # --- Stage 7: Rename nodes --------------------------------------------
-    for code, nodes in by_country.items():
-        for idx, n in enumerate(nodes, start=1):
-            rename_node(n, code, idx)
+    # --- Stage 8: Write outputs (every list is numbered independently) ----
+    report = write_all_outputs(
+        by_country,
+        by_protocol,
+        total_tested=len(candidates),
+        total_passed=len(allowed),
+    )
 
-    for proto, nodes in by_protocol.items():
-        for idx, n in enumerate(nodes, start=1):
-            cc = n.country_code or "DE"
-            rename_node(n, cc, idx)
-
-    # --- Stage 8: Build main subscription (max 5 per country) -------------
-    main_links: List[str] = []
-    for code in sorted(ALLOWED_COUNTRIES.keys()):
-        nodes = by_country.get(code, [])
-        for n in nodes[:MAIN_QUOTA_PER_COUNTRY]:
-            main_links.append(n.renamed_link or n.original_link)
-
-    # --- Stage 9: Write outputs -------------------------------------------
-    report = write_all_outputs(by_country, by_protocol, main_links)
-
-    # --- Stage 10: GitHub Actions annotations + summary --------------------
+    # --- Stage 11: GitHub Actions annotations + summary -------------------
     emit_annotations(report["countries"])
     write_step_summary(report["countries"])
 
@@ -957,6 +1275,8 @@ async def _main_impl() -> int:
     print(f"[info] Main sub count: {report['main_sub_count']}")
     print(f"[info] Alerts (empty countries): {report['alerts']}")
     print(f"[info] Wrote outputs to {OUTPUT_DIR}/")
+    _mark("output")
+    print(f"[time] total: {time.monotonic() - started:.1f}s")
     return 0
 
 

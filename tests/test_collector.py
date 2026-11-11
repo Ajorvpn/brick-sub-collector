@@ -3,6 +3,9 @@
 import asyncio
 import base64
 import json
+import os
+import shutil
+import tempfile
 import unittest
 from unittest import mock
 
@@ -153,52 +156,109 @@ class TestVerifyNodeStability(unittest.IsolatedAsyncioTestCase):
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
-        call_count = {"n": 0}
+        calls = {"handshake": 0, "payload": 0}
 
-        async def fake_probe(n):
-            call_count["n"] += 1
+        async def fake_handshake(n):
+            calls["handshake"] += 1
             return True
 
-        with mock.patch.object(collector, "_single_probe", side_effect=fake_probe):
+        async def fake_payload(n):
+            calls["payload"] += 1
+            return True, 512, 24.0
+
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
             result = await collector.verify_node_stability(node)
 
         self.assertIsNotNone(result)
-        self.assertEqual(call_count["n"], 2)
+        self.assertEqual(calls["handshake"], 1)
+        self.assertEqual(calls["payload"], 1)
+        self.assertEqual(result["payload_bytes"], 512)
         self.assertIsNotNone(node.avg_latency_ms)
         self.assertIsNotNone(node.quality_score)
 
-    async def test_fails_second_probe_dropped(self):
+    async def test_quality_score_formula(self):
         node = collector.NodeInfo(
             protocol="vless", host="1.1.1.1", port=443,
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
 
-        async def fake_probe(n):
+        async def fake_handshake(n):
+            return True
+
+        async def fake_payload(n):
+            return True, 200, 30.0
+
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
+            result = await collector.verify_node_stability(node)
+
+        self.assertIsNotNone(result)
+        expected_avg = round((node.latency_1 + node.latency_2) / 2)
+        expected_jitter = round(abs(node.latency_1 - node.latency_2))
+        penalty = 0.0 if node.tls_enabled else collector.NON_TLS_PENALTY_MS
+        self.assertEqual(node.avg_latency_ms, expected_avg)
+        self.assertEqual(node.jitter_ms, expected_jitter)
+        self.assertAlmostEqual(
+            node.quality_score,
+            expected_avg + expected_jitter * 1.5 + penalty,
+            places=6,
+        )
+
+    async def test_failed_handshake_dropped(self):
+        node = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443,
+            tls_enabled=False, network="tcp",
+            resolved_ip="1.1.1.1",
+        )
+
+        async def fake_handshake(n):
             return False
 
-        with mock.patch.object(collector, "_single_probe", side_effect=fake_probe):
+        async def fake_payload(n):
+            raise AssertionError("payload probe must not run after handshake failure")
+
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
             result = await collector.verify_node_stability(node)
 
         self.assertIsNone(result)
-        self.assertEqual(node.error, "dual probe failed")
+        self.assertEqual(node.error, "handshake probe failed")
+        self.assertIsNone(node.quality_score)
 
-    async def test_passes_first_fails_second_dropped(self):
+    async def test_failed_payload_probe_dropped(self):
         node = collector.NodeInfo(
             protocol="vless", host="1.1.1.1", port=443,
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
-        calls = {"n": 0}
 
-        async def fake_probe2(n):
-            calls["n"] += 1
-            return calls["n"] == 1
+        async def fake_handshake(n):
+            return True
 
-        with mock.patch.object(collector, "_single_probe", side_effect=fake_probe2):
+        async def fake_payload(n):
+            return False, 0, 20.0
+
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
             result = await collector.verify_node_stability(node)
 
         self.assertIsNone(result)
+        self.assertEqual(node.error, "payload probe failed")
+        self.assertIsNone(node.quality_score)
 
     async def test_quality_score_sorting(self):
         node1 = collector.NodeInfo(
@@ -347,8 +407,12 @@ class TestEndToEndPipeline(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(n.ip_key, f"ip_key missing for {n.host}")
 
         # --- Stage: verify_node_stability ---
-        # Mock _single_probe to return True (all nodes pass)
-        with mock.patch.object(collector, "_single_probe", return_value=True):
+        # Mock both probes to succeed (all nodes pass)
+        with mock.patch.object(
+            collector, "_handshake_probe", return_value=True
+        ), mock.patch.object(
+            collector, "_payload_probe", return_value=(True, 256, 15.0)
+        ):
             for n in resolved:
                 result = await collector.verify_node_stability(n)
                 self.assertIsNotNone(result, f"stability check failed for {n.host}")
@@ -406,6 +470,625 @@ class TestEndToEndPipeline(unittest.IsolatedAsyncioTestCase):
             tls_enabled=False, network="tcp", resolved_ip=None,
         )
         self.assertEqual(node2.ip_key, "example.com:8080")
+
+
+class _DummySession:
+    """Stand-in for aiohttp.ClientSession (the HTTP GeoIP path is mocked)."""
+
+
+class _FakeMmdbReader:
+    """Minimal stand-in for the reader returned by maxminddb.open_database()."""
+
+    def __init__(self, mapping):
+        self.mapping = mapping
+        self.queries = []
+
+    def get(self, ip):
+        self.queries.append(ip)
+        country_code = self.mapping.get(ip)
+        if country_code is None:
+            return None
+        return {"country": {"iso_code": country_code}}
+
+
+def _geoip_node(host, port):
+    return collector.NodeInfo(
+        protocol="vless", host=host, port=port,
+        tls_enabled=False, network="tcp", resolved_ip=host,
+    )
+
+
+class TestGeoIPPureIp(unittest.IsolatedAsyncioTestCase):
+    """D1: every GeoIP lookup must use the raw IP, never ``ip:port``."""
+
+    async def test_ip_key_has_port_but_pure_ip_does_not(self):
+        node = _geoip_node("1.2.3.4", 443)
+        self.assertEqual(node.ip_key, "1.2.3.4:443")
+        self.assertEqual(node.pure_ip, "1.2.3.4")
+
+    async def test_nodes_with_port_in_ip_key_are_not_dropped(self):
+        nodes = [
+            _geoip_node("1.1.1.1", 443),
+            _geoip_node("2.2.2.2", 8443),
+            _geoip_node("3.3.3.3", 8388),
+        ]
+        reader = _FakeMmdbReader(
+            {"1.1.1.1": "DE", "2.2.2.2": "US", "3.3.3.3": "IR"}
+        )
+
+        with mock.patch.object(collector, "_mmdb_reader", reader), mock.patch.object(
+            collector, "_batch_geoip_with_retry"
+        ) as batch:
+            allowed = await collector.filter_by_geoip(_DummySession(), nodes)
+
+        self.assertEqual([n.pure_ip for n in allowed], ["1.1.1.1", "2.2.2.2"])
+        self.assertEqual([n.country_code for n in allowed], ["DE", "US"])
+        self.assertEqual(allowed[0].country_name, "Germany")
+        # Lookups were performed with raw IPs only, and no HTTP fallback ran.
+        self.assertEqual(reader.queries, ["1.1.1.1", "2.2.2.2", "3.3.3.3"])
+        batch.assert_not_called()
+
+    async def test_identical_ip_different_ports_dedup_by_ip_key(self):
+        nodes = [_geoip_node("1.1.1.1", 443), _geoip_node("1.1.1.1", 8443)]
+        reader = _FakeMmdbReader({"1.1.1.1": "NL"})
+
+        with mock.patch.object(collector, "_mmdb_reader", reader), mock.patch.object(
+            collector, "_batch_geoip_with_retry"
+        ):
+            allowed = await collector.filter_by_geoip(_DummySession(), nodes)
+
+        self.assertEqual(len(allowed), 2)
+        self.assertEqual(reader.queries, ["1.1.1.1"])
+
+
+class TestGeoIPMmdbAndFallback(unittest.IsolatedAsyncioTestCase):
+    """D2: offline .mmdb first, ip-api.com/batch as the raw-IP fallback."""
+
+    def test_mmdb_lookup_reads_iso_code(self):
+        reader = _FakeMmdbReader({"9.9.9.9": "fi"})
+        with mock.patch.object(collector, "_mmdb_reader", reader):
+            self.assertEqual(collector.mmdb_lookup("9.9.9.9"), "FI")
+            self.assertIsNone(collector.mmdb_lookup("8.8.8.8"))
+            self.assertIsNone(collector.mmdb_lookup(""))
+
+    def test_mmdb_unavailable_without_reader(self):
+        collector.reset_mmdb_state()
+        self.assertFalse(collector.mmdb_available())
+        self.assertIsNone(collector.mmdb_lookup("1.1.1.1"))
+
+    async def test_missing_mmdb_entry_falls_back_with_raw_ip(self):
+        nodes = [_geoip_node("1.1.1.1", 443), _geoip_node("9.9.9.9", 443)]
+        reader = _FakeMmdbReader({"1.1.1.1": "DE"})
+        seen = {}
+
+        async def fake_batch(session, ips):
+            seen["ips"] = list(ips)
+            return {ip: "NL" for ip in ips}
+
+        with mock.patch.object(collector, "_mmdb_reader", reader), mock.patch.object(
+            collector, "_batch_geoip_with_retry", side_effect=fake_batch
+        ):
+            allowed = await collector.filter_by_geoip(_DummySession(), nodes)
+
+        self.assertEqual(seen["ips"], ["9.9.9.9"])
+        for ip in seen["ips"]:
+            self.assertNotIn(":", ip)
+        self.assertEqual({n.pure_ip for n in allowed}, {"1.1.1.1", "9.9.9.9"})
+
+    async def test_without_mmdb_everything_uses_api_fallback(self):
+        nodes = [_geoip_node("1.1.1.1", 443), _geoip_node("2.2.2.2", 443)]
+        seen = {}
+
+        async def fake_batch(session, ips):
+            seen["ips"] = list(ips)
+            return {ip: "CA" for ip in ips}
+
+        collector.reset_mmdb_state()
+        with mock.patch.object(
+            collector, "_batch_geoip_with_retry", side_effect=fake_batch
+        ):
+            allowed = await collector.filter_by_geoip(_DummySession(), nodes)
+
+        self.assertEqual(seen["ips"], ["1.1.1.1", "2.2.2.2"])
+        self.assertEqual(len(allowed), 2)
+        self.assertTrue(all(n.country_code == "CA" for n in allowed))
+
+    async def test_api_fallback_limit_caps_batches(self):
+        nodes = [_geoip_node(f"10.0.0.{i}", 443) for i in range(1, 6)]
+        seen = {}
+
+        async def fake_batch(session, ips):
+            seen["ips"] = list(ips)
+            return {ip: "DE" for ip in ips}
+
+        collector.reset_mmdb_state()
+        with mock.patch.object(
+            collector, "_batch_geoip_with_retry", side_effect=fake_batch
+        ):
+            allowed = await collector.filter_by_geoip(
+                _DummySession(), nodes, api_fallback_limit=2
+            )
+
+        self.assertEqual(seen["ips"], ["10.0.0.1", "10.0.0.2"])
+        self.assertEqual(len(allowed), 2)
+
+
+class TestPayloadProbe(unittest.IsolatedAsyncioTestCase):
+    """D3: real handshake + active payload/TTFB verification."""
+
+    async def asyncSetUp(self):
+        self._servers = []
+        self._timeout = mock.patch.object(collector, "PROBE_TIMEOUT", 0.3)
+        self._timeout.start()
+
+    def tearDown(self):
+        self._timeout.stop()
+
+    async def asyncTearDown(self):
+        for server in self._servers:
+            server.close()
+            await server.wait_closed()
+
+    async def _serve(self, handler):
+        server = await asyncio.start_server(handler, "127.0.0.1", 0)
+        self._servers.append(server)
+        return server.sockets[0].getsockname()[1]
+
+    async def test_handshake_probe_accepts_plain_and_rejects_tls_mismatch(self):
+        async def handler(reader, writer):
+            while await reader.read(1024):
+                pass
+            writer.close()
+
+        port = await self._serve(handler)
+        plain = _geoip_node("127.0.0.1", port)
+        self.assertTrue(await collector._handshake_probe(plain))
+
+        tls_node = _geoip_node("127.0.0.1", port)
+        tls_node.tls_enabled = True
+        tls_node.sni = "example.com"
+        self.assertFalse(await collector._handshake_probe(tls_node))
+
+    async def test_payload_probe_reads_payload_bytes(self):
+        async def handler(reader, writer):
+            await reader.read(4096)
+            writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            await reader.read(1)
+            writer.close()
+
+        port = await self._serve(handler)
+        ok, payload_bytes, latency_ms = await collector._payload_probe(
+            _geoip_node("127.0.0.1", port)
+        )
+        self.assertTrue(ok)
+        self.assertGreater(payload_bytes, 0)
+        self.assertGreaterEqual(latency_ms, 0.0)
+
+    async def test_payload_probe_drops_silent_non_tls_http_endpoint(self):
+        async def handler(reader, writer):
+            while await reader.read(4096):
+                pass
+            writer.close()
+
+        port = await self._serve(handler)
+        node = _geoip_node("127.0.0.1", port)  # non-TLS vless -> must answer HTTP
+        ok, payload_bytes, _latency = await collector._payload_probe(node)
+        self.assertFalse(ok)
+        self.assertEqual(payload_bytes, 0)
+
+    async def test_payload_probe_drops_non_http_garbage(self):
+        async def handler(reader, writer):
+            await reader.read(4096)
+            writer.write(b"SSH-2.0-OpenSSH_9.6\r\n")
+            await writer.drain()
+            await reader.read(1)
+            writer.close()
+
+        port = await self._serve(handler)
+        node = _geoip_node("127.0.0.1", port)
+        ok, _payload_bytes, _latency = await collector._payload_probe(node)
+        self.assertFalse(ok)
+
+    async def test_payload_probe_tolerates_silent_ss_endpoint(self):
+        async def handler(reader, writer):
+            while await reader.read(4096):
+                pass
+            writer.close()
+
+        port = await self._serve(handler)
+        node = collector.NodeInfo(
+            protocol="ss", host="127.0.0.1", port=port,
+            tls_enabled=False, network="tcp", resolved_ip="127.0.0.1",
+        )
+        ok, payload_bytes, _latency = await collector._payload_probe(node)
+        self.assertTrue(ok)
+        self.assertEqual(payload_bytes, 0)
+
+    async def test_payload_probe_drops_refused_port(self):
+        probe_server = await asyncio.start_server(
+            lambda r, w: None, "127.0.0.1", 0
+        )
+        closed_port = probe_server.sockets[0].getsockname()[1]
+        probe_server.close()
+        await probe_server.wait_closed()
+
+        ok, payload_bytes, _latency = await collector._payload_probe(
+            _geoip_node("127.0.0.1", closed_port)
+        )
+        self.assertFalse(ok)
+        self.assertEqual(payload_bytes, 0)
+
+    async def test_payload_request_uses_sni_host_header(self):
+        node = _geoip_node("1.1.1.1", 443)
+        node.sni = "cdn.example.com"
+        request = collector._build_payload_request(node).decode()
+        self.assertIn("Host: cdn.example.com", request)
+        self.assertIn("Upgrade: websocket", request)
+        self.assertIn("User-Agent: Mozilla/5.0", request)
+
+
+class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
+    """D2: GeoIP pre-filter must run before the network probes."""
+
+    async def test_geoip_runs_before_probing_when_mmdb_ready(self):
+        order = []
+
+        async def fake_fetch_all(urls):
+            return ["vless://uuid@1.1.1.1:443?security=tls#a"]
+
+        async def fake_resolve(nodes):
+            for n in nodes:
+                n.resolved_ip = "1.1.1.1"
+            return list(nodes)
+
+        async def fake_ensure(session):
+            order.append("geoip_db")
+            return True
+
+        async def fake_geoip(session, nodes, api_fallback_limit=None):
+            order.append("geoip")
+            for n in nodes:
+                n.country_code = "DE"
+                n.country_name = "Germany"
+            return list(nodes)
+
+        async def fake_probe(node):
+            order.append("probe")
+            node.quality_score = 10.0
+            node.avg_latency_ms = 10
+            return {"quality_score": 10.0}
+
+        def fake_write(by_country, by_protocol, total_tested=0, total_passed=0):
+            order.append(f"write:{total_tested}:{total_passed}")
+            return {
+                "total_tested": total_tested,
+                "total_passed": total_passed,
+                "main_sub_count": len(by_country.get("DE", [])),
+                "countries": {},
+                "alerts": [],
+            }
+
+        with mock.patch.object(
+            collector, "load_sources", return_value=["https://example.com/sub.txt"]
+        ), mock.patch.object(
+            collector, "fetch_all", side_effect=fake_fetch_all
+        ), mock.patch.object(
+            collector, "resolve_and_dedup_nodes", side_effect=fake_resolve
+        ), mock.patch.object(
+            collector, "ensure_mmdb_database", side_effect=fake_ensure
+        ), mock.patch.object(
+            collector, "filter_by_geoip", side_effect=fake_geoip
+        ), mock.patch.object(
+            collector, "verify_node_stability", side_effect=fake_probe
+        ), mock.patch.object(
+            collector, "write_all_outputs", side_effect=fake_write
+        ), mock.patch.object(
+            collector, "emit_annotations"
+        ), mock.patch.object(
+            collector, "write_step_summary"
+        ):
+            rc = await collector._main_impl()
+
+        self.assertEqual(rc, 0)
+        self.assertEqual(order, ["geoip_db", "geoip", "probe", "write:1:1"])
+
+
+class TestSourcesFile(unittest.TestCase):
+    """D4: sources.txt must hold exactly six live subscription mirrors."""
+
+    def test_no_dead_urls(self):
+        with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        self.assertEqual(len(urls), 6)
+        for dead in (
+            "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
+            "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/"
+            "All_Configs_Sub.txt",
+            "https://raw.githubusercontent.com/epodonios/v2ray-configs/main/"
+            "All_Configs_Sub.txt",
+            "https://raw.githubusercontent.com/soroushmirzaei/"
+            "telegram-configs-collector/main/channels/configs",
+        ):
+            self.assertNotIn(dead, urls)
+
+    def test_keeps_working_high_yield_mirrors(self):
+        with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        for live in (
+            "https://raw.githubusercontent.com/MohammadBahemmat/"
+            "V2ray-Collector/main/all_servers.txt",
+            "https://raw.githubusercontent.com/mahdibland/"
+            "V2RayAggregator/master/sub/sub_merge.txt",
+            "https://raw.githubusercontent.com/Danialsamadi/v2go/main/Sub1.txt",
+            "https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/"
+            "main/config/all_configs.txt",
+            "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+            "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/"
+            "subscribe/v2ray.txt",
+        ):
+            self.assertIn(live, urls)
+
+
+class TestHtmlEntityLinks(unittest.TestCase):
+    """B1: &amp; is unescaped before parsing and never reaches the output."""
+
+    def test_vless_with_html_entities(self):
+        link = (
+            "vless://uuid@1.2.3.4:443?security=tls&amp;sni=example.com"
+            "&amp;type=ws#remark"
+        )
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node)
+        self.assertTrue(node.tls_enabled)
+        self.assertEqual(node.sni, "example.com")
+        self.assertEqual(node.network, "ws")
+        self.assertNotIn("&amp;", node.raw_link)
+        self.assertNotIn("&amp;", node.original_link)
+
+    def test_extract_links_unescapes_entities(self):
+        text = (
+            "vless://uuid@1.2.3.4:443?security=reality&amp;sni=example.com"
+            "&amp;type=tcp#a\n"
+            "trojan://pw@2.2.2.2:443?sni=x.example&amp;type=ws#b"
+        )
+        links = collector.extract_links(text)
+        self.assertEqual(len(links), 2)
+        for link in links:
+            self.assertNotIn("&amp;", link)
+        node = collector.parse_node_info(links[0])
+        self.assertTrue(node.tls_enabled)
+        self.assertEqual(node.sni, "example.com")
+
+    def test_double_escaped_entity(self):
+        node = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=tls&amp;amp;sni=ex.com#r"
+        )
+        self.assertIsNotNone(node)
+        self.assertTrue(node.tls_enabled)
+        self.assertEqual(node.sni, "ex.com")
+
+    def test_renamed_link_has_no_html_entities(self):
+        node = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=tls&amp;sni=example.com#old"
+        )
+        node.avg_latency_ms = 30
+        link = collector.rename_node(node, "DE", 1)
+        self.assertNotIn("&amp;", link)
+        self.assertIn("security=tls&sni=example.com", link)
+        self.assertIn("🇩🇪 Germany 01 | VLESS | ⚡ 30ms | BrickVPN", link)
+
+
+class TestBlockedPorts(unittest.TestCase):
+    """B2: service/OS ports never enter the pipeline."""
+
+    def test_blocked_ports_rejected(self):
+        for port in sorted(collector.BLOCKED_PORTS):
+            self.assertIsNone(
+                collector.parse_node_info(
+                    f"vless://uuid@1.1.1.1:{port}?security=tls#x"
+                ),
+                f"port {port} must be blocked",
+            )
+
+    def test_ss_on_smb_port_rejected(self):
+        self.assertIsNone(
+            collector.parse_node_info("ss://aes-256-gcm:pw@51.222.141.125:445#x")
+        )
+
+    def test_vmess_on_mysql_port_rejected(self):
+        cfg = {"add": "1.2.3.4", "port": 3306, "id": "uuid", "net": "tcp"}
+        link = "vmess://" + base64.b64encode(json.dumps(cfg).encode()).decode()
+        self.assertIsNone(collector.parse_node_info(link))
+
+    def test_normal_ports_allowed(self):
+        for port in (443, 8443, 8388, 8080, 2053):
+            self.assertIsNotNone(
+                collector.parse_node_info(
+                    f"vless://uuid@1.1.1.1:{port}?security=tls#x"
+                ),
+                f"port {port} must be allowed",
+            )
+
+
+class TestTlsRankingPriority(unittest.IsolatedAsyncioTestCase):
+    """B2: a verified TLS node outranks an identical-latency plain node."""
+
+    async def test_tls_wins_tiebreak(self):
+        async def fake_handshake(n):
+            return True
+
+        async def fake_payload(n):
+            return True, 128, 40.0
+
+        tls_node = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
+            network="tcp", resolved_ip="1.1.1.1",
+        )
+        plain_node = collector.NodeInfo(
+            protocol="ss", host="2.2.2.2", port=8388, tls_enabled=False,
+            network="tcp", resolved_ip="2.2.2.2",
+        )
+
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
+            await collector.verify_node_stability(tls_node)
+            await collector.verify_node_stability(plain_node)
+
+        self.assertLess(tls_node.quality_score, plain_node.quality_score)
+        self.assertAlmostEqual(
+            plain_node.quality_score - tls_node.quality_score,
+            collector.NON_TLS_PENALTY_MS,
+            delta=2.0,
+        )
+
+
+class TestLatencyCapAndIpDiversity(unittest.IsolatedAsyncioTestCase):
+    """B3: MAX_LATENCY_MS cap and one node per unique IP per country."""
+
+    async def test_slow_node_dropped(self):
+        async def fake_handshake(n):
+            return True
+
+        async def fake_payload(n):
+            return True, 64, float(collector.MAX_LATENCY_MS * 2 + 200)
+
+        node = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
+            network="tcp", resolved_ip="1.1.1.1",
+        )
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
+            result = await collector.verify_node_stability(node)
+
+        self.assertIsNone(result)
+        self.assertIn("cap", node.error)
+        self.assertIsNone(node.quality_score)
+
+    async def test_fast_node_kept(self):
+        async def fake_handshake(n):
+            return True
+
+        async def fake_payload(n):
+            return True, 64, 60.0
+
+        node = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
+            network="tcp", resolved_ip="1.1.1.1",
+        )
+        with mock.patch.object(
+            collector, "_handshake_probe", side_effect=fake_handshake
+        ), mock.patch.object(
+            collector, "_payload_probe", side_effect=fake_payload
+        ):
+            result = await collector.verify_node_stability(node)
+
+        self.assertIsNotNone(result)
+        self.assertLessEqual(node.avg_latency_ms, collector.MAX_LATENCY_MS)
+
+    def test_dedupe_by_pure_ip_keeps_best(self):
+        best = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443,
+            resolved_ip="1.1.1.1", quality_score=10.0,
+        )
+        worse = collector.NodeInfo(
+            protocol="ss", host="1.1.1.1", port=8388,
+            resolved_ip="1.1.1.1", quality_score=50.0,
+        )
+        other = collector.NodeInfo(
+            protocol="vless", host="2.2.2.2", port=443,
+            resolved_ip="2.2.2.2", quality_score=20.0,
+        )
+        ranked = sorted([worse, other, best], key=lambda n: n.quality_score)
+        unique = collector.dedupe_by_pure_ip(ranked)
+
+        self.assertEqual([n.pure_ip for n in unique], ["1.1.1.1", "2.2.2.2"])
+        self.assertIs(unique[0], best)
+        self.assertEqual(len(unique), 2)
+
+
+class TestSequentialNumbering(unittest.TestCase):
+    """B4 + B5: independent 01..05 / 01..20 numbering and honest metrics."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", self.tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(self.tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(self.tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(self.tmp, "servers.txt")
+            ),
+            mock.patch.object(
+                collector, "SUB_FILE", os.path.join(self.tmp, "sub.txt")
+            ),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(self.tmp, "status.json")
+            ),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _build_nodes(self, count):
+        nodes = []
+        for i in range(count):
+            node = collector.NodeInfo(
+                protocol="vless", host=f"10.0.0.{i + 1}", port=443,
+                resolved_ip=f"10.0.0.{i + 1}", country_code="DE",
+                quality_score=float(i), avg_latency_ms=10 + i,
+            )
+            nodes.append(node)
+        return nodes
+
+    def test_numbering_restarts_per_output_list(self):
+        nodes = self._build_nodes(7)
+        report = collector.write_all_outputs(
+            {"DE": nodes}, {}, total_tested=12, total_passed=7
+        )
+
+        with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+            server_lines = f.read().splitlines()
+        self.assertEqual(len(server_lines), collector.MAIN_QUOTA_PER_COUNTRY)
+        for idx, line in enumerate(server_lines, start=1):
+            self.assertIn(f"Germany {idx:02d} |", line)
+
+        with open(os.path.join(collector.COUNTRIES_DIR, "DE.txt"), encoding="utf-8") as f:
+            country_lines = f.read().splitlines()
+        self.assertEqual(len(country_lines), 7)
+        for idx, line in enumerate(country_lines, start=1):
+            self.assertIn(f"Germany {idx:02d} |", line)
+
+        self.assertEqual(report["main_sub_count"], collector.MAIN_QUOTA_PER_COUNTRY)
+        self.assertEqual(report["total_tested"], 12)
+        self.assertEqual(report["total_passed"], 7)
+        self.assertGreater(report["total_tested"], report["total_passed"])
+
+    def test_status_json_records_probed_candidates(self):
+        nodes = self._build_nodes(3)
+        collector.write_all_outputs(
+            {"DE": nodes}, {}, total_tested=3888, total_passed=2267
+        )
+        with open(collector.STATUS_FILE, encoding="utf-8") as f:
+            status = json.load(f)
+        self.assertEqual(status["total_tested"], 3888)
+        self.assertEqual(status["total_passed"], 2267)
+        self.assertGreater(status["total_tested"], status["total_passed"])
+        self.assertGreater(status["main_sub_count"], 0)
 
 
 if __name__ == "__main__":
