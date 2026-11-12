@@ -796,11 +796,13 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
 
 class TestSourcesFile(unittest.TestCase):
     """D4: sources.txt must hold exactly six live subscription mirrors."""
+    """D4: sources.txt must hold exactly ten live subscription mirrors."""
 
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
         self.assertEqual(len(urls), 6)
+        self.assertEqual(len(urls), 10)
         for dead in (
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/"
@@ -816,6 +818,14 @@ class TestSourcesFile(unittest.TestCase):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
         for live in (
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/mci_top100.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/irancell_top100.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/tci_top100.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/iran_top100_checked.txt",
             "https://raw.githubusercontent.com/MohammadBahemmat/"
             "V2ray-Collector/main/all_servers.txt",
             "https://raw.githubusercontent.com/mahdibland/"
