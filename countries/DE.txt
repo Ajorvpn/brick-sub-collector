@@ -1,0 +1,2 @@
+ss://YWVzLTI1Ni1nY206WEtGS2wyclVMaklwNzQ@185.226.172.8:8008#🇩🇪 Germany 01 | SS | ⚡ 136ms | BrickVPN
+vless://7d74eae4-8a06-4306-a923-ad686f30bf26@OV-Germany1.09vpn.com:80?path=%2Fvless%2F&security=none&encryption=none&type=ws#🇩🇪 Germany 02 | VLESS | ⚡ 218ms | BrickVPN

@@ -1,0 +1,96 @@
+{
+  "updated_at": "2026-11-14T04:40:53Z",
+  "total_tested": 57,
+  "total_passed": 47,
+  "main_sub_count": 16,
+  "countries": {
+    "AT": {
+      "count": 0,
+      "quota": 5,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "Austria",
+      "flag": "🇦🇹"
+    },
+    "CA": {
+      "count": 0,
+      "quota": 5,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "Canada",
+      "flag": "🇨🇦"
+    },
+    "CH": {
+      "count": 0,
+      "quota": 5,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "Switzerland",
+      "flag": "🇨🇭"
+    },
+    "DE": {
+      "count": 2,
+      "quota": 5,
+      "status": "low",
+      "avg_latency_ms": 177,
+      "country_name": "Germany",
+      "flag": "🇩🇪"
+    },
+    "FI": {
+      "count": 0,
+      "quota": 5,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "Finland",
+      "flag": "🇫🇮"
+    },
+    "FR": {
+      "count": 0,
+      "quota": 5,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "France",
+      "flag": "🇫🇷"
+    },
+    "GB": {
+      "count": 34,
+      "quota": 5,
+      "status": "healthy",
+      "avg_latency_ms": 147,
+      "country_name": "United Kingdom",
+      "flag": "🇬🇧"
+    },
+    "NL": {
+      "count": 4,
+      "quota": 5,
+      "status": "low",
+      "avg_latency_ms": 298,
+      "country_name": "Netherlands",
+      "flag": "🇳🇱"
+    },
+    "SE": {
+      "count": 0,
+      "quota": 5,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "Sweden",
+      "flag": "🇸🇪"
+    },
+    "US": {
+      "count": 7,
+      "quota": 5,
+      "status": "healthy",
+      "avg_latency_ms": 101,
+      "country_name": "United States",
+      "flag": "🇺🇸"
+    }
+  },
+  "alerts": [
+    "AT",
+    "CA",
+    "CH",
+    "FI",
+    "FR",
+    "SE"
+  ]
+}
