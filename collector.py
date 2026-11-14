@@ -44,10 +44,15 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs
 
 import aiohttp
+
+try:  # optional dependency: only needed for enc:v1: subscription output
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:  # pragma: no cover - only when the package is missing
+    AESGCM = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -74,7 +79,7 @@ PROBE_GAP = 0.1
 # Active payload read budget (was 2.5s: silent endpoints burned the whole wait).
 PAYLOAD_READ_TIMEOUT = 0.8
 SS_PROBE_READ_TIMEOUT = 0.4
-MAX_LATENCY_MS = 500
+MAX_LATENCY_MS = 650
 NON_TLS_PENALTY_MS = 150.0
 MAX_CONCURRENT_PROBES = 240
 MAX_CONCURRENT_DNS = 200
@@ -92,6 +97,9 @@ MMDB_CANDIDATE_URLS: List[str] = [
 
 MAIN_QUOTA_PER_COUNTRY = 5
 COUNTRY_FILE_QUOTA = 20
+# Per-operator subscription size (output/operators/{op}.txt).
+OPERATOR_QUOTA = 30
+OPERATOR_TAGS: Tuple[str, ...] = ("mci", "irancell", "tci")
 
 PROXY_SCHEMES = ("vless", "vmess", "trojan", "ss")
 
@@ -99,6 +107,29 @@ PROXY_SCHEMES = ("vless", "vmess", "trojan", "ss")
 BLOCKED_PORTS: Set[int] = {
     21, 22, 23, 25, 53, 110, 135, 137, 138, 139, 143, 445,
     1433, 3306, 3389, 5432, 6379, 27017,
+}
+
+# Encrypted-only policy: plaintext endpoints on these ports never reach the
+# main subscription (80/8080/8008 are plain HTTP, the rest are abused proxies).
+PLAINTEXT_AND_ABUSED_PORTS: Set[int] = {80, 8080, 8008, 8880, 8388, 19999}
+
+# Transports sing-box cannot consume; a node using one is useless downstream.
+UNSUPPORTED_TRANSPORTS: Set[str] = {"xhttp", "splithttp", "kcp", "mkcp", "quic"}
+
+# Ports a TLS proxy endpoint is realistically served on (ranking preference).
+PREFERRED_TLS_PORTS: Set[int] = {443, 8443, 2053, 2083, 2087, 2096}
+IRAN_VERIFIED_BONUS_MS: float = -150.0
+PREFERRED_PORT_BONUS_MS: float = -35.0
+
+# Domains valid ONLY as SNI camouflage, NEVER as the proxy's connect host.
+# ``cloudflare.com`` is intentionally absent: legitimate CF-fronted nodes use it.
+DECOY_ONLY_HOSTS: Set[str] = {
+    "chatgpt.com", "openai.com", "apple.com", "icloud.com", "microsoft.com",
+    "live.com", "office.com", "bing.com", "google.com", "youtube.com",
+    "gstatic.com", "googleapis.com", "yahoo.com", "speedtest.net",
+    "fast.com", "netflix.com", "spotify.com", "discord.com", "github.com",
+    "gitlab.com", "amazon.com", "aws.amazon.com", "samsung.com",
+    "mozilla.org", "firefox.com", "wikipedia.org", "telegram.org",
 }
 
 # Non-TLS transports/protocols that must answer the HTTP payload probe.
@@ -137,6 +168,10 @@ class NodeInfo:
     network: str = "tcp"
     original_link: str = ""
     raw_link: str = ""
+    security: str = ""
+    path: str = "/"
+    iran_verified: bool = False
+    operator_tags: Set[str] = field(default_factory=set)
 
     resolved_ip: Optional[str] = None
     country_code: Optional[str] = None
@@ -258,6 +293,116 @@ def _extract_query_params(query: str) -> Dict[str, str]:
     return {k: (v[0] if v else "") for k, v in parsed.items()}
 
 
+def _is_decoy_connect_host(host: str) -> bool:
+    """True when *host* is a camouflage domain that cannot be a proxy host."""
+    h = (host or "").strip().lower().rstrip(".")
+    if not h:
+        return True
+    for decoy in DECOY_ONLY_HOSTS:
+        if h == decoy or h.endswith("." + decoy):
+            return True
+    return False
+
+
+def _is_ip_literal(value: str) -> bool:
+    try:
+        ipaddress.ip_address((value or "").strip().strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
+    """Return ``(iran_verified, operator_tags)`` for a source URL."""
+    u = (url or "").strip().lower()
+    tags: Set[str] = set()
+    iran_ok = any(
+        k in u
+        for k in (
+            "sakha1370/openray",
+            "output_iran/",
+            "mahsanet/mahsafreeconfig",
+        )
+    )
+    if "/mci" in u or "mci_top" in u:
+        tags.add("mci")
+    if "/irancell" in u or "irancell_top" in u or "/mtn" in u:
+        tags.add("irancell")
+    if "/tci" in u or "tci_top" in u:
+        tags.add("tci")
+    return iran_ok, tags
+
+
+def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
+    """Merge source provenance from a duplicate endpoint into *target*."""
+    target.iran_verified = target.iran_verified or other.iran_verified
+    target.operator_tags.update(other.operator_tags)
+
+
+def is_main_pool_eligible(node: NodeInfo) -> bool:
+    """Encrypted-only, sing-box compatible nodes may enter the main pool."""
+    return (
+        node.tls_enabled
+        and node.protocol in ("vless", "trojan", "vmess")
+        and node.port not in PLAINTEXT_AND_ABUSED_PORTS
+        and not _is_decoy_connect_host(node.host)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare CIDR validation & clean-IP pool
+# ---------------------------------------------------------------------------
+
+CLOUDFLARE_ALL_IPV4_NETS: Tuple[ipaddress.IPv4Network, ...] = tuple(
+    ipaddress.ip_network(cidr)
+    for cidr in (
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+        "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+        "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22",
+        "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+        "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    )
+)
+
+# Edge range Iranian carriers (MCI / Irancell) block at the IP layer.
+BLOCKED_CF_NET: ipaddress.IPv4Network = ipaddress.ip_network("188.114.96.0/20")
+
+DEFAULT_CF_CLEAN_IPS: Tuple[str, ...] = (
+    "104.18.2.161",
+    "104.17.147.22",
+    "172.66.44.108",
+    "104.19.144.83",
+    "104.18.32.47",
+)
+
+
+def is_cloudflare_ip(ip_str: str) -> bool:
+    """True when *ip_str* is an IPv4 address inside an official CF range."""
+    try:
+        ip_obj = ipaddress.ip_address((ip_str or "").strip())
+        if not isinstance(ip_obj, ipaddress.IPv4Address):
+            return False
+        return any(ip_obj in net for net in CLOUDFLARE_ALL_IPV4_NETS)
+    except ValueError:
+        return False
+
+
+def is_blocked_cloudflare_ip(ip_str: str) -> bool:
+    """True when *ip_str* is inside the carrier-blocked CF edge range."""
+    try:
+        ip_obj = ipaddress.ip_address((ip_str or "").strip())
+        return isinstance(ip_obj, ipaddress.IPv4Address) and (
+            ip_obj in BLOCKED_CF_NET
+        )
+    except ValueError:
+        return False
+
+
+def is_safe_cloudflare_clean_ip(ip_str: str) -> bool:
+    """A clean IP must be Cloudflare-owned and outside the blocked range."""
+    return is_cloudflare_ip(ip_str) and not is_blocked_cloudflare_ip(ip_str)
+
+
 def parse_node_info(link: str) -> Optional[NodeInfo]:
     # B1: unescape HTML entities (``&amp;``) before any URI/query parsing.
     clean = _clean_link(link)
@@ -292,11 +437,24 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
             return None
         if not host or not _port_allowed(port):
             return None
+        if _is_decoy_connect_host(host):
+            return None
+
+        net = str(cfg.get("net", "") or "").lower()
+        if net in ("", "raw"):
+            net = "tcp"
+        if net in UNSUPPORTED_TRANSPORTS:
+            return None
+
         node.host = host
         node.port = port
-        node.network = str(cfg.get("net", "tcp")).lower()
+        node.network = net
         node.tls_enabled = str(cfg.get("tls", "")).lower() == "tls"
+        node.security = "tls" if node.tls_enabled else ""
         node.sni = cfg.get("sni") or cfg.get("host") or None
+        node.path = str(cfg.get("path", "") or "/")
+        if not node.tls_enabled and node.port in PLAINTEXT_AND_ABUSED_PORTS:
+            return None
         return node
 
     if "#" in rest:
@@ -344,18 +502,49 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
     node.host = host
     node.port = port
 
+    # Decoy domains answer ``GET /`` instantly but are not proxy endpoints.
+    if _is_decoy_connect_host(host):
+        return None
+
+    security = params.get("security", "").lower()
+    net = (params.get("type", "") or "").lower()
+    if net in ("", "raw"):
+        net = "tcp"
+    if net in UNSUPPORTED_TRANSPORTS:
+        return None
+
     if scheme == "trojan":
         node.tls_enabled = True
-        node.network = params.get("type", "tcp").lower()
+        node.network = net
+        node.security = "tls"
         node.sni = params.get("sni") or params.get("host") or None
     elif scheme == "vless":
-        node.tls_enabled = params.get("security", "").lower() in ("tls", "reality")
-        node.network = params.get("type", "tcp").lower()
+        node.tls_enabled = security in ("tls", "reality")
+        node.network = net
+        node.security = security if security in ("tls", "reality") else ""
         node.sni = params.get("sni") or params.get("host") or None
     else:
         node.tls_enabled = False
         node.network = "tcp"
+        node.security = ""
         node.sni = None
+
+    node.path = params.get("path") or "/"
+
+    if node.security == "reality":
+        # Reality without a public key, or with an IP as SNI, cannot work.
+        pbk = (params.get("pbk") or "").strip()
+        if not pbk or not node.sni or _is_ip_literal(node.sni):
+            return None
+
+    # Encrypted-only policy for the main pool. ``ss://`` is always plaintext
+    # and is excluded by protocol instead, so its parser stays permissive.
+    if (
+        not node.tls_enabled
+        and node.port in PLAINTEXT_AND_ABUSED_PORTS
+        and node.protocol != "ss"
+    ):
+        return None
 
     return node
 
@@ -664,14 +853,16 @@ async def resolve_and_dedup_nodes(nodes: List[NodeInfo]) -> List[NodeInfo]:
         if ip and _is_public_ip(ip):
             public.append(n)
 
-    # Deduplicate by (resolved_ip, port)
-    seen_ips: Set[str] = set()
+    # Deduplicate by (resolved_ip, port), merging source provenance
+    seen_ips: Dict[str, NodeInfo] = {}
     unique: List[NodeInfo] = []
     for n in public:
         k = n.ip_key
-        if k in seen_ips:
+        existing = seen_ips.get(k)
+        if existing is not None:
+            _merge_provenance(existing, n)
             continue
-        seen_ips.add(k)
+        seen_ips[k] = n
         unique.append(n)
 
     return unique
@@ -705,9 +896,52 @@ PAYLOAD_REQUEST_TEMPLATE = (
 )
 
 
+WS_UPGRADE_NETWORKS = ("ws", "http", "h2", "httpupgrade")
+
+# HTTP statuses that prove the endpoint is not a usable proxy path
+# (Cloudflare 52x, gateway errors, explicit rejections).
+PROBE_REJECT_STATUS: Set[int] = {
+    403, 500, 502, 503, 504, 520, 521, 522, 523, 524, 525, 526, 530,
+}
+
+WS_UPGRADE_TEMPLATE = (
+    "GET {path} HTTP/1.1\r\n"
+    "Host: {host}\r\n"
+    "User-Agent: Mozilla/5.0\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "\r\n"
+)
+
+
 def _build_payload_request(node: NodeInfo) -> bytes:
     """Active HTTP/WebSocket upgrade request used by the payload probe."""
     return PAYLOAD_REQUEST_TEMPLATE.format(host=node.sni or node.host).encode()
+
+
+def _build_ws_upgrade_request(node: NodeInfo) -> bytes:
+    """WebSocket upgrade request targeting the node's own configured path."""
+    raw_path = getattr(node, "path", "") or ""
+    req_path = raw_path if raw_path.startswith("/") else "/"
+    return WS_UPGRADE_TEMPLATE.format(
+        path=req_path, host=node.sni or node.host
+    ).encode()
+
+
+def _http_status_code(payload: bytes) -> Optional[int]:
+    """Parse the status code out of an HTTP response head."""
+    if not payload:
+        return None
+    first_line = payload.split(b"\r\n", 1)[0]
+    parts = first_line.split()
+    if len(parts) < 2:
+        return None
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
 
 
 async def _close_writer(writer: asyncio.StreamWriter) -> None:
@@ -722,7 +956,7 @@ async def _close_writer(writer: asyncio.StreamWriter) -> None:
 
 
 async def _open_connection(
-    node: NodeInfo,
+    node: NodeInfo, timeout: Optional[float] = None
 ) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     """Connect to the node, completing a full TLS handshake when required.
 
@@ -733,15 +967,17 @@ async def _open_connection(
     if not ip:
         raise ConnectionError("node has no resolved IP")
 
+    deadline = PROBE_TIMEOUT if timeout is None else timeout
+
     if not node.tls_enabled:
         return await asyncio.wait_for(
-            asyncio.open_connection(ip, node.port), timeout=PROBE_TIMEOUT
+            asyncio.open_connection(ip, node.port), timeout=deadline
         )
 
     sni = node.sni or node.host
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(ip, node.port, ssl=_SSL_CTX, server_hostname=sni),
-        timeout=PROBE_TIMEOUT,
+        timeout=deadline,
     )
     ssl_object = writer.get_extra_info("ssl_object")
     if ssl_object is None or ssl_object.cipher() is None:
@@ -768,17 +1004,23 @@ def _requires_http_response(node: NodeInfo) -> bool:
     )
 
 
-async def _payload_probe(node: NodeInfo) -> Tuple[bool, int, float]:
-    """Probe 2: active payload download / TTFB verification.
+async def _payload_probe(
+    node: NodeInfo, timeout: Optional[float] = None
+) -> Tuple[bool, int, float]:
+    """Probe 2: protocol-aware reachability / TTFB verification.
 
-    Returns ``(ok, payload_bytes, latency)``. Latency is the connection (and
-    TLS handshake) establishment time, replaced by real TTFB when payload
-    flows, so healthy-but-silent reality endpoints are not penalised by the
-    read wait.
+    Returns ``(ok, payload_bytes, latency)``. Latency is the independent second
+    connection (and TLS handshake) establishment time, replaced by real TTFB
+    when payload flows.
 
     Strictness:
-      * TLS endpoints must handshake with a valid cipher. Payload bytes or a
-        clean read timeout pass; EOF, reset and TLS alerts drop the node.
+      * TLS endpoints must complete an independent handshake with a valid
+        cipher. ``ws``/``http``/``h2``/``httpupgrade`` endpoints are asked for a
+        WebSocket upgrade and are rejected only on non-HTTP junk or a gateway
+        error status; a read timeout or a clean close passes.
+      * ``tcp``/``raw``/``grpc``/``reality`` TLS endpoints are never written to:
+        they close the socket on unauthenticated HTTP text, so EOF after a
+        valid cipher must not drop them.
       * Non-TLS vless/vmess/trojan (and ws/http/h2 transports) must answer the
         HTTP probe with payload starting ``HTTP/`` inside PAYLOAD_READ_TIMEOUT.
       * Non-TLS ``ss://`` endpoints receive 32 random bytes; only an immediate
@@ -786,11 +1028,57 @@ async def _payload_probe(node: NodeInfo) -> Tuple[bool, int, float]:
     """
     started = time.monotonic()
     try:
-        reader, writer = await _open_connection(node)
+        reader, writer = await _open_connection(node, timeout=timeout)
     except Exception:
         return False, 0, (time.monotonic() - started) * 1000.0
 
     established_ms = (time.monotonic() - started) * 1000.0
+
+    if node.tls_enabled:
+        # A valid cipher is the whole verdict for non-HTTP transports.
+        # Note: For Reality/TCP/gRPC, this check proves TLS handshake
+        # reachability only, not VLESS/Trojan proxy authentication.
+        if (node.network or "").lower() in WS_UPGRADE_NETWORKS:
+            request = _build_ws_upgrade_request(node)
+            try:
+                writer.write(request)
+                await asyncio.wait_for(
+                    writer.drain(), timeout=PAYLOAD_READ_TIMEOUT
+                )
+            except (ssl.SSLError, OSError, asyncio.TimeoutError):
+                await _close_writer(writer)
+                return False, 0, established_ms
+            except Exception:
+                await _close_writer(writer)
+                return False, 0, established_ms
+
+            try:
+                chunk = await asyncio.wait_for(
+                    reader.read(PAYLOAD_READ_BYTES),
+                    timeout=PAYLOAD_READ_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                await _close_writer(writer)
+                return True, 0, established_ms
+            except (ssl.SSLError, OSError):
+                # Reset after a valid handshake is normal for WS servers.
+                await _close_writer(writer)
+                return True, 0, established_ms
+
+            await _close_writer(writer)
+            payload = chunk or b""
+            if not payload:
+                # Clean EOF after a valid cipher is not a failure.
+                return True, 0, established_ms
+            if not payload.startswith(b"HTTP/"):
+                return False, len(payload), established_ms
+            status = _http_status_code(payload)
+            if status in PROBE_REJECT_STATUS:
+                return False, len(payload), established_ms
+            return True, len(payload), established_ms
+
+        await _close_writer(writer)
+        return True, 0, established_ms
 
     if not node.tls_enabled and node.protocol == "ss":
         request = os.urandom(32)
@@ -861,6 +1149,11 @@ async def verify_node_stability(node: NodeInfo) -> Optional[Dict[str, Any]]:
     jitter_ms = round(abs(latency_1 - latency_2))
     penalty = 0.0 if node.tls_enabled else NON_TLS_PENALTY_MS
     quality = avg_ms + (jitter_ms * 1.5) + penalty
+    # Iran-verified sources are prefered; so are realistic TLS ports.
+    if node.iran_verified:
+        quality += IRAN_VERIFIED_BONUS_MS
+    if node.tls_enabled and node.port in PREFERRED_TLS_PORTS:
+        quality += PREFERRED_PORT_BONUS_MS
 
     node.latency_1 = latency_1
     node.latency_2 = latency_2
@@ -877,17 +1170,103 @@ async def verify_node_stability(node: NodeInfo) -> Optional[Dict[str, Any]]:
     }
 
 
+def subnet24_key(ip: str) -> str:
+    """``/24`` bucket of an IPv4 address (hostnames are their own bucket)."""
+    raw = (ip or "").strip()
+    parts = raw.split(".")
+    if len(parts) == 4 and all(p.isdigit() for p in parts):
+        return f"{parts[0]}.{parts[1]}.{parts[2]}.0/24"
+    return raw
+
+
 def dedupe_by_pure_ip(nodes: List[NodeInfo]) -> List[NodeInfo]:
-    """Keep only the best-ranked node per unique IP (input must be sorted)."""
+    """Keep the best node per IP, then put one node per ``/24`` subnet first.
+
+    Overflow nodes (same subnet, different IP) are still returned so a country
+    with a thin IP pool can fill its quota, but only after every distinct
+    subnet has had a chance to contribute.
+    """
     seen: Set[str] = set()
+    by_ip: Dict[str, NodeInfo] = {}
     unique: List[NodeInfo] = []
     for n in nodes:
         ip = n.pure_ip
-        if not ip or ip in seen:
+        if not ip:
+            continue
+        existing = by_ip.get(ip)
+        if existing is not None:
+            _merge_provenance(existing, n)
             continue
         seen.add(ip)
+        by_ip[ip] = n
         unique.append(n)
-    return unique
+
+    primary: List[NodeInfo] = []
+    overflow: List[NodeInfo] = []
+    seen_subnets: Set[str] = set()
+    for n in unique:
+        s24 = subnet24_key(n.pure_ip)
+        if s24 in seen_subnets:
+            overflow.append(n)
+        else:
+            seen_subnets.add(s24)
+            primary.append(n)
+    return primary + overflow
+
+
+def _transport_bucket(node: NodeInfo) -> str:
+    sec = (getattr(node, "security", "") or "").lower()
+    net = (node.network or "tcp").lower()
+    if sec == "reality" or "security=reality" in (node.raw_link or "").lower():
+        return "reality"
+    if net in ("ws", "httpupgrade"):
+        return "ws-tls"
+    if net == "grpc":
+        return "grpc-tls"
+    if net in ("http", "h2"):
+        return "h2-tls"
+    return "tcp-tls"
+
+
+def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo]:
+    """Pick up to *quota* nodes: distinct ``/24`` subnets first, round-robin
+    across transport buckets so one transport never owns every slot."""
+    if quota <= 0:
+        return []
+    ordered = dedupe_by_pure_ip(nodes)
+    if len(ordered) <= quota:
+        return ordered
+
+    buckets: Dict[str, List[NodeInfo]] = {}
+    for n in ordered:
+        buckets.setdefault(_transport_bucket(n), []).append(n)
+
+    bucket_order = ["reality", "ws-tls", "grpc-tls", "h2-tls", "tcp-tls"]
+    selected: List[NodeInfo] = []
+    seen_subnets: Set[str] = set()
+    made_progress = True
+    while len(selected) < quota and made_progress:
+        made_progress = False
+        for b in bucket_order:
+            pool = buckets.get(b, [])
+            for idx, cand in enumerate(pool):
+                s24 = subnet24_key(cand.pure_ip)
+                if s24 not in seen_subnets:
+                    selected.append(pool.pop(idx))
+                    seen_subnets.add(s24)
+                    made_progress = True
+                    break
+            if len(selected) >= quota:
+                break
+
+    if len(selected) < quota:
+        selected_ids = {id(n) for n in selected}
+        for n in ordered:
+            if id(n) not in selected_ids:
+                selected.append(n)
+                if len(selected) >= quota:
+                    break
+    return selected
 
 
 
@@ -903,6 +1282,181 @@ def build_clean_name(
     return f"{flag} {name} {index:02d} | {protocol.upper()} | ⚡ {avg_latency_ms}ms | BrickVPN"
 
 
+# ---------------------------------------------------------------------------
+# Iran DPI link shaping: fp=chrome + Cloudflare clean-IP substitution
+# ---------------------------------------------------------------------------
+
+SHAPE_CF_NETWORKS = ("ws", "grpc", "http", "h2", "httpupgrade")
+
+
+def _query_keys(query: str) -> Set[str]:
+    return {p.split("=", 1)[0] for p in query.split("&") if p}
+
+
+def _set_query_params(query: str, values: Dict[str, str]) -> str:
+    """Set or append query parameters while preserving the original order."""
+    parts = [p for p in query.split("&") if p]
+    remaining = dict(values)
+    out: List[str] = []
+    for part in parts:
+        key = part.split("=", 1)[0]
+        if key in remaining:
+            out.append(f"{key}={remaining.pop(key)}")
+        else:
+            out.append(part)
+    out.extend(f"{k}={v}" for k, v in remaining.items())
+    return "&".join(out)
+
+
+def _replace_authority_host(authority: str, new_host: str) -> str:
+    """Swap the host of ``userinfo@host:port``, keeping both ends intact."""
+    userinfo, sep, hostport = authority.rpartition("@")
+    prefix = f"{userinfo}{sep}"
+    if hostport.startswith("["):
+        end = hostport.find("]")
+        port = hostport[end + 1:] if end != -1 else ""
+    elif ":" in hostport:
+        port = ":" + hostport.rsplit(":", 1)[1]
+    else:
+        port = ""
+    return f"{prefix}{new_host}{port}"
+
+
+def _shape_uri_link(
+    link: str,
+    new_host: Optional[str] = None,
+    params: Optional[Dict[str, str]] = None,
+    ensure_fp: bool = False,
+) -> str:
+    """Rewrite a vless:// or trojan:// link in place (param order preserved)."""
+    try:
+        scheme, rest = link.split("://", 1)
+    except ValueError:
+        return link
+
+    fragment = ""
+    if "#" in rest:
+        rest, fragment = rest.split("#", 1)
+    query = ""
+    if "?" in rest:
+        rest, query = rest.split("?", 1)
+
+    if new_host:
+        rest = _replace_authority_host(rest, new_host)
+
+    update = dict(params or {})
+    if ensure_fp and "fp" not in _query_keys(query):
+        update["fp"] = "chrome"
+    query = _set_query_params(query, update)
+
+    shaped = f"{scheme}://{rest}"
+    if query:
+        shaped += "?" + query
+    if fragment:
+        shaped += "#" + fragment
+    return shaped
+
+
+def _shape_vmess_link(
+    link: str,
+    new_host: Optional[str] = None,
+    domain_sni: str = "",
+    ensure_fp: bool = False,
+) -> str:
+    """Rewrite a vmess:// JSON config (connect address / sni / host / fp)."""
+    b64 = link[len("vmess://"):].split("#", 1)[0]
+    pad = len(b64) % 4
+    if pad:
+        b64 += "=" * (4 - pad)
+    try:
+        cfg = json.loads(
+            base64.b64decode(b64).decode("utf-8", errors="replace")
+        )
+    except Exception:
+        return link
+    if not isinstance(cfg, dict):
+        return link
+
+    if new_host:
+        cfg["add"] = new_host
+    if domain_sni:
+        cfg["sni"] = cfg.get("sni") or domain_sni
+        cfg["host"] = cfg.get("host") or domain_sni
+    if ensure_fp:
+        cfg["fp"] = cfg.get("fp") or "chrome"
+
+    new_b64 = base64.b64encode(
+        json.dumps(cfg, separators=(",", ":"), ensure_ascii=False).encode()
+    ).decode()
+    return "vmess://" + new_b64
+
+
+def shape_node_for_iran(
+    node: NodeInfo,
+    index: int = 1,
+    clean_ips: Optional[Sequence[str]] = None,
+    link: Optional[str] = None,
+) -> str:
+    """Shape one link for Iranian DPI.
+
+    * TLS links always carry ``fp=chrome`` so DPI does not fingerprint the
+      default Go/OpenSSL handshake.
+    * Cloudflare CDN nodes whose connect address sits inside a blocked edge
+      range (``188.114.96.0/20``) are re-pointed at a CIDR-verified clean IP,
+      while ``sni``/``host`` keep the camouflage domain untouched.
+    """
+    source = link if link is not None else (node.original_link or node.raw_link)
+    base = _clean_link(source or "")
+    if not base or not node.tls_enabled:
+        return base
+
+    requested = list(clean_ips) if clean_ips is not None else list(DEFAULT_CF_CLEAN_IPS)
+    pool = [str(ip).strip() for ip in requested if is_safe_cloudflare_clean_ip(str(ip))]
+    if not pool:
+        # Never trust an unverified override; fall back to the known-good pool.
+        pool = [ip for ip in DEFAULT_CF_CLEAN_IPS if is_safe_cloudflare_clean_ip(ip)]
+    if not pool:
+        pool = list(DEFAULT_CF_CLEAN_IPS)
+
+    domain_sni = ""
+    if node.sni and not _is_ip_literal(node.sni):
+        domain_sni = node.sni.strip()
+    elif node.host and not _is_ip_literal(node.host):
+        domain_sni = node.host.strip()
+
+    is_blocked_cf = is_blocked_cloudflare_ip(
+        node.resolved_ip
+    ) or is_blocked_cloudflare_ip(node.host)
+    should_replace_cf_ip = (
+        is_blocked_cf
+        and (node.network or "").lower() in SHAPE_CF_NETWORKS
+        and bool(domain_sni)
+    )
+    new_host = (
+        pool[(max(index, 1) - 1) % len(pool)] if should_replace_cf_ip else None
+    )
+
+    if node.protocol == "vmess":
+        return _shape_vmess_link(
+            base,
+            new_host=new_host,
+            domain_sni=domain_sni if should_replace_cf_ip else "",
+            ensure_fp=True,
+        )
+
+    if node.protocol not in ("vless", "trojan"):
+        return base
+
+    params: Dict[str, str] = {}
+    if should_replace_cf_ip:
+        params["sni"] = domain_sni
+        if (node.network or "").lower() in ("ws", "http", "h2", "httpupgrade"):
+            params["host"] = domain_sni
+    return _shape_uri_link(
+        base, new_host=new_host, params=params, ensure_fp=True
+    )
+
+
 def rename_node(node: NodeInfo, country_code: str, index: int) -> str:
     if not node.avg_latency_ms:
         node.avg_latency_ms = 0
@@ -911,6 +1465,7 @@ def rename_node(node: NodeInfo, country_code: str, index: int) -> str:
     )
     node.clean_name = clean
 
+    base_link = node.original_link
     if node.protocol == "vmess":
         b64 = node.original_link[len("vmess://"):].split("#", 1)[0]
         pad = len(b64) % 4
@@ -925,19 +1480,16 @@ def rename_node(node: NodeInfo, country_code: str, index: int) -> str:
                 new_b64 = base64.b64encode(
                     json.dumps(cfg, separators=(",", ":"), ensure_ascii=False).encode()
                 ).decode()
-                node.renamed_link = "vmess://" + new_b64
-                return node.renamed_link
+                base_link = "vmess://" + new_b64
         except Exception:
-            pass
-        node.renamed_link = node.original_link
-        return node.renamed_link
-
-    link = node.original_link
-    if "#" in link:
-        base = link.split("#", 1)[0]
+            base_link = node.original_link
     else:
-        base = link
-    node.renamed_link = f"{base}#{clean}"
+        base = node.original_link.split("#", 1)[0]
+        base_link = f"{base}#{clean}"
+
+    # fp=chrome / clean-IP shaping is applied last so it also covers the
+    # freshly generated remark fragment.
+    node.renamed_link = shape_node_for_iran(node, index, link=base_link)
     return node.renamed_link
 
 
@@ -950,6 +1502,7 @@ def _ensure_dirs() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     os.makedirs(COUNTRIES_DIR, exist_ok=True)
     os.makedirs(PROTOCOLS_DIR, exist_ok=True)
+    os.makedirs(os.path.join(OUTPUT_DIR, "operators"), exist_ok=True)
 
 
 def _write_plain(path: str, links: List[str]) -> None:
@@ -968,6 +1521,137 @@ def _write_b64(path: str, links: List[str]) -> None:
         f.write(encoded)
 
 
+# ---------------------------------------------------------------------------
+# Encrypted subscription (enc:v1:, AES-256-GCM)
+# ---------------------------------------------------------------------------
+
+SUB_ENC_PREFIX = "enc:v1:"
+SUB_ENC_FILENAME = "sub_enc.txt"
+AES_KEY_BYTES = 32
+GCM_NONCE_BYTES = 12
+GCM_TAG_BYTES = 16
+
+
+def parse_aes_key(raw_key: str) -> bytes:
+    """Parse a 64-char hex or base64 encoded 32-byte AES-256 key."""
+    raw = (raw_key or "").strip()
+    if not raw:
+        raise ValueError("empty AES key")
+    key: Optional[bytes] = None
+    if len(raw) == 64:
+        try:
+            key = bytes.fromhex(raw)
+        except ValueError:
+            key = None
+    if key is None:
+        try:
+            key = base64.b64decode(raw, validate=True)
+        except Exception as exc:
+            raise ValueError("AES key is neither hex nor base64") from exc
+    if len(key) != AES_KEY_BYTES:
+        raise ValueError("AES-256 key must decode to exactly 32 bytes")
+    return key
+
+
+def encrypt_subscription_payload(plaintext: str, key_bytes: bytes) -> str:
+    """Encrypt *plaintext* into ``enc:v1:<base64(nonce + ct + tag)>``."""
+    if AESGCM is None:
+        raise RuntimeError("cryptography is required for encrypted subscriptions")
+    if len(key_bytes) != AES_KEY_BYTES:
+        raise ValueError("AES-256 key must be exactly 32 bytes")
+    nonce = os.urandom(GCM_NONCE_BYTES)
+    sealed = AESGCM(key_bytes).encrypt(nonce, plaintext.encode("utf-8"), None)
+    return SUB_ENC_PREFIX + base64.b64encode(nonce + sealed).decode("ascii")
+
+
+def decrypt_subscription_payload(token: str, key_bytes: bytes) -> str:
+    """Reverse :func:`encrypt_subscription_payload` (authenticated)."""
+    if AESGCM is None:
+        raise RuntimeError("cryptography is required for encrypted subscriptions")
+    text = (token or "").strip()
+    if not text.startswith(SUB_ENC_PREFIX):
+        raise ValueError("missing enc:v1: prefix")
+    blob = base64.b64decode(text[len(SUB_ENC_PREFIX):], validate=True)
+    if len(blob) < GCM_NONCE_BYTES + GCM_TAG_BYTES:
+        raise ValueError("encrypted payload is truncated")
+    nonce = blob[:GCM_NONCE_BYTES]
+    sealed = blob[GCM_NONCE_BYTES:]
+    return AESGCM(key_bytes).decrypt(nonce, sealed, None).decode("utf-8")
+
+
+def _write_encrypted_sub(plaintext: str) -> bool:
+    """Write ``sub_enc.txt`` when ``BRICK_SUB_AES_KEY`` is configured."""
+    path = os.path.join(OUTPUT_DIR, SUB_ENC_FILENAME)
+    raw_key = os.environ.get("BRICK_SUB_AES_KEY", "").strip()
+    if not raw_key:
+        # Never publish a stale encrypted mirror from an earlier run.
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+        return False
+    try:
+        key_bytes = parse_aes_key(raw_key)
+        token = encrypt_subscription_payload(plaintext, key_bytes)
+    except (ValueError, RuntimeError) as exc:
+        print(f"[warn] Encrypted subscription skipped: {exc}")
+        return False
+    with open(path, "w", encoding="ascii") as f:
+        f.write(token)
+        f.write("\n")
+    return True
+
+
+def _operator_candidates(by_protocol: Dict[str, List[NodeInfo]]) -> List[NodeInfo]:
+    """Every tested node once, best-ranked first (input for operator subs)."""
+    pool: List[NodeInfo] = []
+    seen: Set[int] = set()
+    for proto in PROXY_SCHEMES:
+        for node in by_protocol.get(proto, []):
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            pool.append(node)
+    pool.sort(
+        key=lambda n: n.quality_score
+        if n.quality_score is not None
+        else float("inf")
+    )
+    return pool
+
+
+def _write_operator_outputs(
+    by_protocol: Dict[str, List[NodeInfo]], operators_dir: str
+) -> Dict[str, Any]:
+    """Write operator-scoped subscriptions (mci / irancell / tci).
+
+    Tagged nodes come first, then other Iran-verified nodes, then the rest of
+    the eligible pool, so a thin operator feed is backfilled instead of empty.
+    """
+    eligible = [n for n in _operator_candidates(by_protocol) if is_main_pool_eligible(n)]
+    report: Dict[str, Any] = {}
+    for op in OPERATOR_TAGS:
+        tagged = [n for n in eligible if op in n.operator_tags]
+        tagged_ids = {id(n) for n in tagged}
+        iran_fill = [
+            n for n in eligible if id(n) not in tagged_ids and n.iran_verified
+        ]
+        filled_ids = tagged_ids | {id(n) for n in iran_fill}
+        rest = [n for n in eligible if id(n) not in filled_ids]
+        picked = select_diverse_top_nodes(
+            tagged + iran_fill + rest, OPERATOR_QUOTA
+        )
+        links = [
+            rename_node(n, n.country_code or "DE", idx)
+            for idx, n in enumerate(picked, start=1)
+        ]
+        _write_plain(os.path.join(operators_dir, f"{op}.txt"), links)
+        _write_b64(os.path.join(operators_dir, f"{op}_base64.txt"), links)
+        report[op] = {"count": len(links), "quota": OPERATOR_QUOTA}
+    return report
+
+
 def write_all_outputs(
     by_country: Dict[str, List[NodeInfo]],
     by_protocol: Dict[str, List[NodeInfo]],
@@ -976,21 +1660,36 @@ def write_all_outputs(
 ) -> Dict[str, Any]:
     _ensure_dirs()
 
+    operators_dir = os.path.join(OUTPUT_DIR, "operators")
+    os.makedirs(operators_dir, exist_ok=True)
+
     # servers.txt / sub.txt: each country numbered independently 01..05.
+    # Only encrypted, sing-box compatible nodes compete for the main pool.
     main_links: List[str] = []
     for code in sorted(ALLOWED_COUNTRIES.keys()):
-        nodes = by_country.get(code, [])
-        for idx, n in enumerate(nodes[:MAIN_QUOTA_PER_COUNTRY], start=1):
+        nodes = [
+            n for n in by_country.get(code, []) if is_main_pool_eligible(n)
+        ]
+        selected = select_diverse_top_nodes(nodes, MAIN_QUOTA_PER_COUNTRY)
+        for idx, n in enumerate(selected, start=1):
             main_links.append(rename_node(n, code, idx))
 
     _write_plain(SERVERS_FILE, main_links)
     _write_b64(SUB_FILE, main_links)
 
+    # Optional AES-256-GCM protected mirror of servers.txt (enc:v1: payload).
+    plain_main = "\n".join(main_links)
+    if main_links:
+        plain_main += "\n"
+    encrypted_sub = _write_encrypted_sub(plain_main)
+
     country_report: Dict[str, Any] = {}
     for code in sorted(ALLOWED_COUNTRIES.keys()):
-        nodes = by_country.get(code, [])
+        nodes = [
+            n for n in by_country.get(code, []) if is_main_pool_eligible(n)
+        ]
         # countries/{CODE}.txt: numbered independently 01..20 per country.
-        top_nodes = nodes[:COUNTRY_FILE_QUOTA]
+        top_nodes = dedupe_by_pure_ip(nodes)[:COUNTRY_FILE_QUOTA]
         country_links = [
             rename_node(n, code, idx) for idx, n in enumerate(top_nodes, start=1)
         ]
@@ -1039,6 +1738,8 @@ def write_all_outputs(
 
     main_count = len(main_links)
 
+    operator_report = _write_operator_outputs(by_protocol, operators_dir)
+
     alerts = [
         code for code, rep in country_report.items() if rep["status"] == "empty"
     ]
@@ -1048,7 +1749,9 @@ def write_all_outputs(
         "total_tested": total_tested,
         "total_passed": total_passed,
         "main_sub_count": main_count,
+        "encrypted_sub": encrypted_sub,
         "countries": country_report,
+        "operators": operator_report,
         "alerts": alerts,
     }
     with open(STATUS_FILE, "w", encoding="utf-8") as f:
@@ -1175,30 +1878,31 @@ async def _main_impl() -> int:
     pages = await fetch_all(urls)
     _mark("fetch")
 
-    # --- Stage 1: Extract links -------------------------------------------
-    all_links: List[str] = []
+    # --- Stage 1+2: extract links, parse, tag provenance, dedup (host,port)
+    parsed: List[NodeInfo] = []
+    by_key: Dict[Tuple[str, int], NodeInfo] = {}
+    total_extracted = 0
     for url, text in zip(urls, pages):
         if not text:
             continue
+        iran_ok, tags = classify_source_url(url)
         links = extract_links(text)
+        total_extracted += len(links)
         print(f"[info] {url}: extracted {len(links)} link(s)")
-        all_links.extend(links)
+        for link in links:
+            node = parse_node_info(link)
+            if node is None:
+                continue
+            node.iran_verified = iran_ok
+            node.operator_tags = set(tags)
+            existing = by_key.get(node.key)
+            if existing is not None:
+                _merge_provenance(existing, node)
+                continue
+            by_key[node.key] = node
+            parsed.append(node)
 
-    print(f"[info] Total extracted: {len(all_links)} link(s)")
-
-    # --- Stage 2: Parse + dedup by (host, port) ---------------------------
-    parsed: List[NodeInfo] = []
-    seen_keys: Set[Tuple[str, int]] = set()
-    for link in all_links:
-        node = parse_node_info(link)
-        if node is None:
-            continue
-        k = node.key
-        if k in seen_keys:
-            continue
-        seen_keys.add(k)
-        parsed.append(node)
-
+    print(f"[info] Total extracted: {total_extracted} link(s)")
     print(f"[info] After parse + dedup: {len(parsed)} node(s)")
     _mark("parse")
 

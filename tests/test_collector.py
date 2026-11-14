@@ -33,7 +33,7 @@ class TestParseNodeInfo(unittest.TestCase):
         self.assertEqual(node.network, "ws")
 
     def test_vmess_no_tls(self):
-        cfg = {"add": "5.6.7.8", "port": 8080, "id": "uuid", "net": "tcp"}
+        cfg = {"add": "5.6.7.8", "port": 8081, "id": "uuid", "net": "tcp"}
         link = "vmess://" + base64.b64encode(json.dumps(cfg).encode()).decode()
         node = collector.parse_node_info(link)
         self.assertIsNotNone(node)
@@ -52,7 +52,10 @@ class TestParseNodeInfo(unittest.TestCase):
         )
 
     def test_vless_tls_reality(self):
-        link = "vless://uuid@2.2.2.2:443?security=reality&sni=example.com&type=ws#remark"
+        link = (
+            "vless://uuid@2.2.2.2:443?security=reality&sni=example.com"
+            "&pbk=pubkey123&type=ws#remark"
+        )
         node = collector.parse_node_info(link)
         self.assertIsNotNone(node)
         self.assertEqual(node.protocol, "vless")
@@ -63,7 +66,7 @@ class TestParseNodeInfo(unittest.TestCase):
         self.assertEqual(node.network, "ws")
 
     def test_vless_no_tls(self):
-        link = "vless://uuid@3.3.3.3:8080?security=none&type=tcp#remark"
+        link = "vless://uuid@3.3.3.3:8081?security=none&type=tcp#remark"
         node = collector.parse_node_info(link)
         self.assertIsNotNone(node)
         self.assertFalse(node.tls_enabled)
@@ -128,7 +131,10 @@ class TestRenameNode(unittest.TestCase):
         node.country_code = "FR"
         node.avg_latency_ms = 55
         result = collector.rename_node(node, "FR", 3)
-        self.assertTrue(result.startswith("vless://uuid@2.2.2.2:443?security=tls#"))
+        self.assertTrue(
+            result.startswith("vless://uuid@2.2.2.2:443?security=tls")
+        )
+        self.assertIn("fp=chrome", result)
         self.assertIn("🇫🇷 France 03 | VLESS | ⚡ 55ms | BrickVPN", result)
 
     def test_trojan_rename(self):
@@ -795,13 +801,11 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSourcesFile(unittest.TestCase):
-    """D4: sources.txt must hold exactly six live subscription mirrors."""
     """D4: sources.txt must hold exactly ten live subscription mirrors."""
 
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 6)
         self.assertEqual(len(urls), 10)
         for dead in (
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
@@ -859,7 +863,7 @@ class TestHtmlEntityLinks(unittest.TestCase):
     def test_extract_links_unescapes_entities(self):
         text = (
             "vless://uuid@1.2.3.4:443?security=reality&amp;sni=example.com"
-            "&amp;type=tcp#a\n"
+            "&amp;pbk=pubkey123&amp;type=tcp#a\n"
             "trojan://pw@2.2.2.2:443?sni=x.example&amp;type=ws#b"
         )
         links = collector.extract_links(text)
@@ -949,9 +953,10 @@ class TestTlsRankingPriority(unittest.IsolatedAsyncioTestCase):
             await collector.verify_node_stability(plain_node)
 
         self.assertLess(tls_node.quality_score, plain_node.quality_score)
+        # The TLS node also earns the preferred-port bonus (443).
         self.assertAlmostEqual(
             plain_node.quality_score - tls_node.quality_score,
-            collector.NON_TLS_PENALTY_MS,
+            collector.NON_TLS_PENALTY_MS - collector.PREFERRED_PORT_BONUS_MS,
             delta=2.0,
         )
 
@@ -1057,9 +1062,13 @@ class TestSequentialNumbering(unittest.TestCase):
     def _build_nodes(self, count):
         nodes = []
         for i in range(count):
+            host = f"10.0.0.{i + 1}"
+            link = f"vless://uuid@{host}:443?security=tls&sni=example.com#node"
             node = collector.NodeInfo(
-                protocol="vless", host=f"10.0.0.{i + 1}", port=443,
-                resolved_ip=f"10.0.0.{i + 1}", country_code="DE",
+                protocol="vless", host=host, port=443,
+                tls_enabled=True, sni="example.com", security="tls",
+                network="tcp", original_link=link, raw_link=link,
+                resolved_ip=host, country_code="DE",
                 quality_score=float(i), avg_latency_ms=10 + i,
             )
             nodes.append(node)
@@ -1099,6 +1108,600 @@ class TestSequentialNumbering(unittest.TestCase):
         self.assertEqual(status["total_passed"], 2267)
         self.assertGreater(status["total_tested"], status["total_passed"])
         self.assertGreater(status["main_sub_count"], 0)
+
+
+class _FakeStreamWriter:
+    """Minimal asyncio.StreamWriter stand-in (records what was written)."""
+
+    def __init__(self):
+        self.written = b""
+        self.closed = False
+
+    def write(self, data):
+        self.written += data
+
+    async def drain(self):
+        return None
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+
+class _FakeStreamReader:
+    """Minimal asyncio.StreamReader stand-in (fixed payload or a timeout)."""
+
+    def __init__(self, payload=b"", timeout=False):
+        self.payload = payload
+        self.timeout = timeout
+
+    async def read(self, _n):
+        if self.timeout:
+            raise asyncio.TimeoutError
+        return self.payload
+
+
+class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
+    """C1-C5: encrypted-only policy, protocol-aware probing, /24 diversity,
+    operator outputs."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", self.tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(self.tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(self.tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(self.tmp, "servers.txt")
+            ),
+            mock.patch.object(
+                collector, "SUB_FILE", os.path.join(self.tmp, "sub.txt")
+            ),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(self.tmp, "status.json")
+            ),
+        ]
+        for patch in self.patches:
+            patch.start()
+
+    def tearDown(self):
+        for patch in self.patches:
+            patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _tls_node(
+        self,
+        host,
+        port=443,
+        country="DE",
+        quality=10.0,
+        network="tcp",
+        security="tls",
+        path="/",
+        tags=(),
+        iran=False,
+        protocol="vless",
+    ):
+        link = (
+            f"{protocol}://uuid@{host}:{port}?security={security}"
+            f"&sni=example.com&type={network}#node"
+        )
+        return collector.NodeInfo(
+            protocol=protocol,
+            host=host,
+            port=port,
+            tls_enabled=True,
+            sni="example.com",
+            network=network,
+            security=security,
+            path=path,
+            original_link=link,
+            raw_link=link,
+            resolved_ip=host,
+            country_code=country,
+            quality_score=quality,
+            avg_latency_ms=int(quality),
+            iran_verified=iran,
+            operator_tags=set(tags),
+        )
+
+    def test_decoy_host_rejected_but_valid_as_sni_and_cloudflare_allowed(self):
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@chatgpt.com:8443?security=tls&sni=chatgpt.com"
+                "&type=ws#decoy"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@www.apple.com:443?security=tls&sni=www.apple.com#decoy"
+            )
+        )
+
+        sni_node = collector.parse_node_info(
+            "vless://uuid@169.40.42.16:443?security=tls&sni=chatgpt.com&type=ws#ok"
+        )
+        self.assertIsNotNone(sni_node)
+        self.assertEqual(sni_node.sni, "chatgpt.com")
+        self.assertTrue(sni_node.tls_enabled)
+
+        cf_node = collector.parse_node_info(
+            "vless://uuid@cloudflare.com:443?security=tls&sni=cloudflare.com#cf"
+        )
+        self.assertIsNotNone(cf_node)
+        self.assertFalse(collector._is_decoy_connect_host("cloudflare.com"))
+        self.assertTrue(collector._is_decoy_connect_host("cdn.chatgpt.com"))
+
+    def test_plaintext_ss_and_port_80_excluded_from_main_and_country_subs(self):
+        ss_node = collector.parse_node_info("ss://aes-256-gcm:pw@5.5.5.5:8388#ss")
+        self.assertIsNotNone(ss_node)
+        ss_node.resolved_ip = "5.5.5.5"
+        ss_node.country_code = "DE"
+        ss_node.quality_score = 5.0
+        ss_node.avg_latency_ms = 5
+
+        http_node = collector.parse_node_info(
+            "vless://uuid@6.6.6.6:80?security=tls&sni=a.example#p80"
+        )
+        self.assertIsNotNone(http_node)
+        http_node.resolved_ip = "6.6.6.6"
+        http_node.country_code = "DE"
+        http_node.quality_score = 1.0
+        http_node.avg_latency_ms = 1
+
+        good = self._tls_node("7.7.7.7", 443, quality=20.0)
+
+        collector.write_all_outputs(
+            {"DE": [http_node, ss_node, good]},
+            {"vless": [http_node, good], "ss": [ss_node]},
+            total_tested=3,
+            total_passed=3,
+        )
+
+        with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+            servers = f.read()
+        self.assertIn("7.7.7.7", servers)
+        self.assertNotIn("5.5.5.5", servers)
+        self.assertNotIn("6.6.6.6", servers)
+        self.assertEqual(len(servers.splitlines()), 1)
+
+        with open(
+            os.path.join(collector.COUNTRIES_DIR, "DE.txt"), encoding="utf-8"
+        ) as f:
+            country = f.read()
+        self.assertIn("7.7.7.7", country)
+        self.assertNotIn("5.5.5.5", country)
+        self.assertNotIn("6.6.6.6", country)
+
+        # protocols/ss.txt keeps grouping every passed ss node.
+        with open(
+            os.path.join(collector.PROTOCOLS_DIR, "ss.txt"), encoding="utf-8"
+        ) as f:
+            self.assertIn("5.5.5.5", f.read())
+
+    def test_unsupported_xhttp_and_splithttp_rejected(self):
+        for net in ("xhttp", "splithttp", "kcp", "mkcp", "quic"):
+            self.assertIsNone(
+                collector.parse_node_info(
+                    f"vless://uuid@1.2.3.4:443?security=tls&type={net}#x"
+                ),
+                f"transport {net} must be rejected",
+            )
+
+        raw_node = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=tls&type=raw#x"
+        )
+        self.assertIsNotNone(raw_node)
+        self.assertEqual(raw_node.network, "tcp")
+
+        default_node = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=tls#x"
+        )
+        self.assertIsNotNone(default_node)
+        self.assertEqual(default_node.network, "tcp")
+
+    def test_reality_without_pbk_or_with_ip_sni_rejected(self):
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@1.2.3.4:443?security=reality&sni=example.com"
+                "&type=tcp#x"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@1.2.3.4:443?security=reality&sni=1.2.3.4"
+                "&pbk=pubkey123&type=tcp#x"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@1.2.3.4:443?security=reality&pbk=pubkey123"
+                "&type=tcp#x"
+            )
+        )
+
+        node = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=reality&sni=www.apple.com"
+            "&pbk=pubkey123&type=tcp#x"
+        )
+        self.assertIsNotNone(node)
+        self.assertEqual(node.security, "reality")
+        self.assertTrue(node.tls_enabled)
+        self.assertEqual(node.sni, "www.apple.com")
+
+    async def test_reality_and_tcp_tls_eof_passes_payload_probe_while_ws_502_dropped(
+        self,
+    ):
+        reality = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
+            network="tcp", security="reality", sni="www.apple.com",
+            resolved_ip="1.1.1.1",
+        )
+
+        async def eof_open(_node, timeout=None):
+            return _FakeStreamReader(b""), _FakeStreamWriter()
+
+        with mock.patch.object(collector, "_open_connection", side_effect=eof_open):
+            ok, payload_bytes, latency = await collector._payload_probe(reality)
+        self.assertTrue(ok)
+        self.assertEqual(payload_bytes, 0)
+        self.assertGreaterEqual(latency, 0.0)
+
+        tcp_node = collector.NodeInfo(
+            protocol="trojan", host="2.2.2.2", port=443, tls_enabled=True,
+            network="tcp", security="tls", sni="example.com",
+            resolved_ip="2.2.2.2",
+        )
+        with mock.patch.object(collector, "_open_connection", side_effect=eof_open):
+            tcp_ok, _n, _latency = await collector._payload_probe(tcp_node)
+        self.assertTrue(tcp_ok)
+
+        ws_node = collector.NodeInfo(
+            protocol="vless", host="3.3.3.3", port=443, tls_enabled=True,
+            network="ws", security="tls", sni="example.com", path="/ws",
+            resolved_ip="3.3.3.3",
+        )
+
+        async def bad_gateway_open(_node, timeout=None):
+            return (
+                _FakeStreamReader(
+                    b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n"
+                ),
+                _FakeStreamWriter(),
+            )
+
+        with mock.patch.object(
+            collector, "_open_connection", side_effect=bad_gateway_open
+        ):
+            ws_ok, _n, _latency = await collector._payload_probe(ws_node)
+        self.assertFalse(ws_ok)
+
+        async def silent_open(_node, timeout=None):
+            return _FakeStreamReader(timeout=True), _FakeStreamWriter()
+
+        with mock.patch.object(
+            collector, "_open_connection", side_effect=silent_open
+        ):
+            silent_ok, _n, _latency = await collector._payload_probe(ws_node)
+        self.assertTrue(silent_ok)
+
+    async def test_ws_payload_probe_uses_node_path(self):
+        node = collector.NodeInfo(
+            protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
+            network="ws", security="tls", sni="cdn.example.com",
+            path="/custom-ws", resolved_ip="1.1.1.1",
+        )
+        writer = _FakeStreamWriter()
+
+        async def fake_open(_node, timeout=None):
+            return (
+                _FakeStreamReader(b"HTTP/1.1 101 Switching Protocols\r\n\r\n"),
+                writer,
+            )
+
+        with mock.patch.object(collector, "_open_connection", side_effect=fake_open):
+            ok, _n, _latency = await collector._payload_probe(node)
+
+        self.assertTrue(ok)
+        request = writer.written.decode()
+        self.assertTrue(request.startswith("GET /custom-ws HTTP/1.1\r\n"))
+        self.assertIn("Host: cdn.example.com", request)
+        self.assertIn("Upgrade: websocket", request)
+        self.assertIn("Connection: Upgrade", request)
+        self.assertIn("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==", request)
+        self.assertIn("Sec-WebSocket-Version: 13", request)
+
+    def test_subnet24_diversity_puts_distinct_subnets_first(self):
+        nodes = [
+            self._tls_node(ip, quality=float(i))
+            for i, ip in enumerate(
+                ["82.38.31.1", "82.38.31.2", "82.38.31.3", "9.9.9.9", "8.8.8.8"]
+            )
+        ]
+        ordered = collector.dedupe_by_pure_ip(nodes)
+        self.assertEqual(
+            [n.pure_ip for n in ordered],
+            ["82.38.31.1", "9.9.9.9", "8.8.8.8", "82.38.31.2", "82.38.31.3"],
+        )
+        self.assertEqual(collector.subnet24_key("82.38.31.77"), "82.38.31.0/24")
+        self.assertEqual(collector.subnet24_key("host.example"), "host.example")
+
+    def test_select_diverse_top_nodes_round_robins_transport_buckets(self):
+        reality = self._tls_node(
+            "10.0.0.1", quality=1.0, network="tcp", security="reality"
+        )
+        ws_same_subnet = self._tls_node("10.0.0.2", quality=2.0, network="ws")
+        ws_other_subnet = self._tls_node("11.0.0.5", quality=3.0, network="ws")
+        tcp_other_subnet = self._tls_node("12.0.0.9", quality=4.0, network="tcp")
+
+        picked = collector.select_diverse_top_nodes(
+            [reality, ws_same_subnet, ws_other_subnet, tcp_other_subnet], 3
+        )
+        self.assertEqual(
+            [n.pure_ip for n in picked], ["10.0.0.1", "11.0.0.5", "12.0.0.9"]
+        )
+        self.assertEqual(len(picked), 3)
+
+    def test_operator_outputs_generated_with_independent_numbering_and_provenance_merged(
+        self,
+    ):
+        nodes = [
+            self._tls_node("20.0.0.1", quality=1.0, tags=("mci",), iran=True),
+            self._tls_node("20.0.1.1", quality=2.0, tags=("mci",), iran=True),
+            self._tls_node("20.0.2.1", quality=3.0, iran=True),
+            self._tls_node("20.0.3.1", quality=4.0, tags=("tci",)),
+        ]
+        report = collector.write_all_outputs(
+            {"DE": nodes}, {"vless": nodes}, total_tested=4, total_passed=4
+        )
+
+        operators_dir = os.path.join(self.tmp, "operators")
+        mci_path = os.path.join(operators_dir, "mci.txt")
+        self.assertTrue(os.path.exists(mci_path))
+        with open(mci_path, encoding="utf-8") as f:
+            mci_lines = f.read().splitlines()
+        self.assertEqual(len(mci_lines), 4)
+        for idx, line in enumerate(mci_lines, start=1):
+            self.assertIn(f"Germany {idx:02d} |", line)
+
+        with open(
+            os.path.join(operators_dir, "mci_base64.txt"), encoding="utf-8"
+        ) as f:
+            decoded = base64.b64decode(f.read()).decode("utf-8")
+        self.assertEqual(decoded.splitlines(), mci_lines)
+
+        self.assertEqual(report["operators"]["mci"]["count"], 4)
+        self.assertEqual(
+            report["operators"]["mci"]["quota"], collector.OPERATOR_QUOTA
+        )
+        # Operators without their own feed are backfilled: Iran-verified nodes
+        # first, then the remaining eligible pool.
+        self.assertEqual(report["operators"]["irancell"]["count"], 4)
+        self.assertTrue(
+            os.path.exists(os.path.join(operators_dir, "irancell_base64.txt"))
+        )
+
+        with open(collector.STATUS_FILE, encoding="utf-8") as f:
+            status = json.load(f)
+        self.assertIn("operators", status)
+        self.assertEqual(status["operators"]["tci"]["quota"], 30)
+
+        # Provenance is merged when the same endpoint appears twice.
+        first = self._tls_node("30.0.0.1", quality=1.0, tags=("mci",), iran=True)
+        second = self._tls_node("30.0.0.1", port=8443, quality=2.0, tags=("tci",))
+        merged = collector.dedupe_by_pure_ip([first, second])
+        self.assertEqual(len(merged), 1)
+        self.assertTrue(merged[0].iran_verified)
+        self.assertEqual(merged[0].operator_tags, {"mci", "tci"})
+
+
+class TestFpShapingAndEncryption(unittest.TestCase):
+    """S1-S4: Cloudflare clean-IP substitution, fp=chrome and enc:v1: output."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", self.tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(self.tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(self.tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(self.tmp, "servers.txt")
+            ),
+            mock.patch.object(
+                collector, "SUB_FILE", os.path.join(self.tmp, "sub.txt")
+            ),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(self.tmp, "status.json")
+            ),
+        ]
+        for patch in self.patches:
+            patch.start()
+        os.environ.pop("BRICK_SUB_AES_KEY", None)
+
+    def tearDown(self):
+        os.environ.pop("BRICK_SUB_AES_KEY", None)
+        for patch in self.patches:
+            patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _tls_node(self, host, port=443, quality=10.0):
+        link = f"vless://uuid@{host}:{port}?security=tls&sni=example.com#node"
+        return collector.NodeInfo(
+            protocol="vless",
+            host=host,
+            port=port,
+            tls_enabled=True,
+            sni="example.com",
+            security="tls",
+            network="tcp",
+            original_link=link,
+            raw_link=link,
+            resolved_ip=host,
+            country_code="DE",
+            quality_score=quality,
+            avg_latency_ms=int(quality),
+        )
+
+    def _blocked_cf_ws_node(self):
+        link = (
+            "vless://uuid@188.114.97.7:443?security=tls&type=ws"
+            "&sni=sub.example.com&path=/ws#old"
+        )
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node)
+        node.resolved_ip = "188.114.97.7"
+        return node
+
+    def test_cloudflare_cidr_helpers_reject_188_114_and_non_cf_ips(self):
+        self.assertTrue(collector.is_cloudflare_ip("104.18.2.161"))
+        self.assertTrue(collector.is_cloudflare_ip("188.114.97.7"))
+        self.assertFalse(collector.is_cloudflare_ip("8.8.8.8"))
+        self.assertFalse(collector.is_cloudflare_ip("not-an-ip"))
+        self.assertFalse(collector.is_cloudflare_ip("2001:db8::1"))
+
+        self.assertTrue(collector.is_blocked_cloudflare_ip("188.114.97.7"))
+        self.assertFalse(collector.is_blocked_cloudflare_ip("104.18.2.161"))
+
+        self.assertTrue(collector.is_safe_cloudflare_clean_ip("104.18.2.161"))
+        self.assertFalse(collector.is_safe_cloudflare_clean_ip("188.114.97.7"))
+        self.assertFalse(collector.is_safe_cloudflare_clean_ip("8.8.8.8"))
+        for ip in collector.DEFAULT_CF_CLEAN_IPS:
+            self.assertTrue(collector.is_safe_cloudflare_clean_ip(ip), ip)
+
+    def test_shape_node_replaces_blocked_cf_ip_and_preserves_sni_and_host_vless(
+        self,
+    ):
+        node = self._blocked_cf_ws_node()
+        shaped = collector.shape_node_for_iran(node, 1)
+
+        self.assertTrue(shaped.startswith("vless://uuid@104.18.2.161:443?"))
+        self.assertNotIn("188.114.97.7", shaped)
+        self.assertIn("sni=sub.example.com", shaped)
+        self.assertIn("host=sub.example.com", shaped)
+        self.assertIn("fp=chrome", shaped)
+        self.assertIn("path=/ws", shaped)
+        self.assertTrue(shaped.endswith("#old"))
+
+    def test_shape_node_replaces_blocked_cf_ip_vmess(self):
+        cfg = {
+            "add": "188.114.97.7",
+            "port": 443,
+            "id": "uuid",
+            "net": "ws",
+            "tls": "tls",
+            "sni": "v.example.com",
+            "ps": "old",
+        }
+        link = "vmess://" + base64.b64encode(json.dumps(cfg).encode()).decode()
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node)
+        node.resolved_ip = "188.114.97.7"
+
+        shaped = collector.shape_node_for_iran(node, 1)
+        self.assertTrue(shaped.startswith("vmess://"))
+        b64 = shaped[len("vmess://"):]
+        pad = len(b64) % 4
+        if pad:
+            b64 += "=" * (4 - pad)
+        decoded = json.loads(base64.b64decode(b64).decode())
+
+        self.assertEqual(decoded["add"], "104.18.2.161")
+        self.assertEqual(decoded["sni"], "v.example.com")
+        self.assertEqual(decoded["host"], "v.example.com")
+        self.assertEqual(decoded["fp"], "chrome")
+        self.assertEqual(decoded["net"], "ws")
+
+    def test_shape_node_never_accepts_non_cloudflare_rogue_clean_ip(self):
+        node = self._blocked_cf_ws_node()
+        shaped = collector.shape_node_for_iran(node, 1, clean_ips=["1.2.3.4"])
+        self.assertIn("@104.18.2.161:443", shaped)
+        self.assertNotIn("1.2.3.4", shaped)
+
+    def test_encrypt_and_decrypt_subscription_payload_roundtrip(self):
+        key = bytes(range(32))
+        plaintext = (
+            "vless://uuid@1.1.1.1:443?security=tls&fp=chrome#a\n"
+            "vless://uuid@2.2.2.2:443?security=tls&fp=chrome#b\n"
+        )
+        token = collector.encrypt_subscription_payload(plaintext, key)
+
+        self.assertTrue(token.startswith("enc:v1:"))
+        raw = base64.b64decode(token[len("enc:v1:"):])
+        self.assertEqual(len(raw), 12 + len(plaintext.encode("utf-8")) + 16)
+        self.assertEqual(
+            collector.decrypt_subscription_payload(token, key), plaintext
+        )
+        # A fresh random nonce means the same plaintext never repeats.
+        self.assertNotEqual(
+            token, collector.encrypt_subscription_payload(plaintext, key)
+        )
+
+        tampered = token[:-6] + (
+            "AAAAAA" if not token.endswith("AAAAAA") else "BBBBBB"
+        )
+        with self.assertRaises(Exception):
+            collector.decrypt_subscription_payload(tampered, key)
+        with self.assertRaises(Exception):
+            collector.decrypt_subscription_payload(token, bytes(32))
+        with self.assertRaises(ValueError):
+            collector.decrypt_subscription_payload("plaintext", key)
+
+        self.assertEqual(len(collector.parse_aes_key(key.hex())), 32)
+        self.assertEqual(
+            len(collector.parse_aes_key(base64.b64encode(key).decode())), 32
+        )
+        for bad in ("", "abc", "00" * 16, "zz" * 32):
+            with self.assertRaises(ValueError):
+                collector.parse_aes_key(bad)
+
+    def test_write_all_outputs_generates_sub_enc_when_key_present(self):
+        nodes = [
+            self._tls_node("20.0.0.1", quality=1.0),
+            self._tls_node("20.0.1.1", quality=2.0),
+        ]
+        # Deterministic TEST key (32 bytes); never a production secret.
+        key_hex = "0123456789abcdef" * 4
+        enc_path = os.path.join(self.tmp, "sub_enc.txt")
+
+        os.environ["BRICK_SUB_AES_KEY"] = key_hex
+        try:
+            report = collector.write_all_outputs(
+                {"DE": nodes}, {"vless": nodes}, total_tested=2, total_passed=2
+            )
+        finally:
+            os.environ.pop("BRICK_SUB_AES_KEY", None)
+
+        self.assertTrue(report["encrypted_sub"])
+        self.assertTrue(os.path.exists(enc_path))
+        with open(enc_path, encoding="ascii") as f:
+            token = f.read().strip()
+        self.assertTrue(token.startswith("enc:v1:"))
+
+        with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+            servers = f.read()
+        self.assertEqual(
+            collector.decrypt_subscription_payload(
+                token, collector.parse_aes_key(key_hex)
+            ),
+            servers,
+        )
+
+        # Without the environment key the encrypted mirror must not go stale.
+        report_without_key = collector.write_all_outputs(
+            {"DE": nodes}, {"vless": nodes}, total_tested=2, total_passed=2
+        )
+        self.assertFalse(report_without_key["encrypted_sub"])
+        self.assertFalse(os.path.exists(enc_path))
 
 
 if __name__ == "__main__":
