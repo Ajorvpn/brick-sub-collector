@@ -38,9 +38,11 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -94,6 +96,15 @@ MMDB_CANDIDATE_URLS: List[str] = [
     "https://github.com/P3TERX/GeoLite.mmdb/raw/download/GeoLite2-Country.mmdb",
     "https://raw.githubusercontent.com/Loyalsoldier/geoip/release/Country.mmdb",
 ]
+
+# Real end-to-end tunnel verification: only nodes whose proxy stream actually
+# answers generate_204 through Xray may reach the published subscriptions.
+MAX_XRAY_CANDIDATES_PER_COUNTRY = 30
+XRAY_BATCH_SIZE = 75
+XRAY_PORT_BASE = 21000
+XRAY_TEST_URL = "http://cp.cloudflare.com/generate_204"
+XRAY_TEST_TIMEOUT = 4.5
+XRAY_STARTUP_DELAY = 0.35
 
 MAIN_QUOTA_PER_COUNTRY = 5
 COUNTRY_FILE_QUOTA = 20
@@ -192,6 +203,7 @@ class NodeInfo:
     latency_2: Optional[float] = None
     avg_latency_ms: Optional[int] = None
     jitter_ms: Optional[int] = None
+    ping_ms: Optional[float] = None
     quality_score: Optional[float] = None
     clean_name: Optional[str] = None
     renamed_link: Optional[str] = None
@@ -1377,6 +1389,439 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
 
 
 # ---------------------------------------------------------------------------
+# Xray-core end-to-end tunnel verification (generate_204)
+# ---------------------------------------------------------------------------
+
+
+def _xray_network(value: str) -> str:
+    """Map a share-link transport name onto an Xray stream network name."""
+    net = (value or "").lower()
+    if net in ("", "raw", "tcp"):
+        return "tcp"
+    if net == "http":
+        return "h2"
+    if net in ("ws", "httpupgrade", "grpc", "h2"):
+        return net
+    return "tcp"
+
+
+def _split_uri_parts(
+    link: str,
+) -> Optional[Tuple[str, str, str, int, Dict[str, str]]]:
+    """Split ``scheme://userinfo@host:port?query#fragment`` into its parts."""
+    try:
+        scheme, rest = link.split("://", 1)
+    except ValueError:
+        return None
+    scheme = scheme.lower()
+    if "#" in rest:
+        rest = rest.split("#", 1)[0]
+    query = ""
+    if "?" in rest:
+        rest, query = rest.split("?", 1)
+
+    userinfo, _sep, authority = rest.rpartition("@")
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end == -1:
+            return None
+        host = authority[1:end]
+        port_str = authority[end + 1:].lstrip(":")
+    elif ":" in authority:
+        host, port_str = authority.rsplit(":", 1)
+    else:
+        host, port_str = authority, ""
+    try:
+        port = int(port_str)
+    except (TypeError, ValueError):
+        return None
+    return scheme, userinfo, host.strip(), port, _extract_query_params(query)
+
+
+def _xray_stream_network_settings(
+    network: str,
+    path: str,
+    host_header: str,
+    service_name: str = "",
+    multi_mode: bool = False,
+) -> Dict[str, Any]:
+    """Transport specific ``streamSettings`` block for an Xray outbound."""
+    if network == "ws":
+        headers: Dict[str, str] = {}
+        if host_header:
+            headers["Host"] = host_header
+        return {"wsSettings": {"path": path or "/", "headers": headers}}
+    if network == "grpc":
+        return {
+            "grpcSettings": {
+                "serviceName": service_name,
+                "multiMode": multi_mode,
+            }
+        }
+    if network == "httpupgrade":
+        return {"httpupgradeSettings": {"path": path or "/", "host": host_header}}
+    if network == "h2":
+        return {
+            "httpSettings": {
+                "path": path or "/",
+                "host": [host_header] if host_header else [],
+            }
+        }
+    return {}
+
+
+def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
+    b64 = link[len("vmess://"):].split("#", 1)[0]
+    pad = len(b64) % 4
+    if pad:
+        b64 += "=" * (4 - pad)
+    try:
+        cfg = json.loads(base64.b64decode(b64).decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+
+    address = str(cfg.get("add", "")).strip()
+    try:
+        port = int(cfg.get("port", 0))
+    except (TypeError, ValueError):
+        return None
+    if not address or not (1 <= port <= 65535):
+        return None
+
+    network = _xray_network(str(cfg.get("net", "")))
+    security = "tls" if str(cfg.get("tls", "")).lower() == "tls" else "none"
+    stream: Dict[str, Any] = {"network": network, "security": security}
+    sni = str(cfg.get("sni") or cfg.get("host") or "").strip()
+    host_header = str(cfg.get("host") or "").strip()
+    if security == "tls":
+        stream["tlsSettings"] = {
+            "serverName": sni or address,
+            "allowInsecure": False,
+            "fingerprint": str(cfg.get("fp") or "chrome"),
+        }
+    stream.update(
+        _xray_stream_network_settings(
+            network,
+            str(cfg.get("path", "") or "/"),
+            host_header,
+            str(cfg.get("serviceName", "") or ""),
+            str(cfg.get("mode", "")) == "multi",
+        )
+    )
+
+    try:
+        alter_id = int(cfg.get("aid", 0) or 0)
+    except (TypeError, ValueError):
+        alter_id = 0
+    return {
+        "tag": tag,
+        "protocol": "vmess",
+        "settings": {
+            "vnext": [
+                {
+                    "address": address,
+                    "port": port,
+                    "users": [
+                        {
+                            "id": str(cfg.get("id", "")),
+                            "alterId": alter_id,
+                            "security": str(cfg.get("scy") or "auto"),
+                        }
+                    ],
+                }
+            ]
+        },
+        "streamSettings": stream,
+    }
+
+
+def build_xray_outbound_for_node(
+    node: NodeInfo, tag: str
+) -> Optional[Dict[str, Any]]:
+    """Build a complete Xray outbound JSON for *node*.
+
+    The link is shaped first (clean IP, ``fp=chrome``, ``ech``/``allowInsecure``
+    stripped), so the tunnel test exercises exactly what the client receives.
+    """
+    shaped = shape_node_for_iran(node, index=1)
+    if not shaped:
+        return None
+    if shaped.lower().startswith("vmess://"):
+        return _build_xray_vmess_outbound(shaped, tag)
+
+    parts = _split_uri_parts(shaped)
+    if parts is None:
+        return None
+    scheme, userinfo, host, port, params = parts
+    if scheme not in ("vless", "trojan") or not host or not userinfo:
+        return None
+
+    security = (params.get("security") or "").lower()
+    if security not in ("tls", "reality"):
+        if (node.security or "").lower() == "reality":
+            security = "reality"
+        elif node.tls_enabled:
+            security = "tls"
+        else:
+            security = "none"
+
+    network = _xray_network(params.get("type") or node.network)
+    stream: Dict[str, Any] = {"network": network, "security": security}
+    sni = (params.get("sni") or params.get("host") or node.sni or host).strip()
+    host_header = (params.get("host") or "").strip()
+
+    if security == "tls":
+        tls_settings: Dict[str, Any] = {
+            "serverName": sni,
+            "allowInsecure": False,
+            "fingerprint": params.get("fp") or "chrome",
+        }
+        alpn = params.get("alpn")
+        if alpn:
+            tls_settings["alpn"] = [a for a in alpn.split(",") if a]
+        stream["tlsSettings"] = tls_settings
+    elif security == "reality":
+        stream["realitySettings"] = {
+            "serverName": sni,
+            "fingerprint": params.get("fp") or "chrome",
+            "publicKey": params.get("pbk") or "",
+            "shortId": params.get("sid") or "",
+            "spiderX": params.get("spx") or "/",
+        }
+
+    stream.update(
+        _xray_stream_network_settings(
+            network,
+            params.get("path") or node.path or "/",
+            host_header,
+            params.get("serviceName", ""),
+            params.get("mode", "") == "multi",
+        )
+    )
+
+    if scheme == "vless":
+        settings: Dict[str, Any] = {
+            "vnext": [
+                {
+                    "address": host,
+                    "port": port,
+                    "users": [
+                        {
+                            "id": unquote(userinfo),
+                            "encryption": params.get("encryption") or "none",
+                            "flow": params.get("flow") or "",
+                        }
+                    ],
+                }
+            ]
+        }
+    else:
+        settings = {
+            "servers": [
+                {
+                    "address": host,
+                    "port": port,
+                    "password": unquote(userinfo),
+                }
+            ]
+        }
+
+    return {
+        "tag": tag,
+        "protocol": scheme,
+        "settings": settings,
+        "streamSettings": stream,
+    }
+
+
+def _xray_candidates(
+    nodes: List[NodeInfo],
+) -> Tuple[List[NodeInfo], List[NodeInfo]]:
+    """Per-country capped candidates plus nodes that cannot be tunnelled."""
+    eligible = [n for n in nodes if is_main_pool_eligible(n)]
+    passthrough = [n for n in nodes if not is_main_pool_eligible(n)]
+
+    by_country: Dict[str, List[NodeInfo]] = {}
+    for n in sorted(eligible, key=_effective_sort_key):
+        by_country.setdefault(n.country_code or "", []).append(n)
+
+    selected: List[NodeInfo] = []
+    for code in sorted(by_country):
+        unique = dedupe_by_pure_ip(by_country[code])
+        selected.extend(unique[:MAX_XRAY_CANDIDATES_PER_COUNTRY])
+    return selected, passthrough
+
+
+async def _xray_http_status(
+    proxy: str, url: str, timeout: float
+) -> Optional[int]:
+    """Fetch *url* through the local Xray HTTP inbound at *proxy*."""
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as session:
+            async with session.get(
+                url, proxy=proxy, allow_redirects=False
+            ) as resp:
+                return resp.status
+    except Exception:
+        return None
+
+
+def _tunnel_quality_score(node: NodeInfo, rtt_ms: float) -> float:
+    """Re-rank a verified node on its real tunnel RTT."""
+    quality = rtt_ms
+    if node.iran_verified:
+        quality += IRAN_VERIFIED_BONUS_MS
+    if node.tls_enabled and node.port in PREFERRED_TLS_PORTS:
+        quality += PREFERRED_PORT_BONUS_MS
+    return quality
+
+
+async def _probe_xray_port(index: int, node: NodeInfo) -> Optional[NodeInfo]:
+    proxy = f"http://127.0.0.1:{XRAY_PORT_BASE + index}"
+    started = time.monotonic()
+    status = await _xray_http_status(proxy, XRAY_TEST_URL, XRAY_TEST_TIMEOUT)
+    if status not in (200, 204):
+        return None
+    rtt_ms = (time.monotonic() - started) * 1000.0
+    node.ping_ms = round(rtt_ms, 1)
+    node.avg_latency_ms = int(round(rtt_ms))
+    node.quality_score = _tunnel_quality_score(node, rtt_ms)
+    return node
+
+
+async def _run_xray_batch(binary: str, batch: List[NodeInfo]) -> List[NodeInfo]:
+    """Run one xray instance for *batch* and return the nodes that answer 204."""
+    inbounds: List[Dict[str, Any]] = []
+    outbounds: List[Dict[str, Any]] = []
+    rules: List[Dict[str, Any]] = []
+    valid: List[Tuple[int, NodeInfo]] = []
+
+    for idx, node in enumerate(batch):
+        outbound = build_xray_outbound_for_node(node, f"out_{idx}")
+        if outbound is None:
+            continue
+        inbounds.append(
+            {
+                "tag": f"in_{idx}",
+                "port": XRAY_PORT_BASE + idx,
+                "listen": "127.0.0.1",
+                "protocol": "http",
+                "sniffing": {"enabled": False},
+            }
+        )
+        outbounds.append(outbound)
+        rules.append(
+            {
+                "type": "field",
+                "inboundTag": [f"in_{idx}"],
+                "outboundTag": f"out_{idx}",
+            }
+        )
+        valid.append((idx, node))
+
+    if not valid:
+        return []
+
+    config = {
+        "log": {"loglevel": "none"},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": {"domainStrategy": "AsIs", "rules": rules},
+    }
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        cfg_path = os.path.join(tmpdir, "xray.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(config, f)
+
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "run",
+            "-c",
+            cfg_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            await asyncio.sleep(XRAY_STARTUP_DELAY)
+            results = await asyncio.gather(
+                *(_probe_xray_port(idx, node) for idx, node in valid)
+            )
+        finally:
+            try:
+                proc.terminate()
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=5.0)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+
+    return [node for node in results if node is not None]
+
+
+async def verify_nodes_with_xray(
+    nodes: List[NodeInfo], xray_bin: Optional[str] = None
+) -> List[NodeInfo]:
+    """Keep only nodes that tunnel ``generate_204`` through a real Xray instance.
+
+    Absent the binary (local runs, unit tests) the socket-verified list is
+    returned unchanged, so the collector still works without Xray installed.
+    """
+    if not nodes:
+        return nodes
+
+    binary = xray_bin or os.environ.get("XRAY_BIN") or shutil.which("xray")
+    if not binary:
+        print(
+            "[info] Xray binary not found; keeping socket-verified nodes "
+            "without tunnel check"
+        )
+        return nodes
+
+    candidates, passthrough = _xray_candidates(nodes)
+    if not candidates:
+        return nodes
+
+    survivors: List[NodeInfo] = []
+    passed_count = 0
+    ran_batches = 0
+    for start in range(0, len(candidates), XRAY_BATCH_SIZE):
+        batch = candidates[start:start + XRAY_BATCH_SIZE]
+        try:
+            batch_passed = await _run_xray_batch(binary, batch)
+        except Exception as exc:
+            # A broken binary/config must never empty the subscription.
+            print(f"[warn] Xray batch failed: {exc}")
+            survivors.extend(batch)
+            continue
+        ran_batches += 1
+        passed_count += len(batch_passed)
+        survivors.extend(batch_passed)
+
+    if ran_batches == 0 and survivors:
+        print("[warn] Xray could not run; falling back to socket-verified nodes")
+        return nodes
+
+    print(
+        f"[info] Xray tunnel check: {passed_count}/{len(candidates)} "
+        "candidate(s) passed generate_204"
+    )
+    return survivors + passthrough
+
+
+# ---------------------------------------------------------------------------
 # Clean node renaming
 # ---------------------------------------------------------------------------
 
@@ -2136,6 +2581,15 @@ async def _main_impl() -> int:
         passed = [n for n in candidates if n.quality_score is not None]
         print(f"[info] After dual-probe stability: {len(passed)} node(s)")
         _mark("probe")
+
+        # --- Stage 5b: end-to-end tunnel verification through real Xray -----
+        tunnel_checked = await verify_nodes_with_xray(passed)
+        if tunnel_checked:
+            passed = tunnel_checked
+            print(f"[info] After Xray tunnel check: {len(passed)} node(s)")
+        else:
+            print("[warn] Xray tunnel check produced no nodes; keeping stable set")
+        _mark("xray tunnel")
 
         # --- Stage 6: GeoIP filtering (only when the offline DB was unusable)
         if mmdb_ready:
