@@ -1798,21 +1798,30 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
         node.resolved_ip = host
         return node
 
-    def test_ech_parameter_stripped_from_vless_trojan_and_vmess(self):
-        vless_node = self._vless_tls_node("&ech=brokenConfigList")
-        self.assertIn("ech=brokenConfigList", vless_node.original_link)
+    def test_ech_and_allow_insecure_stripped_from_vless_trojan_and_vmess(self):
+        vless_link = (
+            "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+            "&ech=brokenConfigList&allowInsecure=1#node"
+        )
+        vless_node = collector.parse_node_info(vless_link)
+        self.assertIsNotNone(vless_node)
+        vless_node.resolved_ip = "1.2.3.4"
+
         vless_shaped = collector.shape_node_for_iran(vless_node, 1)
         self.assertNotIn("ech", vless_shaped)
+        self.assertNotIn("allowinsecure", vless_shaped.lower())
         self.assertIn("sni=a.example", vless_shaped)
         self.assertIn("fp=chrome", vless_shaped)
 
         trojan_node = collector.parse_node_info(
-            "trojan://pw@2.2.2.2:443?sni=b.example&ech=QUJD#node"
+            "trojan://pw@2.2.2.2:443?sni=b.example&insecure=1&ech=QUJD#node"
         )
         self.assertIsNotNone(trojan_node)
         trojan_node.resolved_ip = "2.2.2.2"
+
         trojan_shaped = collector.shape_node_for_iran(trojan_node, 1)
         self.assertNotIn("ech", trojan_shaped)
+        self.assertNotIn("insecure", trojan_shaped.lower())
         self.assertIn("sni=b.example", trojan_shaped)
 
         cfg = {
@@ -1824,6 +1833,9 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             "sni": "c.example",
             "ech": "Zm9v",
             "echConfigList": "ZWNobGlzdA==",
+            "allowInsecure": 1,
+            "insecure": 1,
+            "verify_cert": False,
         }
         vmess_link = "vmess://" + base64.b64encode(
             json.dumps(cfg).encode()
@@ -1839,8 +1851,15 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             b64 += "=" * (4 - pad)
         decoded = json.loads(base64.b64decode(b64).decode())
 
-        self.assertNotIn("ech", decoded)
-        self.assertNotIn("echConfigList", decoded)
+        for dead_key in (
+            "ech",
+            "echConfigList",
+            "allowInsecure",
+            "allow_insecure",
+            "insecure",
+            "verify_cert",
+        ):
+            self.assertNotIn(dead_key, decoded)
         self.assertEqual(decoded["fp"], "chrome")
         self.assertEqual(decoded["sni"], "c.example")
 
@@ -1862,49 +1881,54 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             "fp=chrome", collector.shape_node_for_iran(missing, 1)
         )
 
-    def test_allow_insecure_links_rejected_in_parse_node_info(self):
-        self.assertIsNone(
-            collector.parse_node_info(
-                "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
-                "&allowInsecure=1#x"
-            )
+    def test_raw_ip_tls_node_without_domain_sni_excluded_from_main_pool(self):
+        raw_trojan = collector.parse_node_info(
+            "trojan://pass@216.152.147.7:443?security=tls#CA"
         )
-        self.assertIsNone(
-            collector.parse_node_info(
-                "vless://uuid@1.2.3.4:443?security=tls&sni=a.example&insecure=true#x"
-            )
-        )
-        self.assertIsNone(
-            collector.parse_node_info(
-                "trojan://pw@1.2.3.4:443?sni=a.example&allow_insecure=yes#x"
-            )
-        )
+        self.assertIsNotNone(raw_trojan)
+        self.assertIsNone(raw_trojan.sni)
+        self.assertFalse(collector.is_main_pool_eligible(raw_trojan))
 
         cfg = {
-            "add": "1.2.3.4",
+            "add": "199.247.23.31",
             "port": 443,
             "id": "uuid",
             "tls": "tls",
-            "sni": "a.example",
-            "allowInsecure": 1,
+            "net": "tcp",
         }
-        unsafe_vmess = "vmess://" + base64.b64encode(
+        vmess_link = "vmess://" + base64.b64encode(
             json.dumps(cfg).encode()
         ).decode()
-        self.assertIsNone(collector.parse_node_info(unsafe_vmess))
+        raw_vmess = collector.parse_node_info(vmess_link)
+        self.assertIsNotNone(raw_vmess)
+        self.assertIsNone(raw_vmess.sni)
+        self.assertFalse(collector.is_main_pool_eligible(raw_vmess))
 
-        cfg["allowInsecure"] = 0
-        safe_vmess = "vmess://" + base64.b64encode(
-            json.dumps(cfg).encode()
-        ).decode()
-        self.assertIsNotNone(collector.parse_node_info(safe_vmess))
-
-        self.assertIsNotNone(
-            collector.parse_node_info(
-                "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
-                "&allowInsecure=0#x"
-            )
+        with_sni = collector.parse_node_info(
+            "vless://uuid@199.247.23.31:443?security=tls&sni=sub.example.com#x"
         )
+        self.assertTrue(collector.is_main_pool_eligible(with_sni))
+
+        # A TLS node whose connect host is a real domain gets it as SNI.
+        domain_host = collector.parse_node_info(
+            "trojan://pass@edge.example.com:443#x"
+        )
+        self.assertEqual(domain_host.sni, "edge.example.com")
+        self.assertTrue(collector.is_main_pool_eligible(domain_host))
+
+        # ...but an IP-literal SNI can never verify a certificate.
+        ip_sni = collector.parse_node_info(
+            "vless://uuid@199.247.23.31:443?security=tls&sni=199.247.23.31#x"
+        )
+        self.assertFalse(collector.is_main_pool_eligible(ip_sni))
+
+        # allowInsecure links still parse and are only stripped at shaping time.
+        lenient = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+            "&allowInsecure=1#x"
+        )
+        self.assertIsNotNone(lenient)
+        self.assertTrue(collector.is_main_pool_eligible(lenient))
 
     def test_reality_invalid_pbk_or_sid_rejected(self):
         base = "vless://uuid@1.2.3.4:443?security=reality&type=tcp"
@@ -1931,10 +1955,10 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
                 f"{base}&sni=a.example&pbk={REALITY_PBK[:-2]}&sid={REALITY_SID}#x"
             )
         )
-        # Odd-length and over-long short ids.
+        # Non-hex and over-long short ids (odd lengths are valid in Xray).
         self.assertIsNone(
             collector.parse_node_info(
-                f"{base}&sni=a.example&pbk={REALITY_PBK}&sid=abc#x"
+                f"{base}&sni=a.example&pbk={REALITY_PBK}&sid=zzzz#x"
             )
         )
         self.assertIsNone(
@@ -1943,10 +1967,28 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-    def test_build_tls_context_enforces_cert_required_for_domain_tls_and_cert_none_for_reality(
-        self,
-    ):
-        node = collector.NodeInfo(
+    def test_reality_accepts_odd_and_even_hex_sid_up_to_16_chars(self):
+        base = "vless://uuid@1.2.3.4:443?security=reality&sni=a.example&type=tcp"
+
+        for sid in ("6ba8517", "a", "a0030945", "0123456789abcdef"):
+            self.assertTrue(collector.is_valid_reality_sid(sid), sid)
+            node = collector.parse_node_info(
+                f"{base}&pbk={REALITY_PBK}&sid={sid}#x"
+            )
+            self.assertIsNotNone(node, sid)
+            self.assertEqual(node.security, "reality")
+
+        self.assertTrue(collector.is_valid_reality_sid(""))
+        self.assertFalse(collector.is_valid_reality_sid("zzzz"))
+        self.assertFalse(collector.is_valid_reality_sid("a" * 18))
+
+        # Percent-encoded and standard-base64 keys are accepted too.
+        self.assertTrue(collector.is_valid_reality_pbk(REALITY_PBK))
+        self.assertTrue(collector.is_valid_reality_pbk(REALITY_PBK + "="))
+        self.assertFalse(collector.is_valid_reality_pbk("shortkey"))
+
+    def test_build_tls_context_uses_cert_none_for_all_probe_connections(self):
+        camouflage = collector.NodeInfo(
             protocol="vless",
             host="80.47.228.99",
             port=443,
@@ -1954,10 +1996,6 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             sni="5674-4.seenode.app",
             security="tls",
         )
-        ctx = collector._build_tls_context(node)
-        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
-        self.assertTrue(ctx.check_hostname)
-
         reality = collector.NodeInfo(
             protocol="vless",
             host="1.2.3.4",
@@ -1966,21 +2004,18 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             sni="www.apple.com",
             security="reality",
         )
-        reality_ctx = collector._build_tls_context(reality)
-        self.assertEqual(reality_ctx.verify_mode, ssl.CERT_NONE)
-        self.assertFalse(reality_ctx.check_hostname)
-
-        ip_sni = collector.NodeInfo(
-            protocol="vless",
-            host="1.2.3.4",
+        raw_ip = collector.NodeInfo(
+            protocol="trojan",
+            host="199.247.23.31",
             port=443,
             tls_enabled=True,
             sni=None,
             security="tls",
         )
-        self.assertEqual(
-            collector._build_tls_context(ip_sni).verify_mode, ssl.CERT_NONE
-        )
+        for node in (camouflage, reality, raw_ip):
+            ctx = collector._build_tls_context(node)
+            self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
+            self.assertFalse(ctx.check_hostname)
 
     async def test_reality_tls12_server_dropped_in_probe(self):
         node = collector.NodeInfo(

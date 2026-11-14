@@ -45,7 +45,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, unquote
 
 import aiohttp
 
@@ -124,7 +124,6 @@ PREFERRED_PORT_BONUS_MS: float = -35.0
 # uTLS fingerprints that send the post-quantum X25519MLKEM768 key share, which
 # Xray 26.9.8+ demands before it will accept a REALITY ClientHello.
 PQC_SAFE_FINGERPRINTS: Set[str] = {"chrome", "firefox", "safari"}
-INSECURE_TRUTHY_VALUES: Set[str] = {"1", "true", "yes", "on"}
 HEX_CHARS: Set[str] = set("0123456789abcdefABCDEF")
 
 # VLESS is preferred; deprecated VMess ranks last on an equal score.
@@ -325,6 +324,17 @@ def _is_ip_literal(value: str) -> bool:
         return False
 
 
+def _resolve_sni(candidate: Optional[str], host: str) -> Optional[str]:
+    """SNI: explicit value first, else the host when it is a real domain."""
+    value = (candidate or "").strip()
+    if value:
+        return value
+    host_value = (host or "").strip()
+    if host_value and not _is_ip_literal(host_value):
+        return host_value
+    return None
+
+
 def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
     """Return ``(iran_verified, operator_tags)`` for a source URL."""
     u = (url or "").strip().lower()
@@ -353,12 +363,21 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
 
 
 def is_main_pool_eligible(node: NodeInfo) -> bool:
-    """Encrypted-only, sing-box compatible nodes may enter the main pool."""
+    """Encrypted-only, sing-box compatible nodes may enter the main pool.
+
+    A TLS node that connects to a raw IP *and* carries no domain SNI can never
+    verify a certificate in Xray (``x509: certificate signed by unknown
+    authority``) and has no camouflage name, so it is excluded here wherever it
+    came from.
+    """
+    sni = (node.sni or "").strip()
     return (
         node.tls_enabled
         and node.protocol in ("vless", "trojan", "vmess")
         and node.port not in PLAINTEXT_AND_ABUSED_PORTS
         and not _is_decoy_connect_host(node.host)
+        and bool(sni)
+        and not _is_ip_literal(sni)
     )
 
 
@@ -417,22 +436,28 @@ def is_safe_cloudflare_clean_ip(ip_str: str) -> bool:
 
 
 def is_valid_reality_pbk(pbk: str) -> bool:
-    """REALITY ``pbk`` must decode to a 32-byte X25519 public key."""
-    raw = (pbk or "").strip()
-    if not (42 <= len(raw) <= 45):
+    """REALITY ``pbk`` must decode to a 32-byte X25519 public key.
+
+    Both standard base64 (``+``/``/``) and URL-safe base64 (``-``/``_``) are
+    accepted, and percent-encoded values are unquoted first: aggregators export
+    the same key in all of these spellings.
+    """
+    raw = unquote((pbk or "").strip()).replace(" ", "+")
+    if not (42 <= len(raw) <= 46):
         return False
     padded = raw + ("=" * ((4 - len(raw) % 4) % 4))
     try:
-        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        normalized = padded.replace("+", "-").replace("/", "_")
+        decoded = base64.urlsafe_b64decode(normalized.encode("ascii"))
         return len(decoded) == 32
     except Exception:
         return False
 
 
 def is_valid_reality_sid(sid: str) -> bool:
-    """REALITY short id must be even-length hex, at most 16 characters."""
+    """REALITY short id: 0-16 hex chars. Odd lengths are valid in Xray."""
     raw = (sid or "").strip()
-    if len(raw) > 16 or (len(raw) % 2 != 0):
+    if len(raw) > 16:
         return False
     return all(c in HEX_CHARS for c in raw)
 
@@ -463,13 +488,8 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
             return None
         if not isinstance(cfg, dict):
             return None
-        # Same encrypted-only policy as URI links: never trust a config that
-        # disables certificate verification.
-        for insecure_key in ("allowInsecure", "insecure"):
-            if str(cfg.get(insecure_key, "")).strip().lower() in INSECURE_TRUTHY_VALUES:
-                return None
-        if cfg.get("verify_cert") is False:
-            return None
+        # allowInsecure / insecure / verify_cert are stripped at shaping time
+        # instead of dropping the node: most aggregator feeds carry them.
         host = str(cfg.get("add", "")).strip()
         port_raw = cfg.get("port", 0)
         try:
@@ -492,7 +512,7 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         node.network = net
         node.tls_enabled = str(cfg.get("tls", "")).lower() == "tls"
         node.security = "tls" if node.tls_enabled else ""
-        node.sni = cfg.get("sni") or cfg.get("host") or None
+        node.sni = _resolve_sni(cfg.get("sni") or cfg.get("host"), host)
         node.path = str(cfg.get("path", "") or "/")
         if not node.tls_enabled and node.port in PLAINTEXT_AND_ABUSED_PORTS:
             return None
@@ -509,11 +529,6 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
     else:
         rest_no_query = rest_no_frag
         params = {}
-
-    # Xray 26.9.9 dropped allowInsecure entirely, so such links are dead there.
-    for insecure_key in ("allowInsecure", "allow_insecure", "insecure"):
-        if (params.get(insecure_key) or "").strip().lower() in INSECURE_TRUTHY_VALUES:
-            return None
 
     if "@" in rest_no_query:
         authority = rest_no_query.rsplit("@", 1)[1]
@@ -563,12 +578,12 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         node.tls_enabled = True
         node.network = net
         node.security = "tls"
-        node.sni = params.get("sni") or params.get("host") or None
+        node.sni = _resolve_sni(params.get("sni") or params.get("host"), host)
     elif scheme == "vless":
         node.tls_enabled = security in ("tls", "reality")
         node.network = net
         node.security = security if security in ("tls", "reality") else ""
-        node.sni = params.get("sni") or params.get("host") or None
+        node.sni = _resolve_sni(params.get("sni") or params.get("host"), host)
     else:
         node.tls_enabled = False
         node.network = "tcp"
@@ -932,29 +947,17 @@ def _is_public_ip(ip: str) -> bool:
 # ---------------------------------------------------------------------------
 
 def _build_tls_context(node: NodeInfo) -> ssl.SSLContext:
-    """TLS context for a node's probe.
+    """No-verify TLS context used for the reachability probe only.
 
-    Standard TLS with a domain SNI MUST pass CA + hostname verification: the
-    dead PaaS apps (``*.seenode.app``) and self-signed hosts Xray 26.9.9
-    rejects were let through by an earlier ``CERT_NONE`` context.
-    REALITY authenticates with ``pbk`` and serves an ephemeral certificate, and
-    IP-literal / loopback targets cannot match a public CA name, so those keep
-    a no-verify context.
+    Proxy endpoints legitimately serve camouflage SNIs, Cloudflare edge IPs and
+    REALITY ephemeral certificates, so CA/hostname verification in this probe
+    drops working nodes (the Part 3 regression). Certificate validity belongs to
+    the client (or to REALITY's ``pbk``), and TLS nodes with no domain SNI are
+    excluded up front by :func:`is_main_pool_eligible`.
     """
-    sec = (getattr(node, "security", "") or "").lower()
-    sni_target = (node.sni or node.host or "").strip()
-    if (
-        sec == "reality"
-        or _is_ip_literal(sni_target)
-        or (node.host or "").strip() in ("127.0.0.1", "localhost", "::1")
-    ):
-        ctx = ssl.create_default_context()
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        return ctx
     ctx = ssl.create_default_context()
-    ctx.check_hostname = True
-    ctx.verify_mode = ssl.CERT_REQUIRED
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     return ctx
 
 
@@ -1456,10 +1459,12 @@ def _shape_uri_link(
     if new_host:
         rest = _replace_authority_host(rest, new_host)
 
-    drop = set(drop_params)
+    drop = {name.lower() for name in drop_params}
     if drop:
         query = "&".join(
-            p for p in query.split("&") if p and p.split("=", 1)[0] not in drop
+            p
+            for p in query.split("&")
+            if p and p.split("=", 1)[0].lower() not in drop
         )
 
     update = dict(params or {})
@@ -1496,9 +1501,17 @@ def _shape_vmess_link(
     if not isinstance(cfg, dict):
         return link
 
-    # Corrupted ECH material (or plain-UDP ECH lookups) must never ship.
-    cfg.pop("ech", None)
-    cfg.pop("echConfigList", None)
+    # Corrupted ECH material (or plain-UDP ECH lookups) must never ship, and
+    # Xray 26.9.9 no longer has allowInsecure at all.
+    for dead_key in (
+        "ech",
+        "echConfigList",
+        "allowInsecure",
+        "allow_insecure",
+        "insecure",
+        "verify_cert",
+    ):
+        cfg.pop(dead_key, None)
 
     if new_host:
         cfg["add"] = new_host
@@ -1582,7 +1595,7 @@ def shape_node_for_iran(
         new_host=new_host,
         params=params,
         ensure_fp=True,
-        drop_params=("ech",),
+        drop_params=("ech", "allowInsecure", "allow_insecure", "insecure"),
     )
 
 
