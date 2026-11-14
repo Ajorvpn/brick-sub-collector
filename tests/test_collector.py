@@ -5,11 +5,18 @@ import base64
 import json
 import os
 import shutil
+import ssl
 import tempfile
 import unittest
 from unittest import mock
+from urllib.parse import parse_qs
 
 import collector
+
+# Valid 32-byte base64url X25519 public key and even-length hex short id used
+# by REALITY fixtures (deterministic test material, not a live secret).
+REALITY_PBK = "ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU"
+REALITY_SID = "a0030945"
 
 
 class TestParseNodeInfo(unittest.TestCase):
@@ -54,7 +61,7 @@ class TestParseNodeInfo(unittest.TestCase):
     def test_vless_tls_reality(self):
         link = (
             "vless://uuid@2.2.2.2:443?security=reality&sni=example.com"
-            "&pbk=pubkey123&type=ws#remark"
+            "&pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU&type=ws#remark"
         )
         node = collector.parse_node_info(link)
         self.assertIsNotNone(node)
@@ -863,7 +870,7 @@ class TestHtmlEntityLinks(unittest.TestCase):
     def test_extract_links_unescapes_entities(self):
         text = (
             "vless://uuid@1.2.3.4:443?security=reality&amp;sni=example.com"
-            "&amp;pbk=pubkey123&amp;type=tcp#a\n"
+            "&amp;pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU&amp;type=tcp#a\n"
             "trojan://pw@2.2.2.2:443?sni=x.example&amp;type=ws#b"
         )
         links = collector.extract_links(text)
@@ -1316,19 +1323,19 @@ class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(
             collector.parse_node_info(
                 "vless://uuid@1.2.3.4:443?security=reality&sni=1.2.3.4"
-                "&pbk=pubkey123&type=tcp#x"
+                "&pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU&type=tcp#x"
             )
         )
         self.assertIsNone(
             collector.parse_node_info(
-                "vless://uuid@1.2.3.4:443?security=reality&pbk=pubkey123"
+                "vless://uuid@1.2.3.4:443?security=reality&pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU"
                 "&type=tcp#x"
             )
         )
 
         node = collector.parse_node_info(
             "vless://uuid@1.2.3.4:443?security=reality&sni=www.apple.com"
-            "&pbk=pubkey123&type=tcp#x"
+            "&pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU&type=tcp#x"
         )
         self.assertIsNotNone(node)
         self.assertEqual(node.security, "reality")
@@ -1702,6 +1709,381 @@ class TestFpShapingAndEncryption(unittest.TestCase):
         )
         self.assertFalse(report_without_key["encrypted_sub"])
         self.assertFalse(os.path.exists(enc_path))
+
+
+class _FakeSslObject:
+    """Stand-in for the ssl object of a negotiated TLS transport."""
+
+    def __init__(self, version="TLSv1.3"):
+        self._version = version
+
+    def cipher(self):
+        return ("TLS_AES_256_GCM_SHA384", "TLSv1.3", 256)
+
+    def version(self):
+        return self._version
+
+
+class _TlsFakeWriter(_FakeStreamWriter):
+    """StreamWriter stand-in that reports a negotiated ssl object."""
+
+    def __init__(self, ssl_object):
+        super().__init__()
+        self._ssl_object = ssl_object
+
+    def get_extra_info(self, name, default=None):
+        if name == "ssl_object":
+            return self._ssl_object
+        return default
+
+
+class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
+    """H1-H5: Xray 26.9.9 field failures (ECH, X.509, REALITY, FinalMask)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", self.tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(self.tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(self.tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(self.tmp, "servers.txt")
+            ),
+            mock.patch.object(
+                collector, "SUB_FILE", os.path.join(self.tmp, "sub.txt")
+            ),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(self.tmp, "status.json")
+            ),
+        ]
+        for patch in self.patches:
+            patch.start()
+        os.environ.pop("BRICK_SUB_AES_KEY", None)
+
+    def tearDown(self):
+        os.environ.pop("BRICK_SUB_AES_KEY", None)
+        for patch in self.patches:
+            patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _tls_node(self, host, port=443, quality=10.0):
+        link = f"vless://uuid@{host}:{port}?security=tls&sni=example.com#node"
+        return collector.NodeInfo(
+            protocol="vless",
+            host=host,
+            port=port,
+            tls_enabled=True,
+            sni="example.com",
+            security="tls",
+            network="tcp",
+            original_link=link,
+            raw_link=link,
+            resolved_ip=host,
+            country_code="DE",
+            quality_score=quality,
+            avg_latency_ms=int(quality),
+        )
+
+    def _vless_tls_node(self, extra_query="", host="1.2.3.4"):
+        link = (
+            f"vless://uuid@{host}:443?security=tls&sni=a.example"
+            f"{extra_query}#node"
+        )
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node)
+        node.resolved_ip = host
+        return node
+
+    def test_ech_parameter_stripped_from_vless_trojan_and_vmess(self):
+        vless_node = self._vless_tls_node("&ech=brokenConfigList")
+        self.assertIn("ech=brokenConfigList", vless_node.original_link)
+        vless_shaped = collector.shape_node_for_iran(vless_node, 1)
+        self.assertNotIn("ech", vless_shaped)
+        self.assertIn("sni=a.example", vless_shaped)
+        self.assertIn("fp=chrome", vless_shaped)
+
+        trojan_node = collector.parse_node_info(
+            "trojan://pw@2.2.2.2:443?sni=b.example&ech=QUJD#node"
+        )
+        self.assertIsNotNone(trojan_node)
+        trojan_node.resolved_ip = "2.2.2.2"
+        trojan_shaped = collector.shape_node_for_iran(trojan_node, 1)
+        self.assertNotIn("ech", trojan_shaped)
+        self.assertIn("sni=b.example", trojan_shaped)
+
+        cfg = {
+            "add": "3.3.3.3",
+            "port": 443,
+            "id": "uuid",
+            "net": "ws",
+            "tls": "tls",
+            "sni": "c.example",
+            "ech": "Zm9v",
+            "echConfigList": "ZWNobGlzdA==",
+        }
+        vmess_link = "vmess://" + base64.b64encode(
+            json.dumps(cfg).encode()
+        ).decode()
+        vmess_node = collector.parse_node_info(vmess_link)
+        self.assertIsNotNone(vmess_node)
+        vmess_node.resolved_ip = "3.3.3.3"
+
+        vmess_shaped = collector.shape_node_for_iran(vmess_node, 1)
+        b64 = vmess_shaped[len("vmess://"):]
+        pad = len(b64) % 4
+        if pad:
+            b64 += "=" * (4 - pad)
+        decoded = json.loads(base64.b64decode(b64).decode())
+
+        self.assertNotIn("ech", decoded)
+        self.assertNotIn("echConfigList", decoded)
+        self.assertEqual(decoded["fp"], "chrome")
+        self.assertEqual(decoded["sni"], "c.example")
+
+    def test_incompatible_fingerprints_overwritten_with_chrome(self):
+        for fp in ("edge", "ios", "qq", "random", "randomized", "android"):
+            node = self._vless_tls_node(f"&fp={fp}")
+            shaped = collector.shape_node_for_iran(node, 1)
+            self.assertIn("fp=chrome", shaped, fp)
+            self.assertNotIn(f"fp={fp}", shaped, fp)
+
+        for fp in ("firefox", "safari"):
+            node = self._vless_tls_node(f"&fp={fp}")
+            shaped = collector.shape_node_for_iran(node, 1)
+            self.assertIn(f"fp={fp}", shaped, fp)
+            self.assertNotIn("fp=chrome", shaped, fp)
+
+        missing = self._vless_tls_node()
+        self.assertIn(
+            "fp=chrome", collector.shape_node_for_iran(missing, 1)
+        )
+
+    def test_allow_insecure_links_rejected_in_parse_node_info(self):
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+                "&allowInsecure=1#x"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                "vless://uuid@1.2.3.4:443?security=tls&sni=a.example&insecure=true#x"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                "trojan://pw@1.2.3.4:443?sni=a.example&allow_insecure=yes#x"
+            )
+        )
+
+        cfg = {
+            "add": "1.2.3.4",
+            "port": 443,
+            "id": "uuid",
+            "tls": "tls",
+            "sni": "a.example",
+            "allowInsecure": 1,
+        }
+        unsafe_vmess = "vmess://" + base64.b64encode(
+            json.dumps(cfg).encode()
+        ).decode()
+        self.assertIsNone(collector.parse_node_info(unsafe_vmess))
+
+        cfg["allowInsecure"] = 0
+        safe_vmess = "vmess://" + base64.b64encode(
+            json.dumps(cfg).encode()
+        ).decode()
+        self.assertIsNotNone(collector.parse_node_info(safe_vmess))
+
+        self.assertIsNotNone(
+            collector.parse_node_info(
+                "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+                "&allowInsecure=0#x"
+            )
+        )
+
+    def test_reality_invalid_pbk_or_sid_rejected(self):
+        base = "vless://uuid@1.2.3.4:443?security=reality&type=tcp"
+
+        self.assertIsNotNone(
+            collector.parse_node_info(
+                f"{base}&sni=a.example&pbk={REALITY_PBK}&sid={REALITY_SID}#x"
+            )
+        )
+        self.assertIsNotNone(
+            collector.parse_node_info(
+                f"{base}&sni=a.example&pbk={REALITY_PBK}#x"
+            )
+        )
+
+        # Not a 32-byte X25519 public key.
+        self.assertIsNone(
+            collector.parse_node_info(
+                f"{base}&sni=a.example&pbk=shortkey&sid={REALITY_SID}#x"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                f"{base}&sni=a.example&pbk={REALITY_PBK[:-2]}&sid={REALITY_SID}#x"
+            )
+        )
+        # Odd-length and over-long short ids.
+        self.assertIsNone(
+            collector.parse_node_info(
+                f"{base}&sni=a.example&pbk={REALITY_PBK}&sid=abc#x"
+            )
+        )
+        self.assertIsNone(
+            collector.parse_node_info(
+                f"{base}&sni=a.example&pbk={REALITY_PBK}&sid=aabbccddeeff00112#x"
+            )
+        )
+
+    def test_build_tls_context_enforces_cert_required_for_domain_tls_and_cert_none_for_reality(
+        self,
+    ):
+        node = collector.NodeInfo(
+            protocol="vless",
+            host="80.47.228.99",
+            port=443,
+            tls_enabled=True,
+            sni="5674-4.seenode.app",
+            security="tls",
+        )
+        ctx = collector._build_tls_context(node)
+        self.assertEqual(ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx.check_hostname)
+
+        reality = collector.NodeInfo(
+            protocol="vless",
+            host="1.2.3.4",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+        )
+        reality_ctx = collector._build_tls_context(reality)
+        self.assertEqual(reality_ctx.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(reality_ctx.check_hostname)
+
+        ip_sni = collector.NodeInfo(
+            protocol="vless",
+            host="1.2.3.4",
+            port=443,
+            tls_enabled=True,
+            sni=None,
+            security="tls",
+        )
+        self.assertEqual(
+            collector._build_tls_context(ip_sni).verify_mode, ssl.CERT_NONE
+        )
+
+    async def test_reality_tls12_server_dropped_in_probe(self):
+        node = collector.NodeInfo(
+            protocol="vless",
+            host="1.2.3.4",
+            port=443,
+            tls_enabled=True,
+            network="tcp",
+            security="reality",
+            sni="www.apple.com",
+            resolved_ip="1.2.3.4",
+        )
+
+        def _patched_open(version):
+            async def fake_open(*_args, **_kwargs):
+                return (
+                    _FakeStreamReader(b""),
+                    _TlsFakeWriter(_FakeSslObject(version)),
+                )
+
+            return mock.patch.object(
+                collector.asyncio, "open_connection", side_effect=fake_open
+            )
+
+        with _patched_open("TLSv1.2"):
+            self.assertFalse(await collector._handshake_probe(node))
+        with _patched_open("TLSv1.2"):
+            ok, payload_bytes, _latency = await collector._payload_probe(node)
+        self.assertFalse(ok)
+        self.assertEqual(payload_bytes, 0)
+
+        with _patched_open("TLSv1.3"):
+            self.assertTrue(await collector._handshake_probe(node))
+        with _patched_open("TLSv1.3"):
+            ok13, _bytes13, _latency13 = await collector._payload_probe(node)
+        self.assertTrue(ok13)
+
+    def test_inject_xray_finalmask_fm_uses_1_3_for_reality_and_tlshello_for_tls(
+        self,
+    ):
+        reality_uri = (
+            f"vless://uuid@1.2.3.4:443?security=reality&sni=a.example"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}#node"
+        )
+        reality_shaped = collector.inject_xray_finalmask_fm(reality_uri)
+        self.assertIn("fm=", reality_shaped)
+        self.assertTrue(reality_shaped.endswith("#node"))
+        reality_query = reality_shaped.split("?", 1)[1].split("#", 1)[0]
+        reality_mask = json.loads(parse_qs(reality_query)["fm"][0])
+        self.assertEqual(reality_mask["tcp"][0]["type"], "fragment")
+        self.assertEqual(
+            reality_mask["tcp"][0]["settings"]["packets"], "1-3"
+        )
+
+        tls_uri = "vless://uuid@1.2.3.4:443?security=tls&sni=a.example#node"
+        tls_shaped = collector.inject_xray_finalmask_fm(tls_uri)
+        tls_query = tls_shaped.split("?", 1)[1].split("#", 1)[0]
+        tls_mask = json.loads(parse_qs(tls_query)["fm"][0])
+        self.assertEqual(
+            tls_mask["tcp"][0]["settings"]["packets"], "tlshello"
+        )
+        self.assertIn("security=tls", tls_shaped)
+
+        explicit = collector.inject_xray_finalmask_fm(
+            "vless://uuid@1.2.3.4:443#n", "reality"
+        )
+        self.assertIn("%22packets%22%3A%221-3%22", explicit)
+
+        vmess_link = "vmess://" + base64.b64encode(
+            json.dumps({"add": "1.2.3.4", "port": 443}).encode()
+        ).decode()
+        self.assertEqual(
+            collector.inject_xray_finalmask_fm(vmess_link), vmess_link
+        )
+
+    def test_write_all_outputs_generates_xray_frag_subscription_files(self):
+        nodes = [
+            self._tls_node("20.0.0.1", quality=1.0),
+            self._tls_node("20.0.1.1", quality=2.0),
+        ]
+        collector.write_all_outputs(
+            {"DE": nodes}, {"vless": nodes}, total_tested=2, total_passed=2
+        )
+
+        frag_path = os.path.join(self.tmp, "servers_xray_frag.txt")
+        frag_b64_path = os.path.join(self.tmp, "sub_xray_frag.txt")
+        self.assertTrue(os.path.exists(frag_path))
+        self.assertTrue(os.path.exists(frag_b64_path))
+
+        with open(frag_path, encoding="utf-8") as f:
+            frag_lines = f.read().splitlines()
+        self.assertEqual(len(frag_lines), 2)
+        for line in frag_lines:
+            self.assertIn("fm=", line)
+            self.assertIn("Germany", line)
+
+        with open(frag_b64_path, encoding="ascii") as f:
+            decoded = base64.b64decode(f.read()).decode("utf-8")
+        self.assertEqual(decoded.splitlines(), frag_lines)
+
+        # The plain subscription stays free of fm= for sing-box / mihomo.
+        with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+            self.assertNotIn("fm=", f.read())
 
 
 if __name__ == "__main__":

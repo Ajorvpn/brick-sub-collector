@@ -45,7 +45,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 import aiohttp
 
@@ -120,6 +120,19 @@ UNSUPPORTED_TRANSPORTS: Set[str] = {"xhttp", "splithttp", "kcp", "mkcp", "quic"}
 PREFERRED_TLS_PORTS: Set[int] = {443, 8443, 2053, 2083, 2087, 2096}
 IRAN_VERIFIED_BONUS_MS: float = -150.0
 PREFERRED_PORT_BONUS_MS: float = -35.0
+
+# uTLS fingerprints that send the post-quantum X25519MLKEM768 key share, which
+# Xray 26.9.8+ demands before it will accept a REALITY ClientHello.
+PQC_SAFE_FINGERPRINTS: Set[str] = {"chrome", "firefox", "safari"}
+INSECURE_TRUTHY_VALUES: Set[str] = {"1", "true", "yes", "on"}
+HEX_CHARS: Set[str] = set("0123456789abcdefABCDEF")
+
+# VLESS is preferred; deprecated VMess ranks last on an equal score.
+PROTOCOL_SORT_OFFSET: Dict[str, float] = {
+    "vless": -25.0,
+    "trojan": 0.0,
+    "vmess": 20.0,
+}
 
 # Domains valid ONLY as SNI camouflage, NEVER as the proxy's connect host.
 # ``cloudflare.com`` is intentionally absent: legitimate CF-fronted nodes use it.
@@ -403,6 +416,27 @@ def is_safe_cloudflare_clean_ip(ip_str: str) -> bool:
     return is_cloudflare_ip(ip_str) and not is_blocked_cloudflare_ip(ip_str)
 
 
+def is_valid_reality_pbk(pbk: str) -> bool:
+    """REALITY ``pbk`` must decode to a 32-byte X25519 public key."""
+    raw = (pbk or "").strip()
+    if not (42 <= len(raw) <= 45):
+        return False
+    padded = raw + ("=" * ((4 - len(raw) % 4) % 4))
+    try:
+        decoded = base64.urlsafe_b64decode(padded.encode("ascii"))
+        return len(decoded) == 32
+    except Exception:
+        return False
+
+
+def is_valid_reality_sid(sid: str) -> bool:
+    """REALITY short id must be even-length hex, at most 16 characters."""
+    raw = (sid or "").strip()
+    if len(raw) > 16 or (len(raw) % 2 != 0):
+        return False
+    return all(c in HEX_CHARS for c in raw)
+
+
 def parse_node_info(link: str) -> Optional[NodeInfo]:
     # B1: unescape HTML entities (``&amp;``) before any URI/query parsing.
     clean = _clean_link(link)
@@ -428,6 +462,13 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         except Exception:
             return None
         if not isinstance(cfg, dict):
+            return None
+        # Same encrypted-only policy as URI links: never trust a config that
+        # disables certificate verification.
+        for insecure_key in ("allowInsecure", "insecure"):
+            if str(cfg.get(insecure_key, "")).strip().lower() in INSECURE_TRUTHY_VALUES:
+                return None
+        if cfg.get("verify_cert") is False:
             return None
         host = str(cfg.get("add", "")).strip()
         port_raw = cfg.get("port", 0)
@@ -468,6 +509,11 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
     else:
         rest_no_query = rest_no_frag
         params = {}
+
+    # Xray 26.9.9 dropped allowInsecure entirely, so such links are dead there.
+    for insecure_key in ("allowInsecure", "allow_insecure", "insecure"):
+        if (params.get(insecure_key) or "").strip().lower() in INSECURE_TRUTHY_VALUES:
+            return None
 
     if "@" in rest_no_query:
         authority = rest_no_query.rsplit("@", 1)[1]
@@ -532,9 +578,13 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
     node.path = params.get("path") or "/"
 
     if node.security == "reality":
-        # Reality without a public key, or with an IP as SNI, cannot work.
+        # Reality needs a domain SNI, a 32-byte X25519 public key and an
+        # even-length hex short id; anything else dies in Xray 26.9.9.
         pbk = (params.get("pbk") or "").strip()
-        if not pbk or not node.sni or _is_ip_literal(node.sni):
+        sid = (params.get("sid") or "").strip()
+        if not node.sni or _is_ip_literal(node.sni):
+            return None
+        if not is_valid_reality_pbk(pbk) or not is_valid_reality_sid(sid):
             return None
 
     # Encrypted-only policy for the main pool. ``ss://`` is always plaintext
@@ -881,9 +931,42 @@ def _is_public_ip(ip: str) -> bool:
 # Dual-probe stability: real handshake + active payload (TTFB) verification
 # ---------------------------------------------------------------------------
 
-_SSL_CTX = ssl.create_default_context()
-_SSL_CTX.check_hostname = False
-_SSL_CTX.verify_mode = ssl.CERT_NONE
+def _build_tls_context(node: NodeInfo) -> ssl.SSLContext:
+    """TLS context for a node's probe.
+
+    Standard TLS with a domain SNI MUST pass CA + hostname verification: the
+    dead PaaS apps (``*.seenode.app``) and self-signed hosts Xray 26.9.9
+    rejects were let through by an earlier ``CERT_NONE`` context.
+    REALITY authenticates with ``pbk`` and serves an ephemeral certificate, and
+    IP-literal / loopback targets cannot match a public CA name, so those keep
+    a no-verify context.
+    """
+    sec = (getattr(node, "security", "") or "").lower()
+    sni_target = (node.sni or node.host or "").strip()
+    if (
+        sec == "reality"
+        or _is_ip_literal(sni_target)
+        or (node.host or "").strip() in ("127.0.0.1", "localhost", "::1")
+    ):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
+def _enforce_min_tls_version(node: NodeInfo, ssl_object: Any) -> None:
+    """Drop REALITY nodes that did not negotiate TLS 1.3."""
+    if (getattr(node, "security", "") or "").lower() != "reality":
+        return
+    version = ssl_object.version() if hasattr(ssl_object, "version") else None
+    if isinstance(version, str) and version != "TLSv1.3":
+        raise ssl.SSLError(
+            f"reality negotiated {version}; TLS 1.3 is required"
+        )
 
 PAYLOAD_READ_BYTES = 4096
 PAYLOAD_REQUEST_TEMPLATE = (
@@ -976,13 +1059,20 @@ async def _open_connection(
 
     sni = node.sni or node.host
     reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(ip, node.port, ssl=_SSL_CTX, server_hostname=sni),
+        asyncio.open_connection(
+            ip, node.port, ssl=_build_tls_context(node), server_hostname=sni
+        ),
         timeout=deadline,
     )
     ssl_object = writer.get_extra_info("ssl_object")
     if ssl_object is None or ssl_object.cipher() is None:
         await _close_writer(writer)
         raise ssl.SSLError("TLS transport negotiated no valid cipher")
+    try:
+        _enforce_min_tls_version(node, ssl_object)
+    except ssl.SSLError:
+        await _close_writer(writer)
+        raise
     return reader, writer
 
 
@@ -1214,6 +1304,17 @@ def dedupe_by_pure_ip(nodes: List[NodeInfo]) -> List[NodeInfo]:
     return primary + overflow
 
 
+def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
+    """Ranking key that prefers VLESS over VMess without touching the score."""
+    quality = (
+        node.quality_score if node.quality_score is not None else float("inf")
+    )
+    return (
+        round(quality + PROTOCOL_SORT_OFFSET.get(node.protocol, 0.0), 2),
+        quality,
+    )
+
+
 def _transport_bucket(node: NodeInfo) -> str:
     sec = (getattr(node, "security", "") or "").lower()
     net = (node.network or "tcp").lower()
@@ -1240,6 +1341,8 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
     buckets: Dict[str, List[NodeInfo]] = {}
     for n in ordered:
         buckets.setdefault(_transport_bucket(n), []).append(n)
+    for pool in buckets.values():
+        pool.sort(key=_effective_sort_key)
 
     bucket_order = ["reality", "ws-tls", "grpc-tls", "h2-tls", "tcp-tls"]
     selected: List[NodeInfo] = []
@@ -1293,6 +1396,14 @@ def _query_keys(query: str) -> Set[str]:
     return {p.split("=", 1)[0] for p in query.split("&") if p}
 
 
+def _query_value(query: str, key: str) -> str:
+    for part in query.split("&"):
+        name, _, value = part.partition("=")
+        if name == key:
+            return value
+    return ""
+
+
 def _set_query_params(query: str, values: Dict[str, str]) -> str:
     """Set or append query parameters while preserving the original order."""
     parts = [p for p in query.split("&") if p]
@@ -1327,6 +1438,7 @@ def _shape_uri_link(
     new_host: Optional[str] = None,
     params: Optional[Dict[str, str]] = None,
     ensure_fp: bool = False,
+    drop_params: Sequence[str] = (),
 ) -> str:
     """Rewrite a vless:// or trojan:// link in place (param order preserved)."""
     try:
@@ -1344,8 +1456,15 @@ def _shape_uri_link(
     if new_host:
         rest = _replace_authority_host(rest, new_host)
 
+    drop = set(drop_params)
+    if drop:
+        query = "&".join(
+            p for p in query.split("&") if p and p.split("=", 1)[0] not in drop
+        )
+
     update = dict(params or {})
-    if ensure_fp and "fp" not in _query_keys(query):
+    if ensure_fp and _query_value(query, "fp").strip().lower() not in PQC_SAFE_FINGERPRINTS:
+        # fp=edge/ios/qq/random do not send X25519MLKEM768 and REALITY rejects them.
         update["fp"] = "chrome"
     query = _set_query_params(query, update)
 
@@ -1377,13 +1496,19 @@ def _shape_vmess_link(
     if not isinstance(cfg, dict):
         return link
 
+    # Corrupted ECH material (or plain-UDP ECH lookups) must never ship.
+    cfg.pop("ech", None)
+    cfg.pop("echConfigList", None)
+
     if new_host:
         cfg["add"] = new_host
     if domain_sni:
         cfg["sni"] = cfg.get("sni") or domain_sni
         cfg["host"] = cfg.get("host") or domain_sni
     if ensure_fp:
-        cfg["fp"] = cfg.get("fp") or "chrome"
+        current_fp = str(cfg.get("fp", "")).strip().lower()
+        if current_fp not in PQC_SAFE_FINGERPRINTS:
+            cfg["fp"] = "chrome"
 
     new_b64 = base64.b64encode(
         json.dumps(cfg, separators=(",", ":"), ensure_ascii=False).encode()
@@ -1453,7 +1578,11 @@ def shape_node_for_iran(
         if (node.network or "").lower() in ("ws", "http", "h2", "httpupgrade"):
             params["host"] = domain_sni
     return _shape_uri_link(
-        base, new_host=new_host, params=params, ensure_fp=True
+        base,
+        new_host=new_host,
+        params=params,
+        ensure_fp=True,
+        drop_params=("ech",),
     )
 
 
@@ -1519,6 +1648,54 @@ def _write_b64(path: str, links: List[str]) -> None:
     encoded = base64.b64encode(plain.encode("utf-8")).decode("ascii")
     with open(path, "w", encoding="ascii") as f:
         f.write(encoded)
+
+
+# ---------------------------------------------------------------------------
+# Xray 26+ FinalMask (fm=) subscription shaping
+# ---------------------------------------------------------------------------
+
+
+def build_xray_finalmask_json(security: str) -> str:
+    """FinalMask JSON for Xray 26+ TLS fragmentation.
+
+    Per 2dust/v2rayN#10407 and v2rayNG@58dbb71: REALITY breaks with
+    ``packets="tlshello"`` on Xray 26+, so REALITY MUST use ``packets="1-3"``.
+    Standard TLS uses ``packets="tlshello"``.
+    """
+    packets_mode = "1-3" if (security or "").lower() == "reality" else "tlshello"
+    mask_obj = {
+        "tcp": [
+            {
+                "type": "fragment",
+                "settings": {
+                    "packets": packets_mode,
+                    "length": "10-30",
+                    "delay": "5-10",
+                },
+            }
+        ]
+    }
+    return json.dumps(mask_obj, separators=(",", ":"))
+
+
+def inject_xray_finalmask_fm(uri: str, security: str = "") -> str:
+    """Append/replace ``fm=<FinalMask JSON>`` on a vless/trojan URI.
+
+    Unfragmented ClientHellos get a DPI ``TCP RST`` on MCI/Irancell, so Xray 26+
+    clients need the mask to fragment packets 1-3 (REALITY) or the TLS hello.
+    """
+    text = (uri or "").strip()
+    if not text:
+        return uri
+    lowered = text.lower()
+    if not (lowered.startswith("vless://") or lowered.startswith("trojan://")):
+        return uri
+
+    sec = (
+        security or ("reality" if "security=reality" in lowered else "tls")
+    ).lower()
+    encoded = quote(build_xray_finalmask_json(sec), safe="")
+    return _shape_uri_link(text, params={"fm": encoded})
 
 
 # ---------------------------------------------------------------------------
@@ -1676,6 +1853,14 @@ def write_all_outputs(
 
     _write_plain(SERVERS_FILE, main_links)
     _write_b64(SUB_FILE, main_links)
+
+    # Xray 26+ FinalMask (fm=) mirrors for v2rayN / v2rayNG. servers.txt stays
+    # clean for sing-box / mihomo, which do not understand fm=.
+    xray_frag_lines = [inject_xray_finalmask_fm(link) for link in main_links]
+    _write_plain(
+        os.path.join(OUTPUT_DIR, "servers_xray_frag.txt"), xray_frag_lines
+    )
+    _write_b64(os.path.join(OUTPUT_DIR, "sub_xray_frag.txt"), xray_frag_lines)
 
     # Optional AES-256-GCM protected mirror of servers.txt (enc:v1: payload).
     plain_main = "\n".join(main_links)

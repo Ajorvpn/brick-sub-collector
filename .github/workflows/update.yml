@@ -52,6 +52,12 @@ jobs:
           if [ -f output/sub_enc.txt ]; then
             cp output/sub_enc.txt "$PUBLISH_DIR"/sub_enc.txt
           fi
+          # Xray 26+ FinalMask (fm=) mirrors for v2rayN / v2rayNG.
+          for frag in servers_xray_frag.txt sub_xray_frag.txt; do
+            if [ -f "output/$frag" ]; then
+              cp "output/$frag" "$PUBLISH_DIR/$frag"
+            fi
+          done
           cd "$PUBLISH_DIR"
           git init -q -b sub
           git config user.name "github-actions[bot]"
@@ -60,6 +66,8 @@ jobs:
           # Operator scoped subscriptions (operators/) ship with the rest.
           git add -A operators 2>/dev/null || true
           git add -A sub_enc.txt 2>/dev/null || true
+          # Xray FinalMask mirrors ship alongside the plain subscription.
+          git add -A servers_xray_frag.txt sub_xray_frag.txt 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No generated changes to publish."
             exit 0
