@@ -100,11 +100,17 @@ MMDB_CANDIDATE_URLS: List[str] = [
 # Real end-to-end tunnel verification: only nodes whose proxy stream actually
 # answers generate_204 through Xray may reach the published subscriptions.
 MAX_XRAY_CANDIDATES_PER_COUNTRY = 30
-XRAY_BATCH_SIZE = 75
+XRAY_BATCH_SIZE = 40
 XRAY_PORT_BASE = 21000
 XRAY_TEST_URL = "http://cp.cloudflare.com/generate_204"
 XRAY_TEST_TIMEOUT = 4.5
-XRAY_STARTUP_DELAY = 0.35
+# Listener readiness: a crashed config exits in milliseconds, so poll instead of
+# sleeping blindly (an unchecked crash looked like "0 live nodes").
+XRAY_READY_TIMEOUT = 2.5
+XRAY_READY_POLL_INTERVAL = 0.1
+# Below this many tunnel-verified nodes we keep the socket-verified set, so a
+# broken/blocked Xray run can never collapse the subscription to a node or two.
+MIN_XRAY_VERIFIED_NODES = 5
 
 MAIN_QUOTA_PER_COUNTRY = 5
 COUNTRY_FILE_QUOTA = 20
@@ -357,8 +363,13 @@ def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
             "sakha1370/openray",
             "output_iran/",
             "mahsanet/mahsafreeconfig",
+            "aistudio_iran_verified",
+            "all_valid_proxies_for_iran",
         )
     )
+    if "aistudio_iran_verified" in u:
+        # Inside-Iran verified feeds are tested on both MCI and Irancell.
+        tags.update(("mci", "irancell"))
     if "/mci" in u or "mci_top" in u:
         tags.add("mci")
     if "/irancell" in u or "irancell_top" in u or "/mtn" in u:
@@ -1438,6 +1449,27 @@ def _split_uri_parts(
     return scheme, userinfo, host.strip(), port, _extract_query_params(query)
 
 
+def _xray_reality_short_id(sid: str) -> str:
+    """Xray hex-decodes ``shortId``; odd-length ids must be zero-padded.
+
+    Zero-padding keeps the intended byte value and, unlike returning ``None``,
+    never silently removes a node from the candidate pool.
+    """
+    raw = (sid or "").strip()
+    if not raw:
+        return ""
+    if len(raw) % 2:
+        return "0" + raw
+    return raw
+
+
+def _xray_reality_spider_x(spx: str) -> str:
+    raw = (spx or "").strip()
+    if not raw:
+        return "/"
+    return raw if raw.startswith("/") else "/" + raw
+
+
 def _xray_stream_network_settings(
     network: str,
     path: str,
@@ -1496,9 +1528,10 @@ def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
     sni = str(cfg.get("sni") or cfg.get("host") or "").strip()
     host_header = str(cfg.get("host") or "").strip()
     if security == "tls":
+        # Xray 26.2.6+ removed "allowInsecure" entirely; emitting it aborts the
+        # whole process at startup (migrated to "pinnedPeerCertSha256").
         stream["tlsSettings"] = {
             "serverName": sni or address,
-            "allowInsecure": False,
             "fingerprint": str(cfg.get("fp") or "chrome"),
         }
     stream.update(
@@ -1568,27 +1601,32 @@ def build_xray_outbound_for_node(
             security = "none"
 
     network = _xray_network(params.get("type") or node.network)
+    # A bogus headerType (aes-128-gcm, srtp, ...) never becomes tcpSettings:
+    # plain TCP is the only shape Xray accepts for headerless transports.
     stream: Dict[str, Any] = {"network": network, "security": security}
     sni = (params.get("sni") or params.get("host") or node.sni or host).strip()
     host_header = (params.get("host") or "").strip()
 
     if security == "tls":
+        # Xray 26.2.6+ removed "allowInsecure"; including it aborts startup.
         tls_settings: Dict[str, Any] = {
             "serverName": sni,
-            "allowInsecure": False,
             "fingerprint": params.get("fp") or "chrome",
         }
-        alpn = params.get("alpn")
-        if alpn:
-            tls_settings["alpn"] = [a for a in alpn.split(",") if a]
+        alpn_values = [
+            a.strip() for a in (params.get("alpn") or "").split(",") if a.strip()
+        ]
+        valid_alpn = [a for a in alpn_values if a in ("h3", "h2", "http/1.1")]
+        if valid_alpn:
+            tls_settings["alpn"] = valid_alpn
         stream["tlsSettings"] = tls_settings
     elif security == "reality":
         stream["realitySettings"] = {
             "serverName": sni,
             "fingerprint": params.get("fp") or "chrome",
             "publicKey": params.get("pbk") or "",
-            "shortId": params.get("sid") or "",
-            "spiderX": params.get("spx") or "/",
+            "shortId": _xray_reality_short_id(params.get("sid") or ""),
+            "spiderX": _xray_reality_spider_x(params.get("spx") or ""),
         }
 
     stream.update(
@@ -1601,6 +1639,20 @@ def build_xray_outbound_for_node(
         )
     )
 
+    raw_flow = (params.get("flow") or "").strip()
+    if scheme == "vless" and raw_flow not in (
+        "",
+        "xtls-rprx-vision",
+        "xtls-rprx-vision-udp443",
+    ):
+        # Unknown flow values fail Xray's config validation.
+        return None
+    # XTLS Vision only exists on TCP; on ws/grpc/h2/httpupgrade Xray aborts with
+    # "XTLS only supports TCP", so the flow is stripped there.
+    safe_flow = (
+        raw_flow if (network == "tcp" and security in ("tls", "reality")) else ""
+    )
+
     if scheme == "vless":
         settings: Dict[str, Any] = {
             "vnext": [
@@ -1611,7 +1663,7 @@ def build_xray_outbound_for_node(
                         {
                             "id": unquote(userinfo),
                             "encryption": params.get("encryption") or "none",
-                            "flow": params.get("flow") or "",
+                            "flow": safe_flow,
                         }
                     ],
                 }
@@ -1693,8 +1745,62 @@ async def _probe_xray_port(index: int, node: NodeInfo) -> Optional[NodeInfo]:
     return node
 
 
-async def _run_xray_batch(binary: str, batch: List[NodeInfo]) -> List[NodeInfo]:
-    """Run one xray instance for *batch* and return the nodes that answer 204."""
+async def _xray_listener_up(port: int, timeout: float = 0.15) -> bool:
+    """True when something accepts a TCP connection on 127.0.0.1:*port*."""
+    try:
+        _reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout=timeout
+        )
+    except Exception:
+        return False
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+    return True
+
+
+async def _wait_for_xray_ready(
+    proc: Any, first_port: int, timeout: Optional[float] = None
+) -> bool:
+    """Wait for Xray listeners, bailing out the moment the process dies."""
+    deadline = time.monotonic() + (
+        XRAY_READY_TIMEOUT if timeout is None else timeout
+    )
+    while time.monotonic() < deadline:
+        if getattr(proc, "returncode", None) is not None:
+            return False
+        if await _xray_listener_up(first_port):
+            return True
+        await asyncio.sleep(XRAY_READY_POLL_INTERVAL)
+    return getattr(proc, "returncode", None) is None
+
+
+async def _read_xray_error(proc: Any) -> str:
+    """First stderr line of a crashed Xray process (never raises)."""
+    stderr = getattr(proc, "stderr", None)
+    if stderr is None:
+        return ""
+    try:
+        data = await asyncio.wait_for(stderr.read(), timeout=0.5)
+    except Exception:
+        return ""
+    if not data or not isinstance(data, (bytes, bytearray)):
+        return ""
+    text = data.decode("utf-8", errors="replace").strip()
+    return text.splitlines()[0][:200] if text else ""
+
+
+async def _run_xray_batch(
+    binary: str, batch: List[NodeInfo], _depth: int = 0
+) -> List[NodeInfo]:
+    """Run one xray instance for *batch* and return the nodes that answer 204.
+
+    A batch whose process dies (bad config / removed option) is split in half
+    and retried once; if the retry also crashes the nodes are kept, because a
+    Xray quirk must never wipe out the subscription.
+    """
     inbounds: List[Dict[str, Any]] = []
     outbounds: List[Dict[str, Any]] = []
     rules: List[Dict[str, Any]] = []
@@ -1744,13 +1850,31 @@ async def _run_xray_batch(binary: str, batch: List[NodeInfo]) -> List[NodeInfo]:
             "-c",
             cfg_path,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
+        crashed = False
+        results: List[Optional[NodeInfo]] = []
         try:
-            await asyncio.sleep(XRAY_STARTUP_DELAY)
-            results = await asyncio.gather(
-                *(_probe_xray_port(idx, node) for idx, node in valid)
+            ready = await _wait_for_xray_ready(
+                proc, XRAY_PORT_BASE + valid[0][0]
             )
+            if ready:
+                results = list(
+                    await asyncio.gather(
+                        *(_probe_xray_port(idx, node) for idx, node in valid)
+                    )
+                )
+            if not ready or (
+                getattr(proc, "returncode", None) is not None
+                and not any(results)
+            ):
+                crashed = True
+                detail = await _read_xray_error(proc)
+                print(
+                    "[warn] Xray batch exited early "
+                    f"(code={getattr(proc, 'returncode', None)}): {detail}"
+                )
+                results = []
         finally:
             try:
                 proc.terminate()
@@ -1767,6 +1891,15 @@ async def _run_xray_batch(binary: str, batch: List[NodeInfo]) -> List[NodeInfo]:
                     await proc.wait()
                 except Exception:
                     pass
+
+    if crashed:
+        if _depth == 0 and len(batch) > 1:
+            mid = len(batch) // 2
+            left = await _run_xray_batch(binary, batch[:mid], _depth=1)
+            right = await _run_xray_batch(binary, batch[mid:], _depth=1)
+            return left + right
+        # Fail open: keep socket-verified nodes when Xray cannot run this batch.
+        return list(batch)
 
     return [node for node in results if node is not None]
 
@@ -1818,6 +1951,12 @@ async def verify_nodes_with_xray(
         f"[info] Xray tunnel check: {passed_count}/{len(candidates)} "
         "candidate(s) passed generate_204"
     )
+    if passed_count < MIN_XRAY_VERIFIED_NODES:
+        print(
+            f"[warn] Only {passed_count} tunnel-verified node(s); keeping the "
+            "socket-verified set so the subscription never collapses"
+        )
+        return nodes
     return survivors + passthrough
 
 
@@ -2312,9 +2451,22 @@ def write_all_outputs(
     _write_plain(SERVERS_FILE, main_links)
     _write_b64(SUB_FILE, main_links)
 
-    # Xray 26+ FinalMask (fm=) mirrors for v2rayN / v2rayNG. servers.txt stays
+    # Xray 26+ FinalMask (fm=) mirrors for v2rayN / v2rayNG. Only vless:// and
+    # trojan:// links can carry fm=, so vmess slots are replaced by the next
+    # eligible vless/trojan node of the same country. servers.txt itself stays
     # clean for sing-box / mihomo, which do not understand fm=.
-    xray_frag_lines = [inject_xray_finalmask_fm(link) for link in main_links]
+    xray_frag_lines: List[str] = []
+    for code in sorted(ALLOWED_COUNTRIES.keys()):
+        candidates = [
+            n
+            for n in by_country.get(code, [])
+            if is_main_pool_eligible(n) and n.protocol in ("vless", "trojan")
+        ]
+        picked = select_diverse_top_nodes(candidates, MAIN_QUOTA_PER_COUNTRY)
+        for idx, n in enumerate(picked, start=1):
+            xray_frag_lines.append(
+                inject_xray_finalmask_fm(rename_node(n, code, idx))
+            )
     _write_plain(
         os.path.join(OUTPUT_DIR, "servers_xray_frag.txt"), xray_frag_lines
     )

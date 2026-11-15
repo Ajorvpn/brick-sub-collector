@@ -8,3 +8,5 @@ https://raw.githubusercontent.com/Danialsamadi/v2go/main/Sub1.txt
 https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/main/config/all_configs.txt
 https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt
 https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt
+https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/output/site_access/aistudio_iran_verified.txt
+https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/output_iran/all_valid_proxies_for_iran.txt

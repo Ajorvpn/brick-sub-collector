@@ -813,7 +813,7 @@ class TestSourcesFile(unittest.TestCase):
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 10)
+        self.assertEqual(len(urls), 12)
         for dead in (
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/"
@@ -847,6 +847,10 @@ class TestSourcesFile(unittest.TestCase):
             "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
             "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/"
             "subscribe/v2ray.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/site_access/aistudio_iran_verified.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/all_valid_proxies_for_iran.txt",
         ):
             self.assertIn(live, urls)
 
@@ -2127,6 +2131,8 @@ class _FakeXrayProcess:
     def __init__(self):
         self.terminated = False
         self.killed = False
+        self.returncode = None
+        self.stderr = None
 
     def terminate(self):
         self.terminated = True
@@ -2143,9 +2149,35 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         os.environ.pop("XRAY_BIN", None)
+        os.environ.pop("BRICK_SUB_AES_KEY", None)
+        self.tmp = tempfile.mkdtemp()
+        self.patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", self.tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(self.tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(self.tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(self.tmp, "servers.txt")
+            ),
+            mock.patch.object(
+                collector, "SUB_FILE", os.path.join(self.tmp, "sub.txt")
+            ),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(self.tmp, "status.json")
+            ),
+        ]
+        for patch in self.patches:
+            patch.start()
 
     def tearDown(self):
         os.environ.pop("XRAY_BIN", None)
+        os.environ.pop("BRICK_SUB_AES_KEY", None)
+        for patch in self.patches:
+            patch.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _node_from(self, link, quality=10.0, country="DE"):
         node = collector.parse_node_info(link)
@@ -2180,7 +2212,8 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         reality_settings = stream["realitySettings"]
         self.assertEqual(reality_settings["serverName"], "www.apple.com")
         self.assertEqual(reality_settings["publicKey"], REALITY_PBK)
-        self.assertEqual(reality_settings["shortId"], "6ba8517")
+        # Odd-length hex short ids are zero-padded so Xray can hex-decode them.
+        self.assertEqual(reality_settings["shortId"], "06ba8517")
         self.assertEqual(reality_settings["fingerprint"], "chrome")
         self.assertEqual(reality_settings["spiderX"], "/")
         self.assertNotIn("tlsSettings", stream)
@@ -2196,7 +2229,8 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws_stream["network"], "ws")
         self.assertEqual(ws_stream["security"], "tls")
         self.assertEqual(ws_stream["tlsSettings"]["serverName"], "b.example")
-        self.assertFalse(ws_stream["tlsSettings"]["allowInsecure"])
+        # Xray 26.2.6+ removed allowInsecure from tlsSettings entirely.
+        self.assertNotIn("allowInsecure", ws_stream["tlsSettings"])
         self.assertEqual(ws_stream["tlsSettings"]["fingerprint"], "chrome")
         self.assertEqual(ws_stream["wsSettings"]["path"], "/ws")
         self.assertEqual(ws_stream["wsSettings"]["headers"]["Host"], "b.example")
@@ -2212,8 +2246,8 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(server["address"], "edge.example.com")
         self.assertEqual(server["port"], 443)
         self.assertEqual(server["password"], "secret-pass")
-        self.assertFalse(
-            outbound["streamSettings"]["tlsSettings"]["allowInsecure"]
+        self.assertNotIn(
+            "allowInsecure", outbound["streamSettings"]["tlsSettings"]
         )
 
         cfg = {
@@ -2280,7 +2314,9 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
             collector.asyncio,
             "create_subprocess_exec",
             new=mock.AsyncMock(return_value=proc),
-        ), mock.patch.object(collector, "XRAY_STARTUP_DELAY", 0.0):
+        ), mock.patch.object(
+            collector, "XRAY_READY_TIMEOUT", 0.0
+        ), mock.patch.object(collector, "MIN_XRAY_VERIFIED_NODES", 0):
             result = await collector.verify_nodes_with_xray(
                 [good, gateway, silent], xray_bin="/usr/bin/xray"
             )
@@ -2312,7 +2348,9 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
             collector.asyncio,
             "create_subprocess_exec",
             new=mock.AsyncMock(return_value=proc),
-        ), mock.patch.object(collector, "XRAY_STARTUP_DELAY", 0.0):
+        ), mock.patch.object(
+            collector, "XRAY_READY_TIMEOUT", 0.0
+        ), mock.patch.object(collector, "MIN_XRAY_VERIFIED_NODES", 0):
             result = await collector.verify_nodes_with_xray(
                 [node], xray_bin="/usr/bin/xray"
             )
@@ -2320,6 +2358,133 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(proc.terminated)
         self.assertFalse(proc.killed)
         self.assertEqual(result, [])
+
+    def test_build_xray_outbound_never_emits_removed_allow_insecure_key(self):
+        vless = self._node_from(
+            "vless://uuid-1@1.2.3.4:443?security=tls&sni=a.example&type=ws#v"
+        )
+        trojan = self._node_from("trojan://pw@2.3.4.5:443?sni=b.example#t")
+        vmess_cfg = {
+            "add": "3.4.5.6",
+            "port": 443,
+            "id": "uuid-2",
+            "net": "ws",
+            "tls": "tls",
+            "sni": "c.example",
+        }
+        vmess = self._node_from(
+            "vmess://" + base64.b64encode(json.dumps(vmess_cfg).encode()).decode()
+        )
+
+        for node in (vless, trojan, vmess):
+            outbound = collector.build_xray_outbound_for_node(node, "out")
+            self.assertIsNotNone(outbound, node.protocol)
+            self.assertNotIn("allowInsecure", json.dumps(outbound))
+            tls_settings = outbound["streamSettings"]["tlsSettings"]
+            self.assertNotIn("allowInsecure", tls_settings)
+            self.assertEqual(tls_settings["fingerprint"], "chrome")
+            self.assertTrue(tls_settings["serverName"])
+
+    def test_build_xray_outbound_strips_flow_on_non_tcp_transports(self):
+        ws_node = self._node_from(
+            "vless://uuid-1@1.2.3.4:443?security=tls&type=ws"
+            "&flow=xtls-rprx-vision&sni=a.example#w"
+        )
+        ws_outbound = collector.build_xray_outbound_for_node(ws_node, "out_0")
+        ws_user = ws_outbound["settings"]["vnext"][0]["users"][0]
+        self.assertEqual(ws_outbound["streamSettings"]["network"], "ws")
+        self.assertEqual(ws_user["flow"], "")
+
+        tcp_node = self._node_from(
+            "vless://uuid-2@2.3.4.5:443?security=tls&type=tcp"
+            "&flow=xtls-rprx-vision&sni=b.example#t"
+        )
+        tcp_outbound = collector.build_xray_outbound_for_node(tcp_node, "out_1")
+        tcp_user = tcp_outbound["settings"]["vnext"][0]["users"][0]
+        self.assertEqual(tcp_user["flow"], "xtls-rprx-vision")
+
+        bogus = self._node_from(
+            "vless://uuid-3@3.4.5.6:443?security=tls"
+            "&flow=not-a-real-flow&sni=c.example#b"
+        )
+        self.assertIsNone(
+            collector.build_xray_outbound_for_node(bogus, "out_2")
+        )
+
+    async def test_verify_nodes_with_xray_recovers_when_process_crashes_at_startup(
+        self,
+    ):
+        node = self._node_from(
+            "vless://uuid-a@1.2.3.4:443?security=tls&sni=a.example#a"
+        )
+        proc = _FakeXrayProcess()
+        proc.returncode = 23
+
+        with mock.patch.object(
+            collector, "XRAY_READY_TIMEOUT", 0.0
+        ), mock.patch.object(
+            collector.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=proc),
+        ):
+            result = await collector.verify_nodes_with_xray(
+                [node], xray_bin="/usr/bin/xray"
+            )
+
+        # A startup crash must never turn the batch into "0 live nodes".
+        self.assertEqual(result, [node])
+        self.assertTrue(proc.terminated)
+
+    def test_xray_frag_subscription_prioritizes_fm_capable_vless_and_trojan(
+        self,
+    ):
+        vmess_cfg = {
+            "add": "9.9.9.9",
+            "port": 443,
+            "id": "uuid-v",
+            "net": "ws",
+            "tls": "tls",
+            "sni": "v.example",
+        }
+        vmess = self._node_from(
+            "vmess://" + base64.b64encode(json.dumps(vmess_cfg).encode()).decode(),
+            quality=1.0,
+        )
+        vless = self._node_from(
+            "vless://uuid-a@20.0.0.1:443?security=tls&sni=a.example#a",
+            quality=2.0,
+        )
+        trojan = self._node_from(
+            "trojan://pw@20.0.1.1:443?sni=b.example#b", quality=3.0
+        )
+        nodes = [vmess, vless, trojan]
+
+        collector.write_all_outputs(
+            {"DE": nodes},
+            {"vmess": [vmess], "vless": [vless], "trojan": [trojan]},
+            total_tested=3,
+            total_passed=3,
+        )
+
+        with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+            servers = f.read().splitlines()
+        self.assertEqual(len(servers), 3)
+        self.assertTrue(any(line.startswith("vmess://") for line in servers))
+
+        with open(
+            os.path.join(self.tmp, "servers_xray_frag.txt"), encoding="utf-8"
+        ) as f:
+            frag_lines = f.read().splitlines()
+        self.assertEqual(len(frag_lines), 2)
+        for line in frag_lines:
+            self.assertIn("fm=", line)
+            self.assertFalse(line.startswith("vmess://"))
+
+        with open(
+            os.path.join(self.tmp, "sub_xray_frag.txt"), encoding="ascii"
+        ) as f:
+            decoded = base64.b64decode(f.read()).decode("utf-8").splitlines()
+        self.assertEqual(decoded, frag_lines)
 
     def test_max_xray_candidates_per_country_caps_batch_size(self):
         nodes = []
