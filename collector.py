@@ -163,6 +163,10 @@ PROTOCOL_SORT_OFFSET: Dict[str, float] = {
 # Xray always outranks a socket-only node, while staying in the same pool so
 # every country can still fill its five slots.
 XRAY_VERIFIED_BONUS_MS: float = -300.0
+# Live carrier testing (v2rayN / Xray 26.9.9): VLESS + REALITY passed ~90%,
+# while Trojan + raw/tcp + tls failed ~95%. Rank accordingly.
+REALITY_SORT_BONUS_MS: float = -180.0
+TROJAN_RAW_TLS_PENALTY_MS: float = 150.0
 STREAK_BONUS_PER_HIT_MS: float = -4.0
 IRAN_STREAK_BONUS_PER_HIT_MS: float = -12.0
 MAX_STREAK_BONUS_MS: float = -120.0
@@ -179,6 +183,8 @@ DECOY_ONLY_HOSTS: Set[str] = {
     # Dead PaaS endpoints: herokuapp/seenode resolve to blocked AWS Global
     # Accelerator ranges and answer with an immediate TCP RST inside Iran.
     "herokuapp.com", "seenode.app", "run-on-seenode.com",
+    # PaaS hosting domains seen in carrier logs as "malformed ECHConfigList".
+    "render.com", "onrender.com", "bluehost.com",
 }
 
 # Non-TLS transports/protocols that must answer the HTTP payload probe.
@@ -392,8 +398,9 @@ def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
     iran_ok = any(k in u for k in keys) or (
         "sakha1370/openray" in u and not country_feed
     )
-    if "aistudio_iran_verified" in u:
+    if "aistudio_iran_verified" in u or "iran_top100_checked" in u:
         # Inside-Iran verified feeds are tested on both MCI and Irancell.
+        iran_ok = True
         tags.update(("mci", "irancell"))
     if "/mci" in u or "mci_top" in u:
         tags.add("mci")
@@ -1018,8 +1025,23 @@ def _is_public_ip(ip: str) -> bool:
 # Dual-probe stability: real handshake + active payload (TTFB) verification
 # ---------------------------------------------------------------------------
 
-def _build_tls_context(node: NodeInfo) -> ssl.SSLContext:
-    """No-verify TLS context used for the reachability probe only.
+def _create_probe_ssl_context() -> ssl.SSLContext:
+    """No-verify TLS context for the reachability probe only."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+# Built exactly once at import time. ``ssl.create_default_context()`` reloads
+# /etc/ssl/certs/ca-certificates.crt from disk on every call; doing that ~6,000
+# times on the event loop added +400ms per probe and dropped 96% of nodes for
+# exceeding MAX_LATENCY_MS.
+_PROBE_SSL_CTX: ssl.SSLContext = _create_probe_ssl_context()
+
+
+def _build_tls_context(node: Optional[NodeInfo] = None) -> ssl.SSLContext:
+    """O(1) TLS context shared by every probe connection.
 
     Proxy endpoints legitimately serve camouflage SNIs, Cloudflare edge IPs and
     REALITY ephemeral certificates, so CA/hostname verification in this probe
@@ -1027,10 +1049,7 @@ def _build_tls_context(node: NodeInfo) -> ssl.SSLContext:
     the client (or to REALITY's ``pbk``), and TLS nodes with no domain SNI are
     excluded up front by :func:`is_main_pool_eligible`.
     """
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    return ctx
+    return _PROBE_SSL_CTX
 
 
 def _enforce_min_tls_version(node: NodeInfo, ssl_object: Any) -> None:
@@ -1392,7 +1411,7 @@ def compute_streak_bonus_ms(node: NodeInfo) -> float:
 
 
 def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
-    """Ranking key: Xray-verified first, then VLESS, latency and streaks."""
+    """Ranking key: Xray-verified, REALITY, VLESS first; raw TCP Trojan last."""
     quality = (
         node.quality_score if node.quality_score is not None else float("inf")
     )
@@ -1400,9 +1419,29 @@ def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
         XRAY_VERIFIED_BONUS_MS if getattr(node, "xray_verified", False) else 0.0
     )
     proto_offset = PROTOCOL_SORT_OFFSET.get(node.protocol, 0.0)
+    sec = (getattr(node, "security", "") or "").lower()
+    net = (node.network or "tcp").lower()
+    is_reality = sec == "reality" or "security=reality" in (
+        node.raw_link or ""
+    ).lower()
+    reality_bonus = REALITY_SORT_BONUS_MS if is_reality else 0.0
+    # Carrier testing: Trojan + raw/tcp + tls failed ~95% of the time in Iran.
+    trojan_raw_penalty = (
+        TROJAN_RAW_TLS_PENALTY_MS
+        if (node.protocol == "trojan" and not is_reality and net in ("tcp", "raw"))
+        else 0.0
+    )
     streak_bonus = compute_streak_bonus_ms(node)
     return (
-        round(quality + xray_bonus + proto_offset + streak_bonus, 2),
+        round(
+            quality
+            + xray_bonus
+            + proto_offset
+            + reality_bonus
+            + trojan_raw_penalty
+            + streak_bonus,
+            2,
+        ),
         quality,
     )
 
@@ -1423,10 +1462,14 @@ def _transport_bucket(node: NodeInfo) -> str:
 
 def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo]:
     """Pick up to *quota* nodes: distinct ``/24`` subnets first, round-robin
-    across transport buckets so one transport never owns every slot."""
+    across transport buckets so one transport never owns every slot.
+
+    Nodes are ranked before deduplication, so when one IP carries several
+    transports the best-ranked one is the one that survives.
+    """
     if quota <= 0:
         return []
-    ordered = dedupe_by_pure_ip(nodes)
+    ordered = dedupe_by_pure_ip(sorted(nodes, key=_effective_sort_key))
     if len(ordered) <= quota:
         return ordered
 
@@ -1436,7 +1479,13 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
     for pool in buckets.values():
         pool.sort(key=_effective_sort_key)
 
-    bucket_order = ["reality", "ws-tls", "grpc-tls", "h2-tls", "tcp-tls"]
+    # REALITY is the transport that actually works inside Iran (15 of 18 live
+    # nodes in the carrier test), so it gets up to three of the five slots
+    # before a dead ``tcp-tls`` Trojan is allowed in at all.
+    bucket_order = [
+        "reality", "ws-tls", "reality", "grpc-tls", "reality", "h2-tls",
+        "tcp-tls",
+    ]
     selected: List[NodeInfo] = []
     seen_subnets: Set[str] = set()
     made_progress = True
@@ -3004,13 +3053,20 @@ async def _main_impl() -> int:
         print(f"[info] After dual-probe stability: {len(passed)} node(s)")
         _mark("probe")
 
-        # --- Stage 5b: end-to-end tunnel verification through real Xray -----
-        tunnel_checked = await verify_nodes_with_xray(passed)
-        if tunnel_checked:
-            passed = tunnel_checked
-            print(f"[info] After Xray tunnel check: {len(passed)} node(s)")
+        # --- Stage 5b: optional Xray tunnel verification (OFF by default) ---
+        # The OpenRay inside-Iran feeds are already tunnel-checked upstream, and
+        # batching them through Xray rejected whole VLESS/REALITY batches (17-24
+        # survivors instead of ~700). The socket probes above are the production
+        # gate; the Xray stage stays available as an explicit opt-in.
+        if os.environ.get("BRICK_ENABLE_XRAY_STAGE") == "1":
+            tunnel_checked = await verify_nodes_with_xray(passed)
+            if tunnel_checked:
+                passed = tunnel_checked
+                print(f"[info] After Xray tunnel check: {len(passed)} node(s)")
+            else:
+                print("[warn] Xray tunnel check produced no nodes; keeping stable set")
         else:
-            print("[warn] Xray tunnel check produced no nodes; keeping stable set")
+            print("[info] Xray tunnel stage disabled (BRICK_ENABLE_XRAY_STAGE != 1)")
         _mark("xray tunnel")
 
         # --- Stage 6: GeoIP filtering (only when the offline DB was unusable)

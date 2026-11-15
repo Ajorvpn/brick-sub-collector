@@ -2768,6 +2768,100 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(collector.apply_openray_telemetry([], telemetry), 0)
         self.assertEqual(collector.apply_openray_telemetry([node], {}), 0)
 
+    def test_build_tls_context_returns_cached_singleton_without_disk_reload(
+        self,
+    ):
+        n1 = self._node(
+            "vless://uuid-a@1.2.3.4:443?security=tls&sni=a.example#a"
+        )
+        n2 = self._node(
+            "vless://uuid-b@2.3.4.5:443?security=reality&sni=b.example"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}#b"
+        )
+        ctx1 = collector._build_tls_context(n1)
+        ctx2 = collector._build_tls_context(n2)
+        self.assertIs(ctx1, ctx2)
+        self.assertIs(ctx1, collector._PROBE_SSL_CTX)
+        # Called with no node at all, the same singleton comes back.
+        self.assertIs(collector._build_tls_context(), collector._PROBE_SSL_CTX)
+        self.assertEqual(ctx1.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(ctx1.check_hostname)
+
+    def test_render_and_bluehost_rejected_as_decoy_connect_hosts(self):
+        for host in ("render.com", "app.onrender.com", "bluehost.com"):
+            self.assertTrue(collector._is_decoy_connect_host(host), host)
+            node = collector.parse_node_info(
+                f"vless://uuid@{host}:443?security=tls&sni=a.example#dead"
+            )
+            self.assertIsNone(node, host)
+
+        # A domain that only mentions the decoy name stays usable.
+        self.assertFalse(collector._is_decoy_connect_host("render.com.example.net"))
+
+    def test_effective_sort_key_boosts_vless_reality_and_penalizes_raw_tcp_trojan(
+        self,
+    ):
+        reality = self._node(
+            "vless://uuid-r@1.2.3.4:443?security=reality&sni=a.example"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#reality",
+            quality=200.0,
+        )
+        trojan_tcp = self._node(
+            "trojan://pw@2.3.4.5:443?sni=b.example&type=tcp#trojan",
+            quality=100.0,
+        )
+        self.assertEqual(reality.security, "reality")
+        self.assertEqual(trojan_tcp.network, "tcp")
+
+        reality_key = collector._effective_sort_key(reality)[0]
+        trojan_key = collector._effective_sort_key(trojan_tcp)[0]
+        self.assertLess(reality_key, trojan_key)
+        self.assertEqual(
+            reality_key,
+            round(200.0 + collector.REALITY_SORT_BONUS_MS
+                  + collector.PROTOCOL_SORT_OFFSET["vless"], 2),
+        )
+        self.assertEqual(
+            trojan_key,
+            round(100.0 + collector.TROJAN_RAW_TLS_PENALTY_MS
+                  + collector.PROTOCOL_SORT_OFFSET["trojan"], 2),
+        )
+
+        # A REALITY Trojan is not penalized like a raw TCP Trojan.
+        trojan_reality = collector.NodeInfo(
+            protocol="trojan",
+            quality_score=100.0,
+            network="tcp",
+            security="reality",
+        )
+        self.assertNotEqual(
+            collector._effective_sort_key(trojan_reality)[0], trojan_key
+        )
+
+    def test_iran_top100_checked_feed_is_registered_once_and_iran_verified(
+        self,
+    ):
+        with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        matching = [u for u in urls if "iran_top100_checked" in u]
+        self.assertEqual(len(matching), 1)
+        self.assertEqual(
+            matching[0],
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/iran_top100_checked.txt",
+        )
+
+        iran_ok, tags = collector.classify_source_url(matching[0])
+        self.assertTrue(iran_ok)
+        self.assertEqual(tags, {"mci", "irancell"})
+
+        verified_ok, verified_tags = collector.classify_source_url(
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/site_access/aistudio_iran_verified.txt"
+        )
+        self.assertTrue(verified_ok)
+        self.assertEqual(verified_tags, {"mci", "irancell"})
+
     def test_compute_streak_bonus_ms_and_effective_sort_key_priority(self):
         node = collector.NodeInfo(protocol="vless", quality_score=100.0)
         self.assertEqual(collector.compute_streak_bonus_ms(node), 0.0)
