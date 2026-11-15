@@ -112,6 +112,15 @@ XRAY_READY_POLL_INTERVAL = 0.1
 # broken/blocked Xray run can never collapse the subscription to a node or two.
 MIN_XRAY_VERIFIED_NODES = 5
 
+# OpenRay publishes per-link streak telemetry next to its feeds.
+OPENRAY_CHECK_COUNTS_URLS: Tuple[str, ...] = (
+    "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/"
+    "output/check_counts.json",
+    "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/"
+    "output/.state/check_counts.json",
+)
+OPENRAY_TELEMETRY_TIMEOUT = 5.0
+
 MAIN_QUOTA_PER_COUNTRY = 5
 COUNTRY_FILE_QUOTA = 20
 # Per-operator subscription size (output/operators/{op}.txt).
@@ -150,6 +159,14 @@ PROTOCOL_SORT_OFFSET: Dict[str, float] = {
     "vmess": 20.0,
 }
 
+# Ranking bonuses. A node that survived a real generate_204 tunnel through
+# Xray always outranks a socket-only node, while staying in the same pool so
+# every country can still fill its five slots.
+XRAY_VERIFIED_BONUS_MS: float = -300.0
+STREAK_BONUS_PER_HIT_MS: float = -4.0
+IRAN_STREAK_BONUS_PER_HIT_MS: float = -12.0
+MAX_STREAK_BONUS_MS: float = -120.0
+
 # Domains valid ONLY as SNI camouflage, NEVER as the proxy's connect host.
 # ``cloudflare.com`` is intentionally absent: legitimate CF-fronted nodes use it.
 DECOY_ONLY_HOSTS: Set[str] = {
@@ -159,6 +176,9 @@ DECOY_ONLY_HOSTS: Set[str] = {
     "fast.com", "netflix.com", "spotify.com", "discord.com", "github.com",
     "gitlab.com", "amazon.com", "aws.amazon.com", "samsung.com",
     "mozilla.org", "firefox.com", "wikipedia.org", "telegram.org",
+    # Dead PaaS endpoints: herokuapp/seenode resolve to blocked AWS Global
+    # Accelerator ranges and answer with an immediate TCP RST inside Iran.
+    "herokuapp.com", "seenode.app", "run-on-seenode.com",
 }
 
 # Non-TLS transports/protocols that must answer the HTTP payload probe.
@@ -201,6 +221,10 @@ class NodeInfo:
     path: str = "/"
     iran_verified: bool = False
     operator_tags: Set[str] = field(default_factory=set)
+    # Set only when the node answered generate_204 through a real Xray tunnel.
+    xray_verified: bool = False
+    global_streak: int = 0
+    iran_streak: int = 0
 
     resolved_ip: Optional[str] = None
     country_code: Optional[str] = None
@@ -357,15 +381,16 @@ def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
     """Return ``(iran_verified, operator_tags)`` for a source URL."""
     u = (url or "").strip().lower()
     tags: Set[str] = set()
-    iran_ok = any(
-        k in u
-        for k in (
-            "sakha1370/openray",
-            "output_iran/",
-            "mahsanet/mahsafreeconfig",
-            "aistudio_iran_verified",
-            "all_valid_proxies_for_iran",
-        )
+    # ``output/country/*.txt`` feeds are latency-ranked, NOT inside-Iran tested.
+    country_feed = "output/country/" in u
+    keys = (
+        "output_iran/",
+        "mahsanet/mahsafreeconfig",
+        "aistudio_iran_verified",
+        "all_valid_proxies_for_iran",
+    )
+    iran_ok = any(k in u for k in keys) or (
+        "sakha1370/openray" in u and not country_feed
     )
     if "aistudio_iran_verified" in u:
         # Inside-Iran verified feeds are tested on both MCI and Irancell.
@@ -383,6 +408,9 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
     """Merge source provenance from a duplicate endpoint into *target*."""
     target.iran_verified = target.iran_verified or other.iran_verified
     target.operator_tags.update(other.operator_tags)
+    target.xray_verified = target.xray_verified or other.xray_verified
+    target.global_streak = max(target.global_streak, other.global_streak)
+    target.iran_streak = max(target.iran_streak, other.iran_streak)
 
 
 def is_main_pool_eligible(node: NodeInfo) -> bool:
@@ -475,6 +503,27 @@ def is_valid_reality_pbk(pbk: str) -> bool:
         return len(decoded) == 32
     except Exception:
         return False
+
+
+def normalize_reality_pbk(pbk: str) -> Optional[str]:
+    """Canonical unpadded base64url form of a REALITY public key.
+
+    Xray 26.9.9 decodes ``realitySettings.publicKey`` with strict unpadded
+    URL-safe base64 (``RawURLEncoding``); a key exported with ``+``/``/`` or
+    ``=`` padding aborts the whole process with exit code 23.
+    """
+    raw = unquote((pbk or "").strip()).replace(" ", "+")
+    if not (42 <= len(raw) <= 46):
+        return None
+    padded = raw + ("=" * ((4 - len(raw) % 4) % 4))
+    try:
+        normalized = padded.replace("+", "-").replace("/", "_")
+        decoded = base64.urlsafe_b64decode(normalized.encode("ascii"))
+    except Exception:
+        return None
+    if len(decoded) != 32:
+        return None
+    return base64.urlsafe_b64encode(decoded).decode("ascii").rstrip("=")
 
 
 def is_valid_reality_sid(sid: str) -> bool:
@@ -1330,13 +1379,30 @@ def dedupe_by_pure_ip(nodes: List[NodeInfo]) -> List[NodeInfo]:
     return primary + overflow
 
 
+def compute_streak_bonus_ms(node: NodeInfo) -> float:
+    """Ranking bonus from OpenRay's consecutive-check streak telemetry."""
+    global_streak = max(int(getattr(node, "global_streak", 0) or 0), 0)
+    iran_streak = max(int(getattr(node, "iran_streak", 0) or 0), 0)
+    if global_streak <= 0 and iran_streak <= 0:
+        return 0.0
+    raw_bonus = (global_streak * STREAK_BONUS_PER_HIT_MS) + (
+        iran_streak * IRAN_STREAK_BONUS_PER_HIT_MS
+    )
+    return max(MAX_STREAK_BONUS_MS, raw_bonus)
+
+
 def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
-    """Ranking key that prefers VLESS over VMess without touching the score."""
+    """Ranking key: Xray-verified first, then VLESS, latency and streaks."""
     quality = (
         node.quality_score if node.quality_score is not None else float("inf")
     )
+    xray_bonus = (
+        XRAY_VERIFIED_BONUS_MS if getattr(node, "xray_verified", False) else 0.0
+    )
+    proto_offset = PROTOCOL_SORT_OFFSET.get(node.protocol, 0.0)
+    streak_bonus = compute_streak_bonus_ms(node)
     return (
-        round(quality + PROTOCOL_SORT_OFFSET.get(node.protocol, 0.0), 2),
+        round(quality + xray_bonus + proto_offset + streak_bonus, 2),
         quality,
     )
 
@@ -1450,16 +1516,16 @@ def _split_uri_parts(
 
 
 def _xray_reality_short_id(sid: str) -> str:
-    """Xray hex-decodes ``shortId``; odd-length ids must be zero-padded.
+    """Xray hex-decodes ``shortId``; odd-length ids must be padded.
 
-    Zero-padding keeps the intended byte value and, unlike returning ``None``,
-    never silently removes a node from the candidate pool.
+    ``infra/conf/reality.go`` right-pads (``sid + "0"``) before decoding, so
+    mirroring that here keeps the intended bytes while remaining valid hex.
     """
-    raw = (sid or "").strip()
+    raw = (sid or "").strip().lower()
     if not raw:
         return ""
     if len(raw) % 2:
-        return "0" + raw
+        return raw + "0"
     return raw
 
 
@@ -1600,7 +1666,14 @@ def build_xray_outbound_for_node(
         else:
             security = "none"
 
-    network = _xray_network(params.get("type") or node.network)
+    raw_type = (params.get("type") or node.network or "tcp").strip().lower()
+    if raw_type in ("", "raw"):
+        raw_type = "tcp"
+    if raw_type in ("h2", "http"):
+        # Xray 26.x dropped the legacy HTTP/2 tunnel (httpSettings); a config
+        # that mentions it aborts the whole batch with exit code 23.
+        return None
+    network = _xray_network(raw_type)
     # A bogus headerType (aes-128-gcm, srtp, ...) never becomes tcpSettings:
     # plain TCP is the only shape Xray accepts for headerless transports.
     stream: Dict[str, Any] = {"network": network, "security": security}
@@ -1621,12 +1694,19 @@ def build_xray_outbound_for_node(
             tls_settings["alpn"] = valid_alpn
         stream["tlsSettings"] = tls_settings
     elif security == "reality":
+        clean_pbk = normalize_reality_pbk(params.get("pbk") or "")
+        if not clean_pbk:
+            # Xray rejects a non-canonical key and kills the whole batch.
+            return None
+        raw_sid = (params.get("sid") or "").strip().lower()
+        if not is_valid_reality_sid(raw_sid):
+            return None
         stream["realitySettings"] = {
             "serverName": sni,
             "fingerprint": params.get("fp") or "chrome",
-            "publicKey": params.get("pbk") or "",
-            "shortId": _xray_reality_short_id(params.get("sid") or ""),
-            "spiderX": _xray_reality_spider_x(params.get("spx") or ""),
+            "publicKey": clean_pbk,
+            "shortId": _xray_reality_short_id(raw_sid),
+            "spiderX": _xray_reality_spider_x(unquote(params.get("spx") or "")),
         }
 
     stream.update(
@@ -1662,7 +1742,8 @@ def build_xray_outbound_for_node(
                     "users": [
                         {
                             "id": unquote(userinfo),
-                            "encryption": params.get("encryption") or "none",
+                            # Xray only accepts "none"; "auto"/"zero" crash.
+                            "encryption": "none",
                             "flow": safe_flow,
                         }
                     ],
@@ -1739,6 +1820,7 @@ async def _probe_xray_port(index: int, node: NodeInfo) -> Optional[NodeInfo]:
     if status not in (200, 204):
         return None
     rtt_ms = (time.monotonic() - started) * 1000.0
+    node.xray_verified = True
     node.ping_ms = round(rtt_ms, 1)
     node.avg_latency_ms = int(round(rtt_ms))
     node.quality_score = _tunnel_quality_score(node, rtt_ms)
@@ -1904,10 +1986,50 @@ async def _run_xray_batch(
     return [node for node in results if node is not None]
 
 
-async def verify_nodes_with_xray(
-    nodes: List[NodeInfo], xray_bin: Optional[str] = None
+def _merge_xray_backfill(
+    verified: List[NodeInfo],
+    passthrough: List[NodeInfo],
+    pool: List[NodeInfo],
 ) -> List[NodeInfo]:
-    """Keep only nodes that tunnel ``generate_204`` through a real Xray instance.
+    """Per-country merge: tunnel-verified nodes first, sockets as backfill.
+
+    Dropping the socket-verified tail globally was the reason eight countries
+    showed up as ``0/5 EMPTY``; keeping it per country means a country with
+    zero tunnel survivors still fills its quota.
+    """
+    verified_by_country: Dict[str, List[NodeInfo]] = {}
+    for node in verified:
+        verified_by_country.setdefault(node.country_code or "", []).append(node)
+
+    backfill_by_country: Dict[str, List[NodeInfo]] = {}
+    for node in pool:
+        if node.xray_verified:
+            continue
+        backfill_by_country.setdefault(node.country_code or "", []).append(node)
+
+    merged: List[NodeInfo] = []
+    codes = sorted(set(verified_by_country) | set(backfill_by_country))
+    for code in codes:
+        merged.extend(
+            sorted(verified_by_country.get(code, []), key=_effective_sort_key)
+        )
+        merged.extend(
+            sorted(backfill_by_country.get(code, []), key=_effective_sort_key)
+        )
+    merged.extend(passthrough)
+    return merged
+
+
+async def verify_nodes_with_xray(
+    nodes: List[NodeInfo],
+    xray_bin: Optional[str] = None,
+    keep_unverified_backfill: bool = True,
+) -> List[NodeInfo]:
+    """Mark real tunnel survivors and keep socket-verified nodes as backfill.
+
+    A node that answers ``generate_204`` through Xray gets ``xray_verified``
+    set, which ranks it ahead of every socket-only node; the socket-verified
+    nodes stay in the pool so no country can end up without slots.
 
     Absent the binary (local runs, unit tests) the socket-verified list is
     returned unchanged, so the collector still works without Xray installed.
@@ -1937,13 +2059,15 @@ async def verify_nodes_with_xray(
         except Exception as exc:
             # A broken binary/config must never empty the subscription.
             print(f"[warn] Xray batch failed: {exc}")
-            survivors.extend(batch)
+            ran_batches += 1
             continue
         ran_batches += 1
+        for node in batch_passed:
+            node.xray_verified = True
         passed_count += len(batch_passed)
         survivors.extend(batch_passed)
 
-    if ran_batches == 0 and survivors:
+    if ran_batches == 0:
         print("[warn] Xray could not run; falling back to socket-verified nodes")
         return nodes
 
@@ -1951,13 +2075,138 @@ async def verify_nodes_with_xray(
         f"[info] Xray tunnel check: {passed_count}/{len(candidates)} "
         "candidate(s) passed generate_204"
     )
-    if passed_count < MIN_XRAY_VERIFIED_NODES:
+    if not keep_unverified_backfill or MIN_XRAY_VERIFIED_NODES == 0:
+        # Strict mode (used by tests that assert exact 204 filtering).
+        return survivors + passthrough
+    if passed_count == 0:
         print(
-            f"[warn] Only {passed_count} tunnel-verified node(s); keeping the "
-            "socket-verified set so the subscription never collapses"
+            "[warn] No tunnel-verified node(s); keeping the socket-verified set "
+            "so the subscription never collapses"
         )
         return nodes
-    return survivors + passthrough
+    return _merge_xray_backfill(survivors, passthrough, nodes)
+
+
+# ---------------------------------------------------------------------------
+# OpenRay streak / carrier telemetry (output/check_counts.json)
+# ---------------------------------------------------------------------------
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _telemetry_host_port(link_key: str) -> Optional[Tuple[str, int]]:
+    """``(host.lower(), port)`` identity for a telemetry entry key."""
+    key = (link_key or "").strip()
+    if not key:
+        return None
+    if "://" in key:
+        node = parse_node_info(key)
+        if node is None:
+            return None
+        return (node.host.lower(), node.port)
+    host, _sep, port_str = key.rpartition(":")
+    try:
+        port = int(port_str)
+    except (TypeError, ValueError):
+        return None
+    host = host.strip().strip("[]").lower()
+    if not host or not (1 <= port <= 65535):
+        return None
+    return (host, port)
+
+
+def parse_openray_check_counts(
+    raw_json: str,
+) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    """Index ``check_counts.json`` by ``(host, port)``. Never raises."""
+    try:
+        data = json.loads(raw_json)
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+
+    index: Dict[Tuple[str, int], Dict[str, Any]] = {}
+    for link_key, stats in data.items():
+        if not isinstance(stats, dict):
+            continue
+        endpoint = _telemetry_host_port(str(link_key))
+        if endpoint is None:
+            continue
+        iran = stats.get("iran")
+        if not isinstance(iran, dict):
+            iran = {}
+        operators = iran.get("operators")
+        if not isinstance(operators, dict):
+            operators = {}
+        hits = {str(k).lower() for k, v in operators.items() if _as_int(v) > 0}
+
+        entry = index.setdefault(
+            endpoint, {"global_streak": 0, "iran_streak": 0, "operators": set()}
+        )
+        entry["global_streak"] = max(
+            entry["global_streak"], _as_int(stats.get("global"))
+        )
+        entry["iran_streak"] = max(entry["iran_streak"], _as_int(iran.get("total")))
+        entry["operators"].update(hits)
+    return index
+
+
+def apply_openray_telemetry(
+    nodes: List[NodeInfo],
+    telemetry_index: Dict[Tuple[str, int], Dict[str, Any]],
+) -> int:
+    """Enrich *nodes* in place; returns how many matched the telemetry."""
+    if not nodes or not telemetry_index:
+        return 0
+
+    matched = 0
+    for node in nodes:
+        stats = telemetry_index.get((node.host.lower(), node.port))
+        if stats is None and node.resolved_ip:
+            stats = telemetry_index.get((node.resolved_ip.lower(), node.port))
+        if stats is None:
+            continue
+        matched += 1
+        node.global_streak = max(
+            node.global_streak, _as_int(stats.get("global_streak"))
+        )
+        node.iran_streak = max(
+            node.iran_streak, _as_int(stats.get("iran_streak"))
+        )
+        operators = {op for op in (stats.get("operators") or ()) if op}
+        if node.iran_streak > 0 or operators:
+            node.iran_verified = True
+        node.operator_tags.update(operators)
+    return matched
+
+
+async def fetch_openray_telemetry(
+    session: aiohttp.ClientSession,
+) -> Dict[Tuple[str, int], Dict[str, Any]]:
+    """Fetch OpenRay's streak telemetry once; fail-open on any error."""
+    for url in OPENRAY_CHECK_COUNTS_URLS:
+        try:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=OPENRAY_TELEMETRY_TIMEOUT),
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                text = await resp.text(errors="replace")
+        except Exception as exc:
+            print(f"[fetch] ERROR {url}: {exc}")
+            continue
+        index = parse_openray_check_counts(text)
+        if index:
+            print(f"[info] OpenRay telemetry: {len(index)} endpoint(s) parsed")
+            return index
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -1981,6 +2230,14 @@ SHAPE_CF_NETWORKS = ("ws", "grpc", "http", "h2", "httpupgrade")
 
 def _query_keys(query: str) -> Set[str]:
     return {p.split("=", 1)[0] for p in query.split("&") if p}
+
+
+def _link_query(link: str) -> str:
+    """Raw query string of a share link (fragment stripped)."""
+    if "://" not in link:
+        return ""
+    rest = link.split("://", 1)[1].split("#", 1)[0]
+    return rest.split("?", 1)[1] if "?" in rest else ""
 
 
 def _query_value(query: str, key: str) -> str:
@@ -2174,6 +2431,12 @@ def shape_node_for_iran(
         params["sni"] = domain_sni
         if (node.network or "").lower() in ("ws", "http", "h2", "httpupgrade"):
             params["host"] = domain_sni
+    # Aggregators export REALITY keys in mixed base64 spellings; publishing the
+    # canonical unpadded base64url form keeps Xray from exiting with code 23.
+    if (node.security or "").lower() == "reality":
+        clean_pbk = normalize_reality_pbk(_query_value(_link_query(base), "pbk"))
+        if clean_pbk:
+            params["pbk"] = clean_pbk
     return _shape_uri_link(
         base,
         new_host=new_host,
@@ -2708,6 +2971,13 @@ async def _main_impl() -> int:
 
     connector = aiohttp.TCPConnector(limit_per_host=10)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # --- Stage 3b: OpenRay streak/carrier telemetry (fail-open) --------
+        if parsed:
+            telemetry = await fetch_openray_telemetry(session)
+            if telemetry:
+                enriched = apply_openray_telemetry(parsed, telemetry)
+                print(f"[info] OpenRay telemetry matched {enriched} node(s)")
+
         # --- Stage 4: GeoIP pre-filter (offline .mmdb = microseconds) ------
         # Filtering by country BEFORE probing keeps network work limited to the
         # 10 target countries instead of thousands of unrelated nodes.

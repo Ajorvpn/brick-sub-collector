@@ -9,7 +9,7 @@ import ssl
 import tempfile
 import unittest
 from unittest import mock
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 import collector
 
@@ -787,6 +787,10 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
         ), mock.patch.object(
             collector, "fetch_all", side_effect=fake_fetch_all
         ), mock.patch.object(
+            collector,
+            "fetch_openray_telemetry",
+            new=mock.AsyncMock(return_value={}),
+        ), mock.patch.object(
             collector, "resolve_and_dedup_nodes", side_effect=fake_resolve
         ), mock.patch.object(
             collector, "ensure_mmdb_database", side_effect=fake_ensure
@@ -808,12 +812,12 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSourcesFile(unittest.TestCase):
-    """D4: sources.txt must hold exactly ten live subscription mirrors."""
+    """D4: sources.txt must hold exactly sixteen live subscription mirrors."""
 
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 12)
+        self.assertEqual(len(urls), 16)
         for dead in (
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/"
@@ -851,6 +855,14 @@ class TestSourcesFile(unittest.TestCase):
             "main/output/site_access/aistudio_iran_verified.txt",
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output_iran/all_valid_proxies_for_iran.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/country/AT.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/country/CH.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/country/FI.txt",
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/country/SE.txt",
         ):
             self.assertIn(live, urls)
 
@@ -2212,8 +2224,9 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         reality_settings = stream["realitySettings"]
         self.assertEqual(reality_settings["serverName"], "www.apple.com")
         self.assertEqual(reality_settings["publicKey"], REALITY_PBK)
-        # Odd-length hex short ids are zero-padded so Xray can hex-decode them.
-        self.assertEqual(reality_settings["shortId"], "06ba8517")
+        # Odd-length short ids are right-padded exactly like Xray's
+        # infra/conf/reality.go (``sid + "0"``).
+        self.assertEqual(reality_settings["shortId"], "6ba85170")
         self.assertEqual(reality_settings["fingerprint"], "chrome")
         self.assertEqual(reality_settings["spiderX"], "/")
         self.assertNotIn("tlsSettings", stream)
@@ -2513,6 +2526,277 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertIs(passthrough[0], ss_node)
         for node in selected:
             self.assertTrue(collector.is_main_pool_eligible(node))
+
+
+class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
+    """Part 4.2: decoy PaaS hosts, Xray 26.9.9 config killers, per-country
+    backfill and OpenRay streak telemetry."""
+
+    def _node(self, link, country="DE", quality=10.0):
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node, link)
+        node.country_code = country
+        node.country_name = collector.ALLOWED_COUNTRIES[country][1]
+        node.quality_score = quality
+        node.avg_latency_ms = int(quality)
+        node.resolved_ip = node.host
+        return node
+
+    def test_herokuapp_and_seenode_rejected_as_decoy_connect_hosts(self):
+        for host in (
+            "mycfwork.herokuapp.com",
+            "5674-4.seenode.app",
+            "x.run-on-seenode.com",
+        ):
+            self.assertTrue(collector._is_decoy_connect_host(host), host)
+            node = collector.parse_node_info(
+                f"vless://uuid@{host}:443?security=tls&sni=a.example#dead"
+            )
+            self.assertIsNone(node, host)
+
+        # A host that merely ends with the dead domain name is not a decoy.
+        self.assertFalse(
+            collector._is_decoy_connect_host("herokuapp.com.evil.example")
+        )
+
+    def test_build_xray_outbound_normalizes_reality_pbk_and_forces_vless_encryption_none_and_skips_h2(
+        self,
+    ):
+        # Standard base64 spelling with padding: Xray's RawURLEncoding chokes.
+        padded_pbk = REALITY_PBK.replace("-", "+").replace("_", "/") + "="
+        link = (
+            "vless://uuid-a@1.2.3.4:443?security=reality&sni=a.example"
+            f"&pbk={quote(padded_pbk, safe='')}&sid={REALITY_SID}"
+            "&type=tcp&encryption=auto#r"
+        )
+        node = self._node(link)
+        self.assertEqual(node.security, "reality")
+
+        outbound = collector.build_xray_outbound_for_node(node, "out_0")
+        self.assertIsNotNone(outbound)
+        reality = outbound["streamSettings"]["realitySettings"]
+        self.assertEqual(reality["publicKey"], REALITY_PBK)
+        self.assertEqual(reality["shortId"], REALITY_SID)
+
+        user = outbound["settings"]["vnext"][0]["users"][0]
+        self.assertEqual(user["encryption"], "none")
+        self.assertEqual(outbound["streamSettings"]["network"], "tcp")
+        self.assertNotIn("httpSettings", json.dumps(outbound))
+
+        # A REALITY node with an unusable key must be skipped, never emitted.
+        broken_link = (
+            "vless://uuid-b@2.3.4.5:443?security=reality&sni=b.example"
+            f"&pbk=not-a-real-key&sid={REALITY_SID}#bad"
+        )
+        broken = collector.NodeInfo(
+            protocol="vless",
+            host="2.3.4.5",
+            port=443,
+            tls_enabled=True,
+            sni="b.example",
+            network="tcp",
+            security="reality",
+            original_link=broken_link,
+            raw_link=broken_link,
+            resolved_ip="2.3.4.5",
+            country_code="DE",
+            quality_score=10.0,
+        )
+        self.assertIsNone(collector.build_xray_outbound_for_node(broken, "out_x"))
+
+        # h2/http are gone from Xray 26.x: parse keeps the node, Xray skips it.
+        h2_node = self._node(
+            "vless://uuid-c@3.4.5.6:443?security=tls&sni=c.example&type=h2#h2"
+        )
+        self.assertEqual(h2_node.network, "h2")
+        self.assertIsNone(collector.build_xray_outbound_for_node(h2_node, "out_1"))
+
+    async def test_per_country_backfill_prevents_empty_countries_and_ranks_xray_verified_first(
+        self,
+    ):
+        us_good = self._node(
+            "vless://uuid-us1@11.0.0.1:443?security=tls&sni=us.example#us1",
+            country="US",
+            quality=100.0,
+        )
+        us_slow = self._node(
+            "vless://uuid-us2@11.0.1.1:443?security=tls&sni=us.example#us2",
+            country="US",
+            quality=40.0,
+        )
+        fr_node = self._node(
+            "vless://uuid-fr@12.0.0.1:443?security=tls&sni=fr.example#fr",
+            country="FR",
+            quality=50.0,
+        )
+        de_node = self._node(
+            "vless://uuid-de@13.0.0.1:443?security=tls&sni=de.example#de",
+            country="DE",
+            quality=60.0,
+        )
+        nodes = [us_good, us_slow, fr_node, de_node]
+
+        async def fake_probe(index, node):
+            if node is us_good:
+                node.xray_verified = True
+                node.ping_ms = 42.0
+                node.quality_score = 100.0
+                return node
+            return None
+
+        proc = _FakeXrayProcess()
+        with mock.patch.object(
+            collector, "_probe_xray_port", side_effect=fake_probe
+        ), mock.patch.object(
+            collector.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=proc),
+        ), mock.patch.object(collector, "XRAY_READY_TIMEOUT", 0.0):
+            result = await collector.verify_nodes_with_xray(
+                nodes, xray_bin="/usr/bin/xray"
+            )
+
+        # No country is dropped just because its tunnel check was empty.
+        self.assertEqual(len(result), 4)
+        self.assertIn(fr_node, result)
+        self.assertIn(de_node, result)
+        self.assertTrue(us_good.xray_verified)
+        self.assertFalse(us_slow.xray_verified)
+        self.assertLess(result.index(us_good), result.index(us_slow))
+        self.assertLess(
+            collector._effective_sort_key(us_good),
+            collector._effective_sort_key(us_slow),
+        )
+
+        # Strict mode keeps only the tunnel-verified nodes.
+        with mock.patch.object(
+            collector, "_probe_xray_port", side_effect=fake_probe
+        ), mock.patch.object(
+            collector.asyncio,
+            "create_subprocess_exec",
+            new=mock.AsyncMock(return_value=_FakeXrayProcess()),
+        ), mock.patch.object(
+            collector, "XRAY_READY_TIMEOUT", 0.0
+        ), mock.patch.object(collector, "MIN_XRAY_VERIFIED_NODES", 0):
+            strict = await collector.verify_nodes_with_xray(
+                [us_good, us_slow], xray_bin="/usr/bin/xray"
+            )
+        self.assertEqual(strict, [us_good])
+
+    def test_country_feeds_are_not_flagged_as_iran_verified(self):
+        base = "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+        for code in ("AT", "CH", "FI", "SE"):
+            iran_ok, tags = collector.classify_source_url(
+                f"{base}main/output/country/{code}.txt"
+            )
+            self.assertFalse(iran_ok, code)
+            self.assertEqual(tags, set())
+
+        self.assertTrue(
+            collector.classify_source_url(f"{base}main/output_iran/mci_top100.txt")[0]
+        )
+        self.assertTrue(
+            collector.classify_source_url(
+                f"{base}main/output/site_access/aistudio_iran_verified.txt"
+            )[0]
+        )
+
+    def test_parse_openray_check_counts_extracts_streaks_and_operators(self):
+        raw = json.dumps(
+            {
+                "vless://uuid-a@1.2.3.4:443?security=tls&sni=a.example#a": {
+                    "global": 7,
+                    "iran": {
+                        "total": 3,
+                        "operators": {"mci": 2, "irancell": 0, "tci": 1},
+                    },
+                },
+                "5.6.7.8:8443": {
+                    "global": 2,
+                    "iran": {"total": 0, "operators": {}},
+                },
+                "generated_at": "2026-11-15",
+                "broken://x": {"global": 1},
+                "no-port": {"global": 4},
+            }
+        )
+        index = collector.parse_openray_check_counts(raw)
+        self.assertEqual(index[("1.2.3.4", 443)]["global_streak"], 7)
+        self.assertEqual(index[("1.2.3.4", 443)]["iran_streak"], 3)
+        self.assertEqual(index[("1.2.3.4", 443)]["operators"], {"mci", "tci"})
+        self.assertEqual(index[("5.6.7.8", 8443)]["global_streak"], 2)
+        self.assertEqual(index[("5.6.7.8", 8443)]["iran_streak"], 0)
+        self.assertEqual(len(index), 2)
+
+        self.assertEqual(collector.parse_openray_check_counts("not json"), {})
+        self.assertEqual(collector.parse_openray_check_counts("[]"), {})
+
+    def test_apply_openray_telemetry_enriches_node_provenance_and_streaks(self):
+        node = self._node(
+            "vless://uuid-a@1.2.3.4:443?security=tls&sni=a.example#a"
+        )
+        other = self._node(
+            "vless://uuid-b@2.3.4.5:443?security=tls&sni=b.example#b"
+        )
+        other.resolved_ip = "5.6.7.8"
+
+        telemetry = {
+            ("1.2.3.4", 443): {
+                "global_streak": 9,
+                "iran_streak": 2,
+                "operators": {"mci"},
+            },
+            ("5.6.7.8", 443): {
+                "global_streak": 3,
+                "iran_streak": 0,
+                "operators": set(),
+            },
+        }
+        matched = collector.apply_openray_telemetry([node, other], telemetry)
+
+        self.assertEqual(matched, 2)
+        self.assertEqual(node.global_streak, 9)
+        self.assertEqual(node.iran_streak, 2)
+        self.assertTrue(node.iran_verified)
+        self.assertIn("mci", node.operator_tags)
+
+        # Matched through resolved_ip, and no Iran hits means no flag.
+        self.assertEqual(other.global_streak, 3)
+        self.assertEqual(other.iran_streak, 0)
+        self.assertFalse(other.iran_verified)
+
+        self.assertEqual(collector.apply_openray_telemetry([], telemetry), 0)
+        self.assertEqual(collector.apply_openray_telemetry([node], {}), 0)
+
+    def test_compute_streak_bonus_ms_and_effective_sort_key_priority(self):
+        node = collector.NodeInfo(protocol="vless", quality_score=100.0)
+        self.assertEqual(collector.compute_streak_bonus_ms(node), 0.0)
+
+        node.global_streak = 5
+        self.assertEqual(collector.compute_streak_bonus_ms(node), -20.0)
+
+        node.iran_streak = 2
+        self.assertEqual(collector.compute_streak_bonus_ms(node), -44.0)
+
+        node.global_streak = 100
+        node.iran_streak = 50
+        self.assertEqual(
+            collector.compute_streak_bonus_ms(node),
+            collector.MAX_STREAK_BONUS_MS,
+        )
+
+        socket_only = collector.NodeInfo(protocol="vless", quality_score=100.0)
+        tunnel = collector.NodeInfo(
+            protocol="vless", quality_score=105.0, xray_verified=True
+        )
+        self.assertLess(
+            collector._effective_sort_key(tunnel),
+            collector._effective_sort_key(socket_only),
+        )
+        self.assertEqual(
+            collector._effective_sort_key(socket_only)[0],
+            round(100.0 + collector.PROTOCOL_SORT_OFFSET["vless"], 2),
+        )
 
 
 if __name__ == "__main__":
