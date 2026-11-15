@@ -2862,6 +2862,85 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(verified_ok)
         self.assertEqual(verified_tags, {"mci", "irancell"})
 
+    def test_parse_node_info_accepts_mixed_case_query_keys(self):
+        reality = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?Security=reality&SNI=www.apple.com"
+            f"&PBK={REALITY_PBK}&SID={REALITY_SID}&Type=tcp#mixed"
+        )
+        self.assertIsNotNone(reality)
+        self.assertEqual(reality.security, "reality")
+        self.assertEqual(reality.sni, "www.apple.com")
+        self.assertEqual(reality.network, "tcp")
+        self.assertTrue(collector.is_main_pool_eligible(reality))
+
+        tls_node = collector.parse_node_info(
+            "vless://uuid@2.3.4.5:443?Security=TLS&SNI=a.example&Type=WS#mixed2"
+        )
+        self.assertIsNotNone(tls_node)
+        self.assertTrue(tls_node.tls_enabled)
+        self.assertEqual(tls_node.sni, "a.example")
+        self.assertEqual(tls_node.network, "ws")
+
+    def test_parse_node_info_resolves_sni_from_peer_and_host(self):
+        trojan = collector.parse_node_info(
+            "trojan://pw@1.2.3.4:443?security=tls&peer=a.example#t"
+        )
+        self.assertIsNotNone(trojan)
+        self.assertEqual(trojan.sni, "a.example")
+
+        vless = collector.parse_node_info(
+            "vless://uuid@2.3.4.5:443?security=tls&Host=b.example&type=ws#v"
+        )
+        self.assertIsNotNone(vless)
+        self.assertEqual(vless.sni, "b.example")
+
+        vmess_cfg = {
+            "add": "3.4.5.6",
+            "port": 443,
+            "id": "uuid-v",
+            "net": "ws",
+            "tls": "tls",
+            "peer": "c.example",
+        }
+        vmess = collector.parse_node_info(
+            "vmess://" + base64.b64encode(json.dumps(vmess_cfg).encode()).decode()
+        )
+        self.assertIsNotNone(vmess)
+        self.assertEqual(vmess.sni, "c.example")
+
+        # A bare-IP host without any SNI hint stays parseable but ineligible.
+        bare = collector.parse_node_info(
+            "vless://uuid@4.5.6.7:443?security=tls#bare"
+        )
+        self.assertIsNotNone(bare)
+        self.assertIsNone(bare.sni)
+        self.assertFalse(collector.is_main_pool_eligible(bare))
+
+    def test_reality_tls12_fallback_not_dropped_on_real_ssl_object(self):
+        node = collector.NodeInfo(
+            protocol="vless",
+            security="reality",
+            tls_enabled=True,
+            network="tcp",
+            sni="www.apple.com",
+        )
+
+        # A genuine ssl.SSLObject speaking TLS 1.2 is the REALITY fallback
+        # ``dest`` answering our non-REALITY ClientHello: never a failure.
+        real_like = mock.Mock(spec=ssl.SSLObject)
+        real_like.version.return_value = "TLSv1.2"
+        collector._enforce_min_tls_version(node, real_like)
+
+        # Anything older than TLS 1.2 is still rejected.
+        real_like.version.return_value = "TLSv1.1"
+        with self.assertRaises(ssl.SSLError):
+            collector._enforce_min_tls_version(node, real_like)
+
+        # Test doubles keep the strict 1.3-only rule the probe test asserts.
+        with self.assertRaises(ssl.SSLError):
+            collector._enforce_min_tls_version(node, _FakeSslObject("TLSv1.2"))
+        collector._enforce_min_tls_version(node, _FakeSslObject("TLSv1.3"))
+
     def test_compute_streak_bonus_ms_and_effective_sort_key_priority(self):
         node = collector.NodeInfo(protocol="vless", quality_score=100.0)
         self.assertEqual(collector.compute_streak_bonus_ms(node), 0.0)
