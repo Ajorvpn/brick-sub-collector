@@ -234,6 +234,9 @@ class NodeInfo:
     xray_verified: bool = False
     global_streak: int = 0
     iran_streak: int = 0
+    # Position at which the node first appeared in an OpenRay Iran feed, so the
+    # upstream (inside-Iran) ordering can be preserved end to end.
+    source_index: int = 0
 
     resolved_ip: Optional[str] = None
     country_code: Optional[str] = None
@@ -713,12 +716,14 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         if not is_valid_reality_pbk(pbk) or not is_valid_reality_sid(sid):
             return None
 
-    # Encrypted-only policy for the main pool. ``ss://`` is always plaintext
-    # and is excluded by protocol instead, so its parser stays permissive.
+    # Xray 26.9.9 refuses to start on plaintext VLESS ("vless without TLS or
+    # other encryption is prohibited"), so those links are dropped here.
+    # Shadowsocks and AEAD VMess are natively supported by Xray/sing-box and
+    # are exactly what OpenRay's fastest inside-Iran rows are, so they stay.
     if (
         not node.tls_enabled
         and node.port in PLAINTEXT_AND_ABUSED_PORTS
-        and node.protocol != "ss"
+        and node.protocol == "vless"
     ):
         return None
 
@@ -2561,8 +2566,11 @@ def shape_node_for_iran(
     is_blocked_cf = is_blocked_cloudflare_ip(
         node.resolved_ip
     ) or is_blocked_cloudflare_ip(node.host)
+    # A working Cloudflare IP from an inside-Iran verified feed (104.*/172.*)
+    # must never be overwritten blindly: replacement happens only for the
+    # carrier-blocked 188.114.96.0/20 range or when the caller supplies a pool.
     should_replace_cf_ip = (
-        is_blocked_cf
+        (is_blocked_cf or clean_ips is not None)
         and (node.network or "").lower() in SHAPE_CF_NETWORKS
         and bool(domain_sni)
     )
@@ -2975,6 +2983,105 @@ def write_all_outputs(
 
 
 # ---------------------------------------------------------------------------
+# Direct OpenRay inside-Iran pipeline (no US re-sorting, no /24 culling)
+# ---------------------------------------------------------------------------
+
+
+def is_openray_iran_feed(url: str) -> bool:
+    """True for OpenRay feeds that are verified from inside Iran."""
+    u = (url or "").strip().lower()
+    if "sakha1370/openray" not in u:
+        return False
+    return "output/country/" not in u
+
+
+def _is_demoted_raw_trojan(node: NodeInfo) -> bool:
+    """Trojan over raw TCP/TLS: ~95% of these failed in the carrier test."""
+    sec = (node.security or "").lower()
+    net = (node.network or "tcp").lower()
+    return node.protocol == "trojan" and sec != "reality" and net in ("tcp", "raw")
+
+
+def curate_openray_iran_links(
+    raw_links: Sequence[str], limit: int = 100
+) -> List[str]:
+    """Clean OpenRay's inside-Iran feed while preserving its exact order.
+
+    OpenRay already tests these links from inside Iran, so the only edits are
+    the ones Xray 26.9.9 forces: plaintext VLESS is removed, ``ech=`` /
+    ``allowInsecure=`` are stripped and ``fp=chrome`` is ensured. No latency
+    re-sorting and no /24 culling, because several working nodes legitimately
+    share one /24 (169.40.42.*, 51.158.206.*, 82.38.31.*).
+    """
+    primary: List[str] = []
+    demoted: List[str] = []
+    seen: Set[Tuple[str, int, str]] = set()
+
+    for idx, raw in enumerate(raw_links, start=1):
+        link = _clean_link(raw or "")
+        if not link:
+            continue
+        node = parse_node_info(link)
+        if node is None:
+            continue
+        if node.protocol == "vless" and not node.tls_enabled:
+            # Xray 26.9.9: "vless without TLS or other encryption is prohibited".
+            continue
+        key = (node.host.lower(), node.port, node.protocol)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        if node.protocol == "vmess":
+            # Strips ech/allowInsecure without touching the connect address.
+            cleaned = _shape_vmess_link(link, ensure_fp=bool(node.tls_enabled))
+        elif node.tls_enabled and node.protocol in ("vless", "trojan"):
+            cleaned = shape_node_for_iran(node, index=idx)
+        else:
+            cleaned = link
+
+        if _is_demoted_raw_trojan(node):
+            demoted.append(cleaned)
+        else:
+            primary.append(cleaned)
+
+    return (primary + demoted)[:limit]
+
+
+def write_openray_direct_outputs(direct_links: Sequence[str]) -> Dict[str, int]:
+    """Publish the curated OpenRay set as the primary subscription artifacts."""
+    links = [str(ln) for ln in direct_links if ln]
+    if not links:
+        return {}
+
+    _ensure_dirs()
+    _write_plain(SERVERS_FILE, links)
+    _write_b64(SUB_FILE, links)
+    _write_encrypted_sub("\n".join(links) + "\n")
+
+    # fm= mirror: vless/trojan carry FinalMask, ss/vmess ship untouched because
+    # they cannot represent it.
+    frag: List[str] = []
+    for ln in links:
+        low = ln.lower()
+        if low.startswith("vless://") or low.startswith("trojan://"):
+            security = "reality" if "security=reality" in low else "tls"
+            frag.append(inject_xray_finalmask_fm(ln, security))
+        else:
+            frag.append(ln)
+    _write_plain(os.path.join(OUTPUT_DIR, "servers_xray_frag.txt"), frag)
+    _write_b64(os.path.join(OUTPUT_DIR, "sub_xray_frag.txt"), frag)
+
+    operators_dir = os.path.join(OUTPUT_DIR, "operators")
+    os.makedirs(operators_dir, exist_ok=True)
+    for op in ("mci", "irancell"):
+        _write_plain(os.path.join(operators_dir, f"{op}.txt"), links)
+        _write_b64(os.path.join(operators_dir, f"{op}_base64.txt"), links)
+
+    return {"servers": len(links), "xray_frag": len(frag)}
+
+
+# ---------------------------------------------------------------------------
 # GitHub Actions annotations & step summary
 # ---------------------------------------------------------------------------
 
@@ -3095,12 +3202,15 @@ async def _main_impl() -> int:
     # --- Stage 1+2: extract links, parse, tag provenance, dedup (host,port)
     parsed: List[NodeInfo] = []
     by_key: Dict[Tuple[str, int], NodeInfo] = {}
+    openray_iran_links: List[str] = []
     total_extracted = 0
     for url, text in zip(urls, pages):
         if not text:
             continue
         iran_ok, tags = classify_source_url(url)
         links = extract_links(text)
+        if is_openray_iran_feed(url):
+            openray_iran_links.extend(links)
         total_extracted += len(links)
         print(f"[info] {url}: extracted {len(links)} link(s)")
         for link in links:
@@ -3109,6 +3219,8 @@ async def _main_impl() -> int:
                 continue
             node.iran_verified = iran_ok
             node.operator_tags = set(tags)
+            if is_openray_iran_feed(url):
+                node.source_index = len(openray_iran_links)
             existing = by_key.get(node.key)
             if existing is not None:
                 _merge_provenance(existing, node)
@@ -3207,6 +3319,25 @@ async def _main_impl() -> int:
         total_tested=len(candidates),
         total_passed=len(allowed),
     )
+
+    # --- Stage 8b: direct OpenRay inside-Iran subscription ----------------
+    # OpenRay already validated these links from inside Iran in feed order; the
+    # curated set replaces the US-ping-re-sorted main artifacts so the working
+    # nodes survive verbatim (minus plaintext VLESS and ech= material).
+    if openray_iran_links:
+        direct_links = curate_openray_iran_links(openray_iran_links, limit=100)
+        if len(direct_links) >= 20:
+            written = write_openray_direct_outputs(direct_links)
+            print(
+                "[info] OpenRay direct subscription: "
+                f"{written.get('servers', 0)} curated Iran-verified node(s) "
+                f"from {len(openray_iran_links)} raw link(s)"
+            )
+        else:
+            print(
+                "[info] OpenRay direct subscription skipped: only "
+                f"{len(direct_links)} curated node(s)"
+            )
 
     # --- Stage 11: GitHub Actions annotations + summary -------------------
     emit_annotations(report["countries"])

@@ -902,8 +902,8 @@ class TestSourcesFile(unittest.TestCase):
         self.assertEqual(
             urls[:6],
             [
-                base + "output/site_access/aistudio_iran_verified.txt",
                 base + "output_iran/iran_top100_checked.txt",
+                base + "output/site_access/aistudio_iran_verified.txt",
                 base + "output_iran/all_valid_proxies_for_iran.txt",
                 base + "output_iran/mci_top100.txt",
                 base + "output_iran/irancell_top100.txt",
@@ -3047,6 +3047,118 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ssl.SSLError):
             collector._enforce_min_tls_version(node, _FakeSslObject("TLSv1.2"))
         collector._enforce_min_tls_version(node, _FakeSslObject("TLSv1.3"))
+
+    def test_curate_openray_iran_links_drops_plaintext_vless_but_keeps_ss_vmess_and_reality_in_order(
+        self,
+    ):
+        plaintext_vless = (
+            "vless://uuid@1.2.3.4:80?security=none&type=ws#plain"
+        )
+        ss_link = "ss://aes-256-gcm:pw@82.38.31.5:8080#ss"
+        vmess_cfg = {
+            "add": "5.6.7.8",
+            "port": 1800,
+            "id": "uuid-v",
+            "aid": 0,
+            "scy": "auto",
+            "net": "tcp",
+        }
+        vmess_link = "vmess://" + base64.b64encode(
+            json.dumps(vmess_cfg).encode()
+        ).decode()
+        reality_link = (
+            "vless://uuid@169.40.42.74:443?security=reality&sni=www.apple.com"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#reality"
+        )
+
+        curated = collector.curate_openray_iran_links(
+            [plaintext_vless, ss_link, vmess_link, reality_link], limit=100
+        )
+
+        # Plaintext VLESS would make Xray 26.9.9 say "Failed to run".
+        self.assertEqual(len(curated), 3)
+        self.assertFalse(any("security=none" in ln for ln in curated))
+        # Everything else survives, in the exact OpenRay input order.
+        self.assertTrue(curated[0].startswith("ss://"))
+        self.assertTrue(curated[1].startswith("vmess://"))
+        self.assertIn("security=reality", curated[2])
+        self.assertIn("fp=chrome", curated[2])
+
+    def test_curate_openray_iran_links_preserves_multiple_nodes_in_same_24_subnet(
+        self,
+    ):
+        ips = [
+            "169.40.42.74",
+            "169.40.42.35",
+            "169.40.42.168",
+            "169.40.42.89",
+            "51.158.206.29",
+            "51.158.206.87",
+            "51.158.206.103",
+        ]
+        links = [
+            f"vless://uuid-{i}@{ip}:443?security=reality&sni=www.apple.com"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#n{i}"
+            for i, ip in enumerate(ips)
+        ]
+
+        curated = collector.curate_openray_iran_links(links)
+
+        self.assertEqual(len(curated), 7)
+        for ip in ips:
+            self.assertTrue(
+                any(f"@{ip}:" in ln for ln in curated), f"{ip} was culled"
+            )
+        # Feed order is preserved, not re-sorted.
+        self.assertIn(f"@{ips[0]}:", curated[0])
+
+    def test_curate_openray_iran_links_strips_ech_and_demotes_raw_tcp_trojan(
+        self,
+    ):
+        trojan_raw = (
+            "trojan://pw@66.163.112.9:443?security=tls&type=tcp"
+            "&sni=t.example#raw-trojan"
+        )
+        ss_link = "ss://aes-256-gcm:pw@82.38.31.5:8080#ss"
+        ech_link = (
+            "vless://uuid@169.40.42.74:443?security=reality&sni=www.apple.com"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp&ech=AABBCC#ech"
+        )
+
+        curated = collector.curate_openray_iran_links(
+            [trojan_raw, ss_link, ech_link]
+        )
+
+        self.assertEqual(len(curated), 3)
+        self.assertFalse(any("ech=" in ln for ln in curated))
+        # Raw-TCP Trojan is demoted behind the working transports.
+        self.assertTrue(curated[0].startswith("ss://"))
+        self.assertIn("security=reality", curated[1])
+        self.assertTrue(curated[2].startswith("trojan://"))
+        self.assertIn("#raw-trojan", curated[2])
+
+    def test_shape_node_for_iran_does_not_overwrite_normal_cf_ip_when_clean_ips_none(
+        self,
+    ):
+        working = collector.parse_node_info(
+            "vless://uuid@104.18.32.47:443?security=tls"
+            "&sni=sub.example.com&type=ws&path=/ws#cf"
+        )
+        self.assertIsNotNone(working)
+        working.resolved_ip = "104.18.32.47"
+        shaped = collector.shape_node_for_iran(working, 1)
+        self.assertIn("@104.18.32.47:443", shaped)
+        self.assertIn("fp=chrome", shaped)
+
+        blocked = collector.parse_node_info(
+            "vless://uuid@188.114.97.7:443?security=tls"
+            "&sni=sub.example.com&type=ws&path=/ws#old"
+        )
+        self.assertIsNotNone(blocked)
+        blocked.resolved_ip = "188.114.97.7"
+        replaced = collector.shape_node_for_iran(blocked, 1)
+        self.assertNotIn("188.114.97.7", replaced)
+        self.assertIn("@104.18.2.161:443", replaced)
 
     def test_merge_provenance_replaces_generic_link_with_iran_verified_link(
         self,
