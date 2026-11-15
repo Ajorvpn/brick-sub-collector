@@ -121,7 +121,8 @@ OPENRAY_CHECK_COUNTS_URLS: Tuple[str, ...] = (
 )
 OPENRAY_TELEMETRY_TIMEOUT = 5.0
 
-MAIN_QUOTA_PER_COUNTRY = 5
+MAIN_QUOTA_PER_COUNTRY = 10
+TOTAL_MAIN_QUOTA = 50
 COUNTRY_FILE_QUOTA = 20
 # Per-operator subscription size (output/operators/{op}.txt).
 OPERATOR_QUOTA = 30
@@ -185,6 +186,10 @@ DECOY_ONLY_HOSTS: Set[str] = {
     "herokuapp.com", "seenode.app", "run-on-seenode.com",
     # PaaS hosting domains seen in carrier logs as "malformed ECHConfigList".
     "render.com", "onrender.com", "bluehost.com",
+    # Expired / name-mismatched certificates observed on 2026-11-16:
+    # ``current time 2026-11-16 is after 2026-07-12T23:59:59Z`` and
+    # ``certificate is not valid for any names, wanted to match yichueng.org``.
+    "09vpn.com", "yichueng.org",
 }
 
 # Non-TLS transports/protocols that must answer the HTTP payload probe.
@@ -197,17 +202,15 @@ PROXY_LINK_RE = re.compile(
 
 PURE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
+# Five powerhouse countries only: they held 93% of every passing node in the
+# 682-709 node runs, while AT/CH/FI/SE/CA rarely filled even five slots.
+# 5 countries x 10 nodes = TOTAL_MAIN_QUOTA slots, unchanged at 50.
 ALLOWED_COUNTRIES: Dict[str, Tuple[str, str]] = {
     "DE": ("\U0001F1E9\U0001F1EA", "Germany"),
-    "FI": ("\U0001F1EB\U0001F1EE", "Finland"),
-    "NL": ("\U0001F1F3\U0001F1F1", "Netherlands"),
-    "GB": ("\U0001F1EC\U0001F1E7", "United Kingdom"),
     "FR": ("\U0001F1EB\U0001F1F7", "France"),
+    "GB": ("\U0001F1EC\U0001F1E7", "United Kingdom"),
+    "NL": ("\U0001F1F3\U0001F1F1", "Netherlands"),
     "US": ("\U0001F1FA\U0001F1F8", "United States"),
-    "CH": ("\U0001F1E8\U0001F1ED", "Switzerland"),
-    "SE": ("\U0001F1F8\U0001F1EA", "Sweden"),
-    "AT": ("\U0001F1E6\U0001F1F9", "Austria"),
-    "CA": ("\U0001F1E8\U0001F1E6", "Canada"),
 }
 
 
@@ -419,6 +422,20 @@ def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
 
 def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
     """Merge source provenance from a duplicate endpoint into *target*."""
+    # An Iran-verified feed must win over a generic scraper: the generic link
+    # is often stale (dead SNI, wrong transport), so its transport parameters
+    # are replaced by the verified variant instead of merely keeping the flag.
+    if other.iran_verified and not target.iran_verified:
+        target.original_link = other.original_link
+        target.raw_link = other.raw_link
+        target.protocol = other.protocol
+        target.network = other.network
+        target.tls_enabled = other.tls_enabled
+        target.security = other.security
+        if other.sni:
+            target.sni = other.sni
+        if other.path:
+            target.path = other.path
     target.iran_verified = target.iran_verified or other.iran_verified
     target.operator_tags.update(other.operator_tags)
     target.xray_verified = target.xray_verified or other.xray_verified
@@ -1048,23 +1065,54 @@ def _create_probe_ssl_context() -> ssl.SSLContext:
     return ctx
 
 
+def _create_strict_tls_context() -> ssl.SSLContext:
+    """Verifying context built ONCE at import time for standard TLS nodes.
+
+    ``ssl.create_default_context()`` reloads the system CA bundle from disk on
+    every call; building it at import keeps probing free of disk I/O while
+    still rejecting expired certificates and hostname mismatches.
+    """
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = True
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    return ctx
+
+
 # Built exactly once at import time. ``ssl.create_default_context()`` reloads
 # /etc/ssl/certs/ca-certificates.crt from disk on every call; doing that ~6,000
 # times on the event loop added +400ms per probe and dropped 96% of nodes for
 # exceeding MAX_LATENCY_MS.
 _PROBE_SSL_CTX: ssl.SSLContext = _create_probe_ssl_context()
+_STRICT_TLS_CTX: ssl.SSLContext = _create_strict_tls_context()
 
 
 def _build_tls_context(node: Optional[NodeInfo] = None) -> ssl.SSLContext:
-    """O(1) TLS context shared by every probe connection.
+    """Return the cached O(1) context for *node* (no per-connection I/O).
 
-    Proxy endpoints legitimately serve camouflage SNIs, Cloudflare edge IPs and
-    REALITY ephemeral certificates, so CA/hostname verification in this probe
-    drops working nodes (the Part 3 regression). Certificate validity belongs to
-    the client (or to REALITY's ``pbk``), and TLS nodes with no domain SNI are
-    excluded up front by :func:`is_main_pool_eligible`.
+    REALITY endpoints, IP-literal/loopback sockets and nodes without a usable
+    SNI get ``_PROBE_SSL_CTX`` (``CERT_NONE``): REALITY serves an ephemeral
+    certificate for its camouflage name, and a non-REALITY client is simply
+    forwarded to the fallback ``dest``.
+
+    Standard ``security == "tls"`` nodes with a domain SNI get the cached
+    ``_STRICT_TLS_CTX`` (``CERT_REQUIRED`` + hostname check), so expired
+    certificates (``09vpn.com``) and name mismatches (``yichueng.org``) are
+    dropped during probing instead of shipping broken nodes.
     """
-    return _PROBE_SSL_CTX
+    if node is None:
+        return _PROBE_SSL_CTX
+    sec = (getattr(node, "security", "") or "").lower()
+    host = (getattr(node, "host", "") or "").strip().lower()
+    sni_target = (getattr(node, "sni", None) or host or "").strip()
+    if (
+        sec == "reality"
+        or "security=reality" in (getattr(node, "raw_link", "") or "").lower()
+        or not sni_target
+        or _is_ip_literal(sni_target)
+        or host in ("127.0.0.1", "localhost", "::1")
+    ):
+        return _PROBE_SSL_CTX
+    return _STRICT_TLS_CTX
 
 
 def _enforce_min_tls_version(node: NodeInfo, ssl_object: Any) -> None:
@@ -1495,7 +1543,9 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
     across transport buckets so one transport never owns every slot.
 
     Nodes are ranked before deduplication, so when one IP carries several
-    transports the best-ranked one is the one that survives.
+    transports the best-ranked one is the one that survives. Iran-verified and
+    tunnel-verified nodes form a privileged tier: generic foreign gRPC or
+    odd-port VMess nodes may only backfill the slots they leave empty.
     """
     if quota <= 0:
         return []
@@ -1503,35 +1553,22 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
     if len(ordered) <= quota:
         return ordered
 
-    buckets: Dict[str, List[NodeInfo]] = {}
-    for n in ordered:
-        buckets.setdefault(_transport_bucket(n), []).append(n)
-    for pool in buckets.values():
-        pool.sort(key=_effective_sort_key)
+    def is_verified(node: NodeInfo) -> bool:
+        return bool(node.iran_verified or getattr(node, "xray_verified", False))
 
-    # REALITY is the transport that actually works inside Iran (15 of 18 live
-    # nodes in the carrier test), so it gets up to three of the five slots
-    # before a dead ``tcp-tls`` Trojan is allowed in at all.
-    bucket_order = [
-        "reality", "ws-tls", "reality", "grpc-tls", "reality", "h2-tls",
-        "tcp-tls",
-    ]
+    verified_tier = [n for n in ordered if is_verified(n)]
+    unverified_tier = [n for n in ordered if not is_verified(n)]
+
     selected: List[NodeInfo] = []
     seen_subnets: Set[str] = set()
-    made_progress = True
-    while len(selected) < quota and made_progress:
-        made_progress = False
-        for b in bucket_order:
-            pool = buckets.get(b, [])
-            for idx, cand in enumerate(pool):
-                s24 = subnet24_key(cand.pure_ip)
-                if s24 not in seen_subnets:
-                    selected.append(pool.pop(idx))
-                    seen_subnets.add(s24)
-                    made_progress = True
-                    break
-            if len(selected) >= quota:
-                break
+    if verified_tier and unverified_tier:
+        _pick_diverse_tier(verified_tier, quota, selected, seen_subnets)
+        if len(selected) < quota:
+            _pick_diverse_tier(
+                unverified_tier, quota - len(selected), selected, seen_subnets
+            )
+    else:
+        _pick_diverse_tier(ordered, quota, selected, seen_subnets)
 
     if len(selected) < quota:
         selected_ids = {id(n) for n in selected}
@@ -1541,6 +1578,45 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
                 if len(selected) >= quota:
                     break
     return selected
+
+
+def _pick_diverse_tier(
+    pool: List[NodeInfo],
+    limit: int,
+    selected: List[NodeInfo],
+    seen_subnets: Set[str],
+) -> None:
+    """Append up to *limit* nodes: distinct ``/24`` subnets, round-robin buckets."""
+    if limit <= 0:
+        return
+    target = len(selected) + limit
+    buckets: Dict[str, List[NodeInfo]] = {}
+    for n in pool:
+        buckets.setdefault(_transport_bucket(n), []).append(n)
+    for bucket_nodes in buckets.values():
+        bucket_nodes.sort(key=_effective_sort_key)
+
+    # REALITY is the transport that actually works inside Iran (15 of 18 live
+    # nodes in the carrier test), so it gets up to three of the five slots
+    # before a dead ``tcp-tls`` Trojan is allowed in at all.
+    bucket_order = [
+        "reality", "ws-tls", "reality", "grpc-tls", "reality", "h2-tls",
+        "tcp-tls",
+    ]
+    made_progress = True
+    while len(selected) < target and made_progress:
+        made_progress = False
+        for b in bucket_order:
+            candidates = buckets.get(b, [])
+            for idx, cand in enumerate(candidates):
+                s24 = subnet24_key(cand.pure_ip)
+                if s24 not in seen_subnets:
+                    selected.append(candidates.pop(idx))
+                    seen_subnets.add(s24)
+                    made_progress = True
+                    break
+            if len(selected) >= target:
+                break
 
 
 
@@ -2912,12 +2988,13 @@ def emit_annotations(country_report: Dict[str, Any]) -> None:
         if count == 0:
             print(
                 f"::error title=🚨 Country Empty ({code})::"
-                f"{name} ({code}) has 0/5 working servers!"
+                f"{name} ({code}) has 0/{MAIN_QUOTA_PER_COUNTRY} working servers!"
             )
         elif count < MAIN_QUOTA_PER_COUNTRY:
             print(
                 f"::warning title=⚠️ Country Low ({code})::"
-                f"{name} ({code}) only has {count}/5 working servers."
+                f"{name} ({code}) only has {count}/{MAIN_QUOTA_PER_COUNTRY} "
+                "working servers."
             )
 
 

@@ -155,10 +155,10 @@ class TestRenameNode(unittest.TestCase):
     def test_ss_rename(self):
         link = "ss://aes-256-gcm:pw@4.4.4.4:8388#old"
         node = collector.parse_node_info(link)
-        node.country_code = "CA"
+        node.country_code = "GB"
         node.avg_latency_ms = 10
-        result = collector.rename_node(node, "CA", 1)
-        self.assertIn("🇨🇦 Canada 01 | SS | ⚡ 10ms | BrickVPN", result)
+        result = collector.rename_node(node, "GB", 1)
+        self.assertIn("🇬🇧 United Kingdom 01 | SS | ⚡ 10ms | BrickVPN", result)
 
 
 
@@ -317,7 +317,7 @@ class TestBatchGeoIPFiltering(unittest.TestCase):
         self.assertEqual(allowed[0].country_code, "DE")
 
     def test_allowed_countries_exact(self):
-        expected = {"DE", "FI", "NL", "GB", "FR", "US", "CH", "SE", "AT", "CA"}
+        expected = {"DE", "FR", "GB", "NL", "US"}
         self.assertEqual(set(collector.ALLOWED_COUNTRIES.keys()), expected)
         blocked = {"IR", "CN", "RU"}
         self.assertTrue(blocked.isdisjoint(set(collector.ALLOWED_COUNTRIES.keys())))
@@ -326,7 +326,7 @@ class TestBatchGeoIPFiltering(unittest.TestCase):
 class TestQuotaEnforcement(unittest.TestCase):
     def test_main_quota_max_5_per_country(self):
         de_nodes = []
-        for i in range(7):
+        for i in range(15):
             n = collector.NodeInfo(
                 protocol="vless", host=f"1.1.1.{i}", port=443,
                 tls_enabled=False, network="tcp",
@@ -338,7 +338,8 @@ class TestQuotaEnforcement(unittest.TestCase):
         main_links = []
         for n in de_nodes[:collector.MAIN_QUOTA_PER_COUNTRY]:
             main_links.append("link")
-        self.assertEqual(len(main_links), 5)
+        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 10)
+        self.assertEqual(len(main_links), 10)
 
     def test_empty_country_no_padding(self):
         by_country = {"DE": [], "FR": [], "NL": []}
@@ -350,9 +351,74 @@ class TestQuotaEnforcement(unittest.TestCase):
         self.assertEqual(len(main_links), 0)
 
     def test_total_max_50(self):
+        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 50)
         self.assertEqual(
             collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 50
         )
+
+    def test_five_countries_with_twelve_nodes_emit_exactly_fifty(self):
+        tmp = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(tmp, "servers.txt")
+            ),
+            mock.patch.object(collector, "SUB_FILE", os.path.join(tmp, "sub.txt")),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(tmp, "status.json")
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+        try:
+            by_country = {}
+            all_nodes = []
+            for idx, code in enumerate(sorted(collector.ALLOWED_COUNTRIES)):
+                nodes = []
+                for i in range(12):
+                    host = f"10.{idx}.{i}.1"
+                    node = collector.NodeInfo(
+                        protocol="vless",
+                        host=host,
+                        port=443,
+                        tls_enabled=True,
+                        sni="edge.example",
+                        network="ws",
+                        security="tls",
+                        original_link=(
+                            f"vless://uuid@{host}:443?security=tls"
+                            "&sni=edge.example&type=ws#node"
+                        ),
+                        raw_link=(
+                            f"vless://uuid@{host}:443?security=tls"
+                            "&sni=edge.example&type=ws#node"
+                        ),
+                        resolved_ip=host,
+                        country_code=code,
+                        quality_score=10.0 + i,
+                        avg_latency_ms=10 + i,
+                    )
+                    nodes.append(node)
+                    all_nodes.append(node)
+                by_country[code] = nodes
+
+            report = collector.write_all_outputs(
+                by_country, {"vless": all_nodes}, 60, 60
+            )
+            with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 50)
+            self.assertEqual(report["main_sub_count"], 50)
+        finally:
+            for patch in patches:
+                patch.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestExtractLinks(unittest.TestCase):
@@ -594,7 +660,7 @@ class TestGeoIPMmdbAndFallback(unittest.IsolatedAsyncioTestCase):
 
         async def fake_batch(session, ips):
             seen["ips"] = list(ips)
-            return {ip: "CA" for ip in ips}
+            return {ip: "DE" for ip in ips}
 
         collector.reset_mmdb_state()
         with mock.patch.object(
@@ -604,7 +670,7 @@ class TestGeoIPMmdbAndFallback(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(seen["ips"], ["1.1.1.1", "2.2.2.2"])
         self.assertEqual(len(allowed), 2)
-        self.assertTrue(all(n.country_code == "CA" for n in allowed))
+        self.assertTrue(all(n.country_code == "DE" for n in allowed))
 
     async def test_api_fallback_limit_caps_batches(self):
         nodes = [_geoip_node(f"10.0.0.{i}", 443) for i in range(1, 6)]
@@ -812,12 +878,12 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSourcesFile(unittest.TestCase):
-    """D4: sources.txt must hold exactly sixteen live subscription mirrors."""
+    """D4: sources.txt holds twelve mirrors, the six Iran feeds first."""
 
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 16)
+        self.assertEqual(len(urls), 12)
         for dead in (
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
             "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/"
@@ -828,6 +894,29 @@ class TestSourcesFile(unittest.TestCase):
             "telegram-configs-collector/main/channels/configs",
         ):
             self.assertNotIn(dead, urls)
+
+    def test_iran_verified_feeds_occupy_the_first_six_lines(self):
+        with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        base = "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/"
+        self.assertEqual(
+            urls[:6],
+            [
+                base + "output/site_access/aistudio_iran_verified.txt",
+                base + "output_iran/iran_top100_checked.txt",
+                base + "output_iran/all_valid_proxies_for_iran.txt",
+                base + "output_iran/mci_top100.txt",
+                base + "output_iran/irancell_top100.txt",
+                base + "output_iran/tci_top100.txt",
+            ],
+        )
+        for url in urls[:6]:
+            iran_ok, _tags = collector.classify_source_url(url)
+            self.assertTrue(iran_ok, url)
+        # The two inside-Iran verified feeds cover MCI and Irancell.
+        for url in urls[:2]:
+            _iran_ok, tags = collector.classify_source_url(url)
+            self.assertEqual(tags, {"mci", "irancell"}, url)
 
     def test_keeps_working_high_yield_mirrors(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -841,28 +930,21 @@ class TestSourcesFile(unittest.TestCase):
             "main/output_iran/tci_top100.txt",
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output_iran/iran_top100_checked.txt",
-            "https://raw.githubusercontent.com/MohammadBahemmat/"
-            "V2ray-Collector/main/all_servers.txt",
             "https://raw.githubusercontent.com/mahdibland/"
             "V2RayAggregator/master/sub/sub_merge.txt",
-            "https://raw.githubusercontent.com/Danialsamadi/v2go/main/Sub1.txt",
-            "https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/"
-            "main/config/all_configs.txt",
-            "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
-            "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/"
-            "subscribe/v2ray.txt",
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output/site_access/aistudio_iran_verified.txt",
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output_iran/all_valid_proxies_for_iran.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output/country/AT.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output/country/CH.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output/country/FI.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output/country/SE.txt",
+            "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/"
+            "All_Configs_Sub.txt",
+            "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/"
+            "All_Configs_Sub.txt",
+            "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/"
+            "main/subscriptions/v2ray/all_sub.txt",
+            "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/"
+            "master/Eternity.txt",
+            "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Sub1.txt",
         ):
             self.assertIn(live, urls)
 
@@ -1098,9 +1180,9 @@ class TestSequentialNumbering(unittest.TestCase):
         return nodes
 
     def test_numbering_restarts_per_output_list(self):
-        nodes = self._build_nodes(7)
+        nodes = self._build_nodes(12)
         report = collector.write_all_outputs(
-            {"DE": nodes}, {}, total_tested=12, total_passed=7
+            {"DE": nodes}, {}, total_tested=20, total_passed=12
         )
 
         with open(collector.SERVERS_FILE, encoding="utf-8") as f:
@@ -1111,13 +1193,13 @@ class TestSequentialNumbering(unittest.TestCase):
 
         with open(os.path.join(collector.COUNTRIES_DIR, "DE.txt"), encoding="utf-8") as f:
             country_lines = f.read().splitlines()
-        self.assertEqual(len(country_lines), 7)
+        self.assertEqual(len(country_lines), 12)
         for idx, line in enumerate(country_lines, start=1):
             self.assertIn(f"Germany {idx:02d} |", line)
 
         self.assertEqual(report["main_sub_count"], collector.MAIN_QUOTA_PER_COUNTRY)
-        self.assertEqual(report["total_tested"], 12)
-        self.assertEqual(report["total_passed"], 7)
+        self.assertEqual(report["total_tested"], 20)
+        self.assertEqual(report["total_passed"], 12)
         self.assertGreater(report["total_tested"], report["total_passed"])
 
     def test_status_json_records_probed_candidates(self):
@@ -2003,13 +2085,13 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(collector.is_valid_reality_pbk(REALITY_PBK + "="))
         self.assertFalse(collector.is_valid_reality_pbk("shortkey"))
 
-    def test_build_tls_context_uses_cert_none_for_all_probe_connections(self):
-        camouflage = collector.NodeInfo(
+    def test_build_tls_context_caches_strict_and_probe_singletons(self):
+        standard_tls = collector.NodeInfo(
             protocol="vless",
             host="80.47.228.99",
             port=443,
             tls_enabled=True,
-            sni="5674-4.seenode.app",
+            sni="a.example",
             security="tls",
         )
         reality = collector.NodeInfo(
@@ -2020,18 +2102,36 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             sni="www.apple.com",
             security="reality",
         )
-        raw_ip = collector.NodeInfo(
+        ip_sni = collector.NodeInfo(
             protocol="trojan",
             host="199.247.23.31",
             port=443,
             tls_enabled=True,
-            sni=None,
+            sni="199.247.23.31",
             security="tls",
         )
-        for node in (camouflage, reality, raw_ip):
+        loopback = collector.NodeInfo(
+            protocol="vless",
+            host="127.0.0.1",
+            port=443,
+            tls_enabled=True,
+            sni="localhost",
+            security="tls",
+        )
+
+        strict_ctx = collector._build_tls_context(standard_tls)
+        self.assertIs(strict_ctx, collector._STRICT_TLS_CTX)
+        self.assertEqual(strict_ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(strict_ctx.check_hostname)
+        self.assertIs(collector._build_tls_context(standard_tls), strict_ctx)
+
+        for node in (reality, ip_sni, loopback):
             ctx = collector._build_tls_context(node)
+            self.assertIs(ctx, collector._PROBE_SSL_CTX, node.host)
             self.assertEqual(ctx.verify_mode, ssl.CERT_NONE)
             self.assertFalse(ctx.check_hostname)
+        self.assertIs(collector._build_tls_context(None), collector._PROBE_SSL_CTX)
+        self.assertIsNot(collector._PROBE_SSL_CTX, collector._STRICT_TLS_CTX)
 
     async def test_reality_tls12_server_dropped_in_probe(self):
         node = collector.NodeInfo(
@@ -2780,12 +2880,19 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         )
         ctx1 = collector._build_tls_context(n1)
         ctx2 = collector._build_tls_context(n2)
-        self.assertIs(ctx1, ctx2)
-        self.assertIs(ctx1, collector._PROBE_SSL_CTX)
-        # Called with no node at all, the same singleton comes back.
+        # A domain SNI on standard TLS uses the strict singleton; REALITY uses
+        # the no-verify probe singleton. Both are cached, so repeated calls
+        # return the very same objects without touching the CA bundle again.
+        self.assertIs(ctx1, collector._STRICT_TLS_CTX)
+        self.assertIs(collector._build_tls_context(n1), ctx1)
+        self.assertIs(ctx2, collector._PROBE_SSL_CTX)
+        self.assertIs(collector._build_tls_context(n2), ctx2)
+        # Called with no node at all, the probe singleton comes back.
         self.assertIs(collector._build_tls_context(), collector._PROBE_SSL_CTX)
-        self.assertEqual(ctx1.verify_mode, ssl.CERT_NONE)
-        self.assertFalse(ctx1.check_hostname)
+        self.assertEqual(ctx1.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(ctx1.check_hostname)
+        self.assertEqual(ctx2.verify_mode, ssl.CERT_NONE)
+        self.assertFalse(ctx2.check_hostname)
 
     def test_render_and_bluehost_rejected_as_decoy_connect_hosts(self):
         for host in ("render.com", "app.onrender.com", "bluehost.com"):
@@ -2940,6 +3047,100 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ssl.SSLError):
             collector._enforce_min_tls_version(node, _FakeSslObject("TLSv1.2"))
         collector._enforce_min_tls_version(node, _FakeSslObject("TLSv1.3"))
+
+    def test_merge_provenance_replaces_generic_link_with_iran_verified_link(
+        self,
+    ):
+        existing = collector.NodeInfo(
+            protocol="vmess",
+            host="1.2.3.4",
+            port=443,
+            tls_enabled=True,
+            network="tcp",
+            security="tls",
+            sni="stale.example",
+            original_link="vmess://stale",
+            raw_link="vmess://stale",
+        )
+        incoming = collector.NodeInfo(
+            protocol="vless",
+            host="1.2.3.4",
+            port=443,
+            tls_enabled=True,
+            network="ws",
+            security="tls",
+            sni="fresh.example",
+            path="/ws",
+            original_link="vless://fresh",
+            raw_link="vless://fresh",
+            iran_verified=True,
+            operator_tags={"mci"},
+        )
+
+        collector._merge_provenance(existing, incoming)
+
+        self.assertEqual(existing.original_link, "vless://fresh")
+        self.assertEqual(existing.raw_link, "vless://fresh")
+        self.assertEqual(existing.protocol, "vless")
+        self.assertEqual(existing.network, "ws")
+        self.assertEqual(existing.sni, "fresh.example")
+        self.assertEqual(existing.path, "/ws")
+        self.assertTrue(existing.iran_verified)
+        self.assertIn("mci", existing.operator_tags)
+
+        # An already verified target keeps its own (equally trusted) link.
+        keeper = collector.NodeInfo(
+            protocol="vless",
+            original_link="vless://keep",
+            raw_link="vless://keep",
+            iran_verified=True,
+        )
+        collector._merge_provenance(keeper, incoming)
+        self.assertEqual(keeper.original_link, "vless://keep")
+
+    def test_select_diverse_top_nodes_picks_all_iran_verified_nodes_before_unverified_buckets(
+        self,
+    ):
+        verified = []
+        for i in range(5):
+            node = self._node(
+                f"vless://uuid-{i}@20.{i}.0.1:443?security=tls"
+                "&sni=a.example&type=ws#verified",
+                country="DE",
+                quality=100.0,
+            )
+            node.iran_verified = True
+            verified.append(node)
+
+        grpc = self._node(
+            "vless://uuid-g@30.0.0.1:443?security=tls&sni=g.example&type=grpc#g",
+            country="DE",
+            quality=1.0,
+        )
+        vmess_cfg = {
+            "add": "31.0.0.1",
+            "port": 1270,
+            "id": "uuid-m",
+            "net": "tcp",
+            "tls": "tls",
+            "sni": "m.example",
+        }
+        vmess = self._node(
+            "vmess://"
+            + base64.b64encode(json.dumps(vmess_cfg).encode()).decode(),
+            country="DE",
+            quality=2.0,
+        )
+        self.assertFalse(grpc.iran_verified)
+        self.assertFalse(vmess.iran_verified)
+
+        picked = collector.select_diverse_top_nodes(verified + [grpc, vmess], 5)
+
+        self.assertEqual(len(picked), 5)
+        for node in verified:
+            self.assertIn(node, picked)
+        self.assertNotIn(grpc, picked)
+        self.assertNotIn(vmess, picked)
 
     def test_compute_streak_bonus_ms_and_effective_sort_key_priority(self):
         node = collector.NodeInfo(protocol="vless", quality_score=100.0)
