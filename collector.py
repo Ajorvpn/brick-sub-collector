@@ -121,8 +121,8 @@ OPENRAY_CHECK_COUNTS_URLS: Tuple[str, ...] = (
 )
 OPENRAY_TELEMETRY_TIMEOUT = 5.0
 
-MAIN_QUOTA_PER_COUNTRY = 10
-TOTAL_MAIN_QUOTA = 50
+MAIN_QUOTA_PER_COUNTRY = 7
+TOTAL_MAIN_QUOTA = 21
 COUNTRY_FILE_QUOTA = 20
 # Per-operator subscription size (output/operators/{op}.txt).
 OPERATOR_QUOTA = 30
@@ -146,6 +146,9 @@ UNSUPPORTED_TRANSPORTS: Set[str] = {"xhttp", "splithttp", "kcp", "mkcp", "quic"}
 # Ports a TLS proxy endpoint is realistically served on (ranking preference).
 PREFERRED_TLS_PORTS: Set[int] = {443, 8443, 2053, 2083, 2087, 2096}
 IRAN_VERIFIED_BONUS_MS: float = -150.0
+# OpenRay's elite feeds are individually checked from inside Iran, in their own
+# (carrier-verified) order; they must always outrank scraped or US-pinged nodes.
+TOP_IRAN_TIER_BONUS_MS: float = -500.0
 PREFERRED_PORT_BONUS_MS: float = -35.0
 
 # uTLS fingerprints that send the post-quantum X25519MLKEM768 key share, which
@@ -202,13 +205,11 @@ PROXY_LINK_RE = re.compile(
 
 PURE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
-# Five powerhouse countries only: they held 93% of every passing node in the
-# 682-709 node runs, while AT/CH/FI/SE/CA rarely filled even five slots.
-# 5 countries x 10 nodes = TOTAL_MAIN_QUOTA slots, unchanged at 50.
+# Three powerhouse countries only: the 2026-11-16 v2rayN run kept DE, NL and
+# US nodes green, while FR/GB scarceley filled a single slot.
+# 3 countries x 7 nodes = TOTAL_MAIN_QUOTA slots.
 ALLOWED_COUNTRIES: Dict[str, Tuple[str, str]] = {
     "DE": ("\U0001F1E9\U0001F1EA", "Germany"),
-    "FR": ("\U0001F1EB\U0001F1F7", "France"),
-    "GB": ("\U0001F1EC\U0001F1E7", "United Kingdom"),
     "NL": ("\U0001F1F3\U0001F1F1", "Netherlands"),
     "US": ("\U0001F1FA\U0001F1F8", "United States"),
 }
@@ -237,6 +238,10 @@ class NodeInfo:
     # Position at which the node first appeared in an OpenRay Iran feed, so the
     # upstream (inside-Iran) ordering can be preserved end to end.
     source_index: int = 0
+    # True for OpenRay's elite inside-Iran feeds (iran_top100_checked,
+    # aistudio_iran_verified); openray_rank keeps their upstream order.
+    top_iran_tier: bool = False
+    openray_rank: int = 0
 
     resolved_ip: Optional[str] = None
     country_code: Optional[str] = None
@@ -423,12 +428,58 @@ def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
     return iran_ok, tags
 
 
+TOP_IRAN_TIER_MARKERS: Tuple[str, ...] = (
+    "iran_top100_checked",
+    "aistudio_iran_verified",
+)
+
+
+def is_top_iran_tier_url(url: str) -> bool:
+    """True for OpenRay's elite, individually checked inside-Iran feeds."""
+    u = (url or "").strip().lower()
+    return "sakha1370/openray" in u and any(
+        marker in u for marker in TOP_IRAN_TIER_MARKERS
+    )
+
+
+# OpenRay remarks embed the country, e.g. ``[OpenRay] \U0001F1FA\U0001F1F8 US-2473``.
+_OPENRAY_COUNTRY_RE = re.compile(r"(?:^|[^A-Za-z])(DE|NL|US)-[0-9]+", re.IGNORECASE)
+_COUNTRY_FLAG_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("\U0001F1E9\U0001F1EA", "DE"),
+    ("\U0001F1F3\U0001F1F1", "NL"),
+    ("\U0001F1FA\U0001F1F8", "US"),
+)
+
+
+def extract_country_hint_from_link(link: str) -> str:
+    """Return the country ISO code embedded in an OpenRay remark, else ``""``.
+
+    ``#[OpenRay] \U0001F1FA\U0001F1F8 US-2473`` -> ``US``; a missing MMDB entry must never
+    cost us a node the upstream feed already labelled.
+    """
+    text = (link or "").strip()
+    if not text:
+        return ""
+    fragment = text.split("#", 1)[1] if "#" in text else text
+    fragment = unquote(fragment)
+    for flag, code in _COUNTRY_FLAG_HINTS:
+        if flag in fragment:
+            return code
+    match = _OPENRAY_COUNTRY_RE.search(fragment)
+    return match.group(1).upper() if match else ""
+
+
 def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
     """Merge source provenance from a duplicate endpoint into *target*."""
-    # An Iran-verified feed must win over a generic scraper: the generic link
-    # is often stale (dead SNI, wrong transport), so its transport parameters
-    # are replaced by the verified variant instead of merely keeping the flag.
-    if other.iran_verified and not target.iran_verified:
+    # An Iran-verified (or elite top-tier) feed must win over a generic
+    # scraper: the generic link is often stale (dead SNI, wrong transport), so
+    # its transport parameters are replaced by the verified variant instead of
+    # merely keeping the flag.
+    other_top = bool(getattr(other, "top_iran_tier", False))
+    target_top = bool(getattr(target, "top_iran_tier", False))
+    if (other_top and not target_top) or (
+        other.iran_verified and not target.iran_verified
+    ):
         target.original_link = other.original_link
         target.raw_link = other.raw_link
         target.protocol = other.protocol
@@ -440,6 +491,13 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
         if other.path:
             target.path = other.path
     target.iran_verified = target.iran_verified or other.iran_verified
+    target.top_iran_tier = target_top or other_top
+    other_rank = int(getattr(other, "openray_rank", 0) or 0)
+    if other_rank > 0:
+        target_rank = int(getattr(target, "openray_rank", 0) or 0)
+        target.openray_rank = (
+            other_rank if target_rank <= 0 else min(target_rank, other_rank)
+        )
     target.operator_tags.update(other.operator_tags)
     target.xray_verified = target.xray_verified or other.xray_verified
     target.global_streak = max(target.global_streak, other.global_streak)
@@ -454,15 +512,30 @@ def is_main_pool_eligible(node: NodeInfo) -> bool:
     authority``) and has no camouflage name, so it is excluded here wherever it
     came from.
     """
-    sni = (node.sni or "").strip()
-    return (
-        node.tls_enabled
-        and node.protocol in ("vless", "trojan", "vmess")
-        and node.port not in PLAINTEXT_AND_ABUSED_PORTS
-        and not _is_decoy_connect_host(node.host)
-        and bool(sni)
-        and not _is_ip_literal(sni)
+    # Plaintext VLESS makes Xray 26.9.9 exit before it starts a single tunnel.
+    if node.protocol == "vless" and not node.tls_enabled:
+        return False
+    if _is_decoy_connect_host(node.host):
+        return False
+    if not _port_allowed(node.port):
+        return False
+
+    verified = bool(
+        getattr(node, "iran_verified", False)
+        or getattr(node, "top_iran_tier", False)
     )
+    if not node.tls_enabled:
+        # Shadowsocks and AEAD VMess are natively supported by Xray/sing-box and
+        # are 30+ of the fastest inside-Iran rows; an inside-Iran feed must have
+        # vouched for them, because generic plaintext collectors ship junk.
+        return verified and node.protocol in ("ss", "vmess")
+
+    if node.protocol not in ("vless", "trojan", "vmess"):
+        return False
+    if node.port in PLAINTEXT_AND_ABUSED_PORTS:
+        return False
+    sni = (node.sni or "").strip()
+    return bool(sni) and not _is_ip_literal(sni)
 
 
 # ---------------------------------------------------------------------------
@@ -957,6 +1030,16 @@ async def filter_by_geoip(
     allowed: List[NodeInfo] = []
     for n in unique:
         cc = ip_to_country.get(n.pure_ip)
+        if (not cc or cc == "XX") and (
+            getattr(n, "top_iran_tier", False) or n.iran_verified
+        ):
+            # A missing MMDB entry must never discard a node the inside-Iran
+            # feed already labelled (``[OpenRay] \U0001F1FA\U0001F1F8 US-2473``).
+            hint = extract_country_hint_from_link(
+                n.original_link or n.raw_link
+            )
+            if hint:
+                cc = hint
         n.country_code = cc
         if cc in ALLOWED_COUNTRIES:
             n.country_name = ALLOWED_COUNTRIES[cc][1]
@@ -1105,6 +1188,13 @@ def _build_tls_context(node: Optional[NodeInfo] = None) -> ssl.SSLContext:
     dropped during probing instead of shipping broken nodes.
     """
     if node is None:
+        return _PROBE_SSL_CTX
+    if getattr(node, "top_iran_tier", False) or getattr(
+        node, "iran_verified", False
+    ):
+        # OpenRay tested these from inside Iran. Their camouflage SNI is often
+        # a CDN/website name that can never match the connect address, so strict
+        # certificate/hostname checks would drop working nodes during probing.
         return _PROBE_SSL_CTX
     sec = (getattr(node, "security", "") or "").lower()
     host = (getattr(node, "host", "") or "").strip().lower()
@@ -1515,6 +1605,12 @@ def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
         else 0.0
     )
     streak_bonus = compute_streak_bonus_ms(node)
+    # Elite OpenRay feeds first, in their own upstream order.
+    top_bonus = (
+        TOP_IRAN_TIER_BONUS_MS if getattr(node, "top_iran_tier", False) else 0.0
+    )
+    rank = int(getattr(node, "openray_rank", 0) or 0)
+    rank_tiebreak = min(rank, 500) * 0.1 if rank > 0 else 0.0
     return (
         round(
             quality
@@ -1522,7 +1618,9 @@ def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
             + proto_offset
             + reality_bonus
             + trojan_raw_penalty
-            + streak_bonus,
+            + streak_bonus
+            + top_bonus
+            + rank_tiebreak,
             2,
         ),
         quality,
@@ -1559,21 +1657,41 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
         return ordered
 
     def is_verified(node: NodeInfo) -> bool:
-        return bool(node.iran_verified or getattr(node, "xray_verified", False))
+        return bool(
+            node.iran_verified
+            or getattr(node, "xray_verified", False)
+            or getattr(node, "top_iran_tier", False)
+        )
+
+    def is_top_tier(node: NodeInfo) -> bool:
+        return bool(getattr(node, "top_iran_tier", False))
 
     verified_tier = [n for n in ordered if is_verified(n)]
     unverified_tier = [n for n in ordered if not is_verified(n)]
 
+    # Elite OpenRay feeds first (non-Trojan), then the rest of the verified
+    # set, then verified raw-TCP Trojan, and only then unverified scrapers. A
+    # whole tier may fill the quota, so several working nodes of one /24
+    # (169.40.42.*, 51.158.206.*, 82.38.31.*) survive before anything else is
+    # touched.
+    tier_1_top = [
+        n for n in verified_tier if is_top_tier(n) and not _is_demoted_raw_trojan(n)
+    ]
+    tier_2_verified = [
+        n
+        for n in verified_tier
+        if not is_top_tier(n) and not _is_demoted_raw_trojan(n)
+    ]
+    tier_3_trojan = [n for n in verified_tier if _is_demoted_raw_trojan(n)]
+
     selected: List[NodeInfo] = []
     seen_subnets: Set[str] = set()
-    if verified_tier and unverified_tier:
-        _pick_diverse_tier(verified_tier, quota, selected, seen_subnets)
-        if len(selected) < quota:
-            _pick_diverse_tier(
-                unverified_tier, quota - len(selected), selected, seen_subnets
-            )
-    else:
-        _pick_diverse_tier(ordered, quota, selected, seen_subnets)
+    for tier in (tier_1_top, tier_2_verified, tier_3_trojan, unverified_tier):
+        if len(selected) >= quota:
+            break
+        if not tier:
+            continue
+        _pick_diverse_tier(tier, quota - len(selected), selected, seen_subnets)
 
     if len(selected) < quota:
         selected_ids = {id(n) for n in selected}
@@ -1620,6 +1738,21 @@ def _pick_diverse_tier(
                     seen_subnets.add(s24)
                     made_progress = True
                     break
+            if len(selected) >= target:
+                break
+
+    # Pass 2: backfill the remaining slots from the same tier even when only
+    # same-/24 nodes are left. OpenRay's working Reality/SS servers are
+    # clustered (169.40.42.*, 51.158.206.*, 82.38.31.*), so subnet purity must
+    # never cost us carriers that actually connect.
+    made_progress = True
+    while len(selected) < target and made_progress:
+        made_progress = False
+        for b in bucket_order:
+            candidates = buckets.get(b, [])
+            if candidates:
+                selected.append(candidates.pop(0))
+                made_progress = True
             if len(selected) >= target:
                 break
 
@@ -2877,22 +3010,13 @@ def write_all_outputs(
     _write_plain(SERVERS_FILE, main_links)
     _write_b64(SUB_FILE, main_links)
 
-    # Xray 26+ FinalMask (fm=) mirrors for v2rayN / v2rayNG. Only vless:// and
-    # trojan:// links can carry fm=, so vmess slots are replaced by the next
-    # eligible vless/trojan node of the same country. servers.txt itself stays
-    # clean for sing-box / mihomo, which do not understand fm=.
-    xray_frag_lines: List[str] = []
-    for code in sorted(ALLOWED_COUNTRIES.keys()):
-        candidates = [
-            n
-            for n in by_country.get(code, [])
-            if is_main_pool_eligible(n) and n.protocol in ("vless", "trojan")
-        ]
-        picked = select_diverse_top_nodes(candidates, MAIN_QUOTA_PER_COUNTRY)
-        for idx, n in enumerate(picked, start=1):
-            xray_frag_lines.append(
-                inject_xray_finalmask_fm(rename_node(n, code, idx))
-            )
+    # Xray 26+ FinalMask (fm=) mirror of servers.txt for v2rayN / v2rayNG. The
+    # curated main set is mirrored verbatim: vless/trojan gain fm=, while
+    # ss/vmess pass through untouched (they cannot carry it), so every country
+    # slot keeps its clean BrickVPN remark instead of being swapped out.
+    xray_frag_lines: List[str] = [
+        inject_xray_finalmask_fm(line) for line in main_links
+    ]
     _write_plain(
         os.path.join(OUTPUT_DIR, "servers_xray_frag.txt"), xray_frag_lines
     )
@@ -3203,11 +3327,13 @@ async def _main_impl() -> int:
     parsed: List[NodeInfo] = []
     by_key: Dict[Tuple[str, int], NodeInfo] = {}
     openray_iran_links: List[str] = []
+    top_iran_rank = 0
     total_extracted = 0
     for url, text in zip(urls, pages):
         if not text:
             continue
         iran_ok, tags = classify_source_url(url)
+        top_tier = is_top_iran_tier_url(url)
         links = extract_links(text)
         if is_openray_iran_feed(url):
             openray_iran_links.extend(links)
@@ -3221,6 +3347,10 @@ async def _main_impl() -> int:
             node.operator_tags = set(tags)
             if is_openray_iran_feed(url):
                 node.source_index = len(openray_iran_links)
+            if top_tier:
+                top_iran_rank += 1
+                node.top_iran_tier = True
+                node.openray_rank = top_iran_rank
             existing = by_key.get(node.key)
             if existing is not None:
                 _merge_provenance(existing, node)
@@ -3319,25 +3449,6 @@ async def _main_impl() -> int:
         total_tested=len(candidates),
         total_passed=len(allowed),
     )
-
-    # --- Stage 8b: direct OpenRay inside-Iran subscription ----------------
-    # OpenRay already validated these links from inside Iran in feed order; the
-    # curated set replaces the US-ping-re-sorted main artifacts so the working
-    # nodes survive verbatim (minus plaintext VLESS and ech= material).
-    if openray_iran_links:
-        direct_links = curate_openray_iran_links(openray_iran_links, limit=100)
-        if len(direct_links) >= 20:
-            written = write_openray_direct_outputs(direct_links)
-            print(
-                "[info] OpenRay direct subscription: "
-                f"{written.get('servers', 0)} curated Iran-verified node(s) "
-                f"from {len(openray_iran_links)} raw link(s)"
-            )
-        else:
-            print(
-                "[info] OpenRay direct subscription skipped: only "
-                f"{len(direct_links)} curated node(s)"
-            )
 
     # --- Stage 11: GitHub Actions annotations + summary -------------------
     emit_annotations(report["countries"])

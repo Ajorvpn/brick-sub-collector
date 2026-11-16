@@ -135,14 +135,14 @@ class TestRenameNode(unittest.TestCase):
     def test_vless_rename(self):
         link = "vless://uuid@2.2.2.2:443?security=tls#old remark"
         node = collector.parse_node_info(link)
-        node.country_code = "FR"
+        node.country_code = "DE"
         node.avg_latency_ms = 55
-        result = collector.rename_node(node, "FR", 3)
+        result = collector.rename_node(node, "DE", 3)
         self.assertTrue(
             result.startswith("vless://uuid@2.2.2.2:443?security=tls")
         )
         self.assertIn("fp=chrome", result)
-        self.assertIn("🇫🇷 France 03 | VLESS | ⚡ 55ms | BrickVPN", result)
+        self.assertIn("🇩🇪 Germany 03 | VLESS | ⚡ 55ms | BrickVPN", result)
 
     def test_trojan_rename(self):
         link = "trojan://pass@3.3.3.3:443#old"
@@ -155,10 +155,10 @@ class TestRenameNode(unittest.TestCase):
     def test_ss_rename(self):
         link = "ss://aes-256-gcm:pw@4.4.4.4:8388#old"
         node = collector.parse_node_info(link)
-        node.country_code = "GB"
+        node.country_code = "NL"
         node.avg_latency_ms = 10
-        result = collector.rename_node(node, "GB", 1)
-        self.assertIn("🇬🇧 United Kingdom 01 | SS | ⚡ 10ms | BrickVPN", result)
+        result = collector.rename_node(node, "NL", 1)
+        self.assertIn("🇳🇱 Netherlands 01 | SS | ⚡ 10ms | BrickVPN", result)
 
 
 
@@ -304,45 +304,92 @@ class TestBatchGeoIPFiltering(unittest.TestCase):
             collector.NodeInfo(
                 protocol="vless", host="2.2.2.2", port=443,
                 tls_enabled=False, network="tcp",
-                resolved_ip="2.2.2.2", country_code="IR",
+                resolved_ip="2.2.2.2", country_code="NL",
             ),
             collector.NodeInfo(
                 protocol="vless", host="3.3.3.3", port=443,
                 tls_enabled=False, network="tcp",
-                resolved_ip="3.3.3.3", country_code="CN",
+                resolved_ip="3.3.3.3", country_code="US",
+            ),
+            collector.NodeInfo(
+                protocol="vless", host="4.4.4.4", port=443,
+                tls_enabled=False, network="tcp",
+                resolved_ip="4.4.4.4", country_code="IR",
+            ),
+            collector.NodeInfo(
+                protocol="vless", host="5.5.5.5", port=443,
+                tls_enabled=False, network="tcp",
+                resolved_ip="5.5.5.5", country_code="CN",
             ),
         ]
         allowed = [n for n in nodes if n.country_code in collector.ALLOWED_COUNTRIES]
-        self.assertEqual(len(allowed), 1)
-        self.assertEqual(allowed[0].country_code, "DE")
+        self.assertEqual([n.country_code for n in allowed], ["DE", "NL", "US"])
 
     def test_allowed_countries_exact(self):
-        expected = {"DE", "FR", "GB", "NL", "US"}
+        expected = {"DE", "NL", "US"}
         self.assertEqual(set(collector.ALLOWED_COUNTRIES.keys()), expected)
         blocked = {"IR", "CN", "RU"}
         self.assertTrue(blocked.isdisjoint(set(collector.ALLOWED_COUNTRIES.keys())))
 
 
 class TestQuotaEnforcement(unittest.TestCase):
-    def test_main_quota_max_5_per_country(self):
-        de_nodes = []
-        for i in range(15):
-            n = collector.NodeInfo(
-                protocol="vless", host=f"1.1.1.{i}", port=443,
-                tls_enabled=False, network="tcp",
-                resolved_ip=f"1.1.1.{i}", country_code="DE",
-                quality_score=float(i), avg_latency_ms=i,
+    def test_main_quota_per_country_is_seven(self):
+        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 7)
+        tmp = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(tmp, "servers.txt")
+            ),
+            mock.patch.object(collector, "SUB_FILE", os.path.join(tmp, "sub.txt")),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(tmp, "status.json")
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+        try:
+            nodes = []
+            for i in range(12):
+                host = f"1.1.1.{i + 1}"
+                link = f"vless://uuid@{host}:443?security=tls&sni=a.example#n"
+                nodes.append(
+                    collector.NodeInfo(
+                        protocol="vless",
+                        host=host,
+                        port=443,
+                        tls_enabled=True,
+                        sni="a.example",
+                        security="tls",
+                        network="tcp",
+                        original_link=link,
+                        raw_link=link,
+                        resolved_ip=host,
+                        country_code="DE",
+                        quality_score=float(i),
+                        avg_latency_ms=i,
+                    )
+                )
+            collector.write_all_outputs(
+                {"DE": nodes}, {"vless": nodes}, total_tested=12, total_passed=12
             )
-            de_nodes.append(n)
-        de_nodes.sort(key=lambda n: n.quality_score or float("inf"))
-        main_links = []
-        for n in de_nodes[:collector.MAIN_QUOTA_PER_COUNTRY]:
-            main_links.append("link")
-        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 10)
-        self.assertEqual(len(main_links), 10)
+            with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 7)
+            self.assertIn("Germany 07 |", lines[-1])
+        finally:
+            for patch in patches:
+                patch.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def test_empty_country_no_padding(self):
-        by_country = {"DE": [], "FR": [], "NL": []}
+        by_country = {"DE": [], "NL": [], "US": []}
         main_links = []
         for code in sorted(collector.ALLOWED_COUNTRIES.keys()):
             nodes = by_country.get(code, [])
@@ -350,13 +397,13 @@ class TestQuotaEnforcement(unittest.TestCase):
                 main_links.append("link")
         self.assertEqual(len(main_links), 0)
 
-    def test_total_max_50(self):
-        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 50)
+    def test_total_max_21(self):
+        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 21)
         self.assertEqual(
-            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 50
+            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 21
         )
 
-    def test_five_countries_with_twelve_nodes_emit_exactly_fifty(self):
+    def test_three_countries_with_ten_nodes_emit_exactly_twenty_one(self):
         tmp = tempfile.mkdtemp()
         patches = [
             mock.patch.object(collector, "OUTPUT_DIR", tmp),
@@ -381,7 +428,7 @@ class TestQuotaEnforcement(unittest.TestCase):
             all_nodes = []
             for idx, code in enumerate(sorted(collector.ALLOWED_COUNTRIES)):
                 nodes = []
-                for i in range(12):
+                for i in range(10):
                     host = f"10.{idx}.{i}.1"
                     node = collector.NodeInfo(
                         protocol="vless",
@@ -409,12 +456,16 @@ class TestQuotaEnforcement(unittest.TestCase):
                 by_country[code] = nodes
 
             report = collector.write_all_outputs(
-                by_country, {"vless": all_nodes}, 60, 60
+                by_country, {"vless": all_nodes}, 30, 30
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 50)
-            self.assertEqual(report["main_sub_count"], 50)
+            self.assertEqual(len(lines), 21)
+            self.assertEqual(report["main_sub_count"], 21)
+            for code in ("Germany", "Netherlands", "United States"):
+                self.assertEqual(
+                    sum(1 for ln in lines if f" {code} " in ln), 7, code
+                )
         finally:
             for patch in patches:
                 patch.stop()
@@ -1180,9 +1231,9 @@ class TestSequentialNumbering(unittest.TestCase):
         return nodes
 
     def test_numbering_restarts_per_output_list(self):
-        nodes = self._build_nodes(12)
+        nodes = self._build_nodes(9)
         report = collector.write_all_outputs(
-            {"DE": nodes}, {}, total_tested=20, total_passed=12
+            {"DE": nodes}, {}, total_tested=20, total_passed=9
         )
 
         with open(collector.SERVERS_FILE, encoding="utf-8") as f:
@@ -1193,13 +1244,13 @@ class TestSequentialNumbering(unittest.TestCase):
 
         with open(os.path.join(collector.COUNTRIES_DIR, "DE.txt"), encoding="utf-8") as f:
             country_lines = f.read().splitlines()
-        self.assertEqual(len(country_lines), 12)
+        self.assertEqual(len(country_lines), 9)
         for idx, line in enumerate(country_lines, start=1):
             self.assertIn(f"Germany {idx:02d} |", line)
 
         self.assertEqual(report["main_sub_count"], collector.MAIN_QUOTA_PER_COUNTRY)
         self.assertEqual(report["total_tested"], 20)
-        self.assertEqual(report["total_passed"], 12)
+        self.assertEqual(report["total_passed"], 9)
         self.assertGreater(report["total_tested"], report["total_passed"])
 
     def test_status_json_records_probed_candidates(self):
@@ -2588,10 +2639,16 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
             os.path.join(self.tmp, "servers_xray_frag.txt"), encoding="utf-8"
         ) as f:
             frag_lines = f.read().splitlines()
-        self.assertEqual(len(frag_lines), 2)
+        # The fm= mirror covers every main slot: ss/vmess cannot carry fm=, so
+        # they pass through untouched instead of losing their clean remark.
+        self.assertEqual(len(frag_lines), 3)
+        vmess_lines = [ln for ln in frag_lines if ln.startswith("vmess://")]
+        self.assertEqual(len(vmess_lines), 1)
+        self.assertNotIn("fm=", vmess_lines[0])
         for line in frag_lines:
-            self.assertIn("fm=", line)
-            self.assertFalse(line.startswith("vmess://"))
+            if not line.startswith("vmess://"):
+                self.assertIn("fm=", line)
+                self.assertIn("Germany", line)
 
         with open(
             os.path.join(self.tmp, "sub_xray_frag.txt"), encoding="ascii"
@@ -2726,7 +2783,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         )
         fr_node = self._node(
             "vless://uuid-fr@12.0.0.1:443?security=tls&sni=fr.example#fr",
-            country="FR",
+            country="NL",
             quality=50.0,
         )
         de_node = self._node(
@@ -3253,6 +3310,153 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             self.assertIn(node, picked)
         self.assertNotIn(grpc, picked)
         self.assertNotIn(vmess, picked)
+
+    def test_top_iran_tier_same_24_nodes_selected_before_other_verified_and_raw_trojan(
+        self,
+    ):
+        top_nodes = []
+        for i, ip in enumerate(
+            ["169.40.42.74", "169.40.42.35", "169.40.42.168", "169.40.42.89"]
+        ):
+            node = self._node(
+                f"vless://uuid-{i}@{ip}:443?security=reality&sni=www.apple.com"
+                f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#r{i}",
+                country="US",
+                quality=300.0 + i,
+            )
+            node.top_iran_tier = True
+            node.openray_rank = i + 1
+            top_nodes.append(node)
+
+        other_verified = []
+        for i in range(5):
+            node = self._node(
+                f"vless://uuid-o{i}@20.{i}.0.1:443?security=tls"
+                "&sni=o.example&type=ws#other",
+                country="US",
+                quality=1.0,
+            )
+            node.iran_verified = True
+            other_verified.append(node)
+
+        raw_trojan = self._node(
+            "trojan://pw@30.0.0.1:443?security=tls&type=tcp&sni=t.example#t",
+            country="US",
+            quality=0.5,
+        )
+        raw_trojan.iran_verified = True
+
+        picked = collector.select_diverse_top_nodes(
+            top_nodes + other_verified + [raw_trojan], 7
+        )
+
+        # All four working 169.40.42.* Reality nodes survive the /24 pass.
+        self.assertEqual(len(picked), 7)
+        for node in top_nodes:
+            self.assertIn(node, picked)
+        self.assertNotIn(raw_trojan, picked)
+        self.assertEqual(
+            len([n for n in picked if n in other_verified]), 3
+        )
+
+    def test_iran_verified_ss_and_vmess_eligible_and_renamed_with_brickvpn_format(
+        self,
+    ):
+        ss_link = "ss://aes-256-gcm:pw@82.38.31.5:8080#ss"
+        ss = self._node(ss_link, country="NL", quality=10.0)
+        ss.iran_verified = True
+        self.assertTrue(collector.is_main_pool_eligible(ss))
+
+        vmess_cfg = {
+            "add": "51.158.206.29",
+            "port": 1800,
+            "id": "uuid-v",
+            "aid": 0,
+            "scy": "auto",
+            "net": "tcp",
+        }
+        vmess = self._node(
+            "vmess://"
+            + base64.b64encode(json.dumps(vmess_cfg).encode()).decode(),
+            country="NL",
+            quality=20.0,
+        )
+        vmess.iran_verified = True
+        self.assertTrue(collector.is_main_pool_eligible(vmess))
+
+        # An unverified plaintext Shadowsocks node stays out of the main pool.
+        unverified_ss = self._node(ss_link, country="NL", quality=30.0)
+        self.assertFalse(collector.is_main_pool_eligible(unverified_ss))
+
+        tmp = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", tmp),
+            mock.patch.object(
+                collector, "COUNTRIES_DIR", os.path.join(tmp, "countries")
+            ),
+            mock.patch.object(
+                collector, "PROTOCOLS_DIR", os.path.join(tmp, "protocols")
+            ),
+            mock.patch.object(
+                collector, "SERVERS_FILE", os.path.join(tmp, "servers.txt")
+            ),
+            mock.patch.object(collector, "SUB_FILE", os.path.join(tmp, "sub.txt")),
+            mock.patch.object(
+                collector, "STATUS_FILE", os.path.join(tmp, "status.json")
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+        try:
+            collector.write_all_outputs(
+                {"NL": [ss, vmess, unverified_ss]},
+                {"ss": [ss], "vmess": [vmess]},
+                total_tested=3,
+                total_passed=3,
+            )
+            with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+                lines = [ln for ln in f.read().splitlines() if ln.strip()]
+            self.assertEqual(len(lines), 2)
+            ss_lines = [ln for ln in lines if "| SS |" in ln]
+            self.assertEqual(len(ss_lines), 1)
+            self.assertIn("Netherlands 01 | SS |", ss_lines[0])
+            self.assertIn("| BrickVPN", ss_lines[0])
+            vmess_lines = [ln for ln in lines if ln.startswith("vmess://")]
+            self.assertEqual(len(vmess_lines), 1)
+            payload = vmess_lines[0][len("vmess://"):]
+            pad = len(payload) % 4
+            if pad:
+                payload += "=" * (4 - pad)
+            cfg = json.loads(base64.b64decode(payload).decode("utf-8"))
+            self.assertIn("Netherlands 02 | VMESS |", cfg["ps"])
+            self.assertIn("| BrickVPN", cfg["ps"])
+        finally:
+            for patch in patches:
+                patch.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_extract_country_hint_from_link_resolves_de_nl_us_from_openray_remarks(
+        self,
+    ):
+        cases = {
+            "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+            "#[OpenRay] \U0001F1FA\U0001F1F8 US-2473": "US",
+            "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+            "#[OpenRay] \U0001F1F3\U0001F1F1 NL-79": "NL",
+            "vless://uuid@1.2.3.4:443?security=tls&sni=a.example"
+            "#[OpenRay] \U0001F1E9\U0001F1EA DE-323": "DE",
+            "vless://uuid@1.2.3.4:443?security=tls&sni=a.example#plain": "",
+        }
+        for link, expected in cases.items():
+            self.assertEqual(
+                collector.extract_country_hint_from_link(link), expected, link
+            )
+
+        # URL-encoded fragments resolve to the same hint.
+        encoded = "vless://uuid@1.2.3.4:443#%5BOpenRay%5D%20US-2473"
+        self.assertEqual(
+            collector.extract_country_hint_from_link(encoded), "US"
+        )
 
     def test_compute_streak_bonus_ms_and_effective_sort_key_priority(self):
         node = collector.NodeInfo(protocol="vless", quality_score=100.0)
