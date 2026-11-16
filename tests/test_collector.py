@@ -1090,6 +1090,25 @@ class TestHtmlEntityLinks(unittest.TestCase):
         self.assertIn("security=tls&sni=example.com", link)
         self.assertIn("🇩🇪 Germany 01 | VLESS | ⚡ 30ms | BrickVPN", link)
 
+    def test_parse_ss_pure_base64(self):
+        raw_auth = base64.b64encode(b"aes-256-gcm:pass@1.2.3.4:8388").decode()
+        node = collector.parse_node_info(f"ss://{raw_auth}#test")
+        self.assertIsNotNone(node)
+        self.assertEqual(node.host, "1.2.3.4")
+        self.assertEqual(node.port, 8388)
+        self.assertEqual(node.protocol, "ss")
+
+    def test_parse_vless_trailing_slash(self):
+        link = "vless://uuid@1.2.3.4:443/?security=tls&sni=example.com#test"
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node)
+        self.assertEqual(node.host, "1.2.3.4")
+        self.assertEqual(node.port, 443)
+        parts = collector._split_uri_parts(link)
+        self.assertIsNotNone(parts)
+        self.assertEqual(parts[2], "1.2.3.4")
+        self.assertEqual(parts[3], 443)
+
 
 class TestBlockedPorts(unittest.TestCase):
     """B2: service/OS ports never enter the pipeline."""

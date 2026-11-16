@@ -698,10 +698,30 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         rest_no_query = rest_no_frag
         params = {}
 
+    if scheme == "ss" and "@" not in rest_no_query:
+        b64 = rest_no_query
+        pad = len(b64) % 4
+        if pad:
+            b64 += "=" * (4 - pad)
+        try:
+            dec = base64.b64decode(b64).decode("utf-8", errors="ignore")
+            if "@" in dec:
+                if "?" in dec:
+                    dec, q2 = dec.split("?", 1)
+                    params.update(_extract_query_params(q2))
+                rest_no_query = dec
+        except Exception:
+            pass
+
     if "@" in rest_no_query:
         authority = rest_no_query.rsplit("@", 1)[1]
     else:
         authority = rest_no_query
+
+    if "/" in authority:
+        authority, path_part = authority.split("/", 1)
+        if "path" not in params and path_part:
+            params["path"] = "/" + path_part
 
     if authority.startswith("["):
         end = authority.find("]")
@@ -1739,6 +1759,9 @@ def _split_uri_parts(
         rest, query = rest.split("?", 1)
 
     userinfo, _sep, authority = rest.rpartition("@")
+    path_part = ""
+    if "/" in authority:
+        authority, path_part = authority.split("/", 1)
     if authority.startswith("["):
         end = authority.find("]")
         if end == -1:
@@ -1753,7 +1776,10 @@ def _split_uri_parts(
         port = int(port_str)
     except (TypeError, ValueError):
         return None
-    return scheme, userinfo, host.strip(), port, _extract_query_params(query)
+    params = _extract_query_params(query)
+    if "path" not in params and path_part:
+        params["path"] = "/" + path_part
+    return scheme, userinfo, host.strip(), port, params
 
 
 def _xray_reality_short_id(sid: str) -> str:
