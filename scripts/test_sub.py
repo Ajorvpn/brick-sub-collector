@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 SING_BOX = os.path.expanduser("~/.local/bin/sing-box-direct")
 SUB_URL = "https://raw.githubusercontent.com/Ajorvpn/brick-sub-collector/sub/sub.txt"
 TRACE_URL = "https://cloudflare.com/cdn-cgi/trace"
-PROBE_URL = "http://cp.cloudflare.com/generate_204"
+PROBE_URL = "https://www.google.com/generate_204"
 TIMEOUT_SECS = 5
 BATCH_SIZE = 8
 
@@ -266,7 +266,7 @@ def parse_link_to_outbound(link, tag):
 
 
 def probe_node_port(port):
-    """Probe Cloudflare generate_204 through local socks5 port."""
+    """Probe HTTPS generate_204 on port 443 with full TLS handshake validation."""
     try:
         res = run_cmd(
             [
@@ -293,6 +293,10 @@ def probe_node_port(port):
             return False, 0, "Timeout"
         elif res.returncode in (7, 52, 56):
             return False, 0, "Connection Error"
+        elif res.returncode == 35:
+            return False, 0, "TLS Handshake Error"
+        elif res.returncode == 60:
+            return False, 0, "SSL Cert Error"
         elif res.returncode == 97:
             return False, 0, "Proxy Handshake Error"
         else:
