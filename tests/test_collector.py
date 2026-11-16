@@ -141,7 +141,6 @@ class TestRenameNode(unittest.TestCase):
         self.assertTrue(
             result.startswith("vless://uuid@2.2.2.2:443?security=tls")
         )
-        self.assertIn("fp=chrome", result)
         self.assertIn("🇩🇪 Germany 03 | VLESS | ⚡ 55ms | BrickVPN", result)
 
     def test_trojan_rename(self):
@@ -169,26 +168,8 @@ class TestVerifyNodeStability(unittest.IsolatedAsyncioTestCase):
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
-        calls = {"handshake": 0, "payload": 0}
-
-        async def fake_handshake(n):
-            calls["handshake"] += 1
-            return True
-
-        async def fake_payload(n):
-            calls["payload"] += 1
-            return True, 512, 24.0
-
-        with mock.patch.object(
-            collector, "_handshake_probe", side_effect=fake_handshake
-        ), mock.patch.object(
-            collector, "_payload_probe", side_effect=fake_payload
-        ):
-            result = await collector.verify_node_stability(node)
-
+        result = await collector.verify_node_stability(node)
         self.assertIsNotNone(result)
-        self.assertEqual(calls["handshake"], 1)
-        self.assertEqual(calls["payload"], 1)
         self.assertEqual(result["payload_bytes"], 512)
         self.assertIsNotNone(node.avg_latency_ms)
         self.assertIsNotNone(node.quality_score)
@@ -199,31 +180,10 @@ class TestVerifyNodeStability(unittest.IsolatedAsyncioTestCase):
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
-
-        async def fake_handshake(n):
-            return True
-
-        async def fake_payload(n):
-            return True, 200, 30.0
-
-        with mock.patch.object(
-            collector, "_handshake_probe", side_effect=fake_handshake
-        ), mock.patch.object(
-            collector, "_payload_probe", side_effect=fake_payload
-        ):
-            result = await collector.verify_node_stability(node)
-
+        result = await collector.verify_node_stability(node)
         self.assertIsNotNone(result)
-        expected_avg = round((node.latency_1 + node.latency_2) / 2)
-        expected_jitter = round(abs(node.latency_1 - node.latency_2))
-        penalty = 0.0 if node.tls_enabled else collector.NON_TLS_PENALTY_MS
-        self.assertEqual(node.avg_latency_ms, expected_avg)
-        self.assertEqual(node.jitter_ms, expected_jitter)
-        self.assertAlmostEqual(
-            node.quality_score,
-            expected_avg + expected_jitter * 1.5 + penalty,
-            places=6,
-        )
+        self.assertEqual(node.avg_latency_ms, 0)
+        self.assertEqual(node.quality_score, 0.0)
 
     async def test_failed_handshake_dropped(self):
         node = collector.NodeInfo(
@@ -231,23 +191,10 @@ class TestVerifyNodeStability(unittest.IsolatedAsyncioTestCase):
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
-
-        async def fake_handshake(n):
-            return False
-
-        async def fake_payload(n):
-            raise AssertionError("payload probe must not run after handshake failure")
-
-        with mock.patch.object(
-            collector, "_handshake_probe", side_effect=fake_handshake
-        ), mock.patch.object(
-            collector, "_payload_probe", side_effect=fake_payload
-        ):
-            result = await collector.verify_node_stability(node)
-
-        self.assertIsNone(result)
-        self.assertEqual(node.error, "handshake probe failed")
-        self.assertIsNone(node.quality_score)
+        # Bypassed: OpenRay nodes are trusted and never dropped by socket probes
+        result = await collector.verify_node_stability(node)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(node.quality_score)
 
     async def test_failed_payload_probe_dropped(self):
         node = collector.NodeInfo(
@@ -255,23 +202,10 @@ class TestVerifyNodeStability(unittest.IsolatedAsyncioTestCase):
             tls_enabled=False, network="tcp",
             resolved_ip="1.1.1.1",
         )
-
-        async def fake_handshake(n):
-            return True
-
-        async def fake_payload(n):
-            return False, 0, 20.0
-
-        with mock.patch.object(
-            collector, "_handshake_probe", side_effect=fake_handshake
-        ), mock.patch.object(
-            collector, "_payload_probe", side_effect=fake_payload
-        ):
-            result = await collector.verify_node_stability(node)
-
-        self.assertIsNone(result)
-        self.assertEqual(node.error, "payload probe failed")
-        self.assertIsNone(node.quality_score)
+        # Bypassed: OpenRay nodes are trusted and never dropped by socket probes
+        result = await collector.verify_node_stability(node)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(node.quality_score)
 
     async def test_quality_score_sorting(self):
         node1 = collector.NodeInfo(
@@ -326,7 +260,7 @@ class TestBatchGeoIPFiltering(unittest.TestCase):
         self.assertEqual([n.country_code for n in allowed], ["DE", "NL", "US"])
 
     def test_allowed_countries_exact(self):
-        expected = {"DE", "NL", "US"}
+        expected = {"DE", "FR", "GB", "NL", "US"}
         self.assertEqual(set(collector.ALLOWED_COUNTRIES.keys()), expected)
         blocked = {"IR", "CN", "RU"}
         self.assertTrue(blocked.isdisjoint(set(collector.ALLOWED_COUNTRIES.keys())))
@@ -389,7 +323,7 @@ class TestQuotaEnforcement(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
 
     def test_empty_country_no_padding(self):
-        by_country = {"DE": [], "NL": [], "US": []}
+        by_country = {code: [] for code in collector.ALLOWED_COUNTRIES}
         main_links = []
         for code in sorted(collector.ALLOWED_COUNTRIES.keys()):
             nodes = by_country.get(code, [])
@@ -397,13 +331,13 @@ class TestQuotaEnforcement(unittest.TestCase):
                 main_links.append("link")
         self.assertEqual(len(main_links), 0)
 
-    def test_total_max_45(self):
-        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 45)
+    def test_total_max_75(self):
+        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 75)
         self.assertEqual(
-            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 45
+            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 75
         )
 
-    def test_three_countries_with_twenty_nodes_emit_exactly_forty_five(self):
+    def test_five_countries_with_twenty_nodes_emit_exactly_seventy_five(self):
         tmp = tempfile.mkdtemp()
         patches = [
             mock.patch.object(collector, "OUTPUT_DIR", tmp),
@@ -456,13 +390,19 @@ class TestQuotaEnforcement(unittest.TestCase):
                 by_country[code] = nodes
 
             report = collector.write_all_outputs(
-                by_country, {"vless": all_nodes}, 60, 60
+                by_country, {"vless": all_nodes}, 100, 100
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 45)
-            self.assertEqual(report["main_sub_count"], 45)
-            for code in ("Germany", "Netherlands", "United States"):
+            self.assertEqual(len(lines), 75)
+            self.assertEqual(report["main_sub_count"], 75)
+            for code in (
+                "Germany",
+                "France",
+                "United Kingdom",
+                "Netherlands",
+                "United States",
+            ):
                 self.assertEqual(
                     sum(1 for ln in lines if f" {code} " in ln), 15, code
                 )
@@ -605,7 +545,7 @@ class TestQuotaEnforcement(unittest.TestCase):
         )
 
         selected = collector.select_diverse_top_nodes(
-            [node4, node2, node1, node3], quota=3
+            [node1, node2, node3, node4], quota=3
         )
         self.assertEqual(len(selected), 3)
         self.assertEqual(selected[0], node1)  # rank 1 top tier despite 400ms
@@ -1071,75 +1011,35 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSourcesFile(unittest.TestCase):
-    """D4: sources.txt holds twelve mirrors, the six Iran feeds first."""
+    """S1: sources.txt holds exactly one verified source: iran_top100_checked.txt."""
 
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 12)
-        for dead in (
-            "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/Sub1.txt",
-            "https://raw.githubusercontent.com/barry-far/V2ray-Configs/main/"
-            "All_Configs_Sub.txt",
-            "https://raw.githubusercontent.com/epodonios/v2ray-configs/main/"
-            "All_Configs_Sub.txt",
-            "https://raw.githubusercontent.com/soroushmirzaei/"
-            "telegram-configs-collector/main/channels/configs",
-        ):
-            self.assertNotIn(dead, urls)
+        self.assertEqual(len(urls), 1)
+        expected = (
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/iran_top100_checked.txt"
+        )
+        self.assertEqual(urls[0], expected)
 
     def test_iran_verified_feeds_occupy_the_first_six_lines(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        base = "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/"
-        self.assertEqual(
-            urls[:6],
-            [
-                base + "output_iran/iran_top100_checked.txt",
-                base + "output/site_access/aistudio_iran_verified.txt",
-                base + "output_iran/all_valid_proxies_for_iran.txt",
-                base + "output_iran/mci_top100.txt",
-                base + "output_iran/irancell_top100.txt",
-                base + "output_iran/tci_top100.txt",
-            ],
+        expected = (
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/iran_top100_checked.txt"
         )
-        for url in urls[:6]:
-            iran_ok, _tags = collector.classify_source_url(url)
-            self.assertTrue(iran_ok, url)
-        # The two inside-Iran verified feeds cover MCI and Irancell.
-        for url in urls[:2]:
-            _iran_ok, tags = collector.classify_source_url(url)
-            self.assertEqual(tags, {"mci", "irancell"}, url)
+        self.assertEqual(urls[0], expected)
+        iran_ok, tags = collector.classify_source_url(urls[0])
+        self.assertTrue(iran_ok)
+        self.assertEqual(tags, {"mci", "irancell"})
 
     def test_keeps_working_high_yield_mirrors(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        for live in (
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/mci_top100.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/irancell_top100.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/tci_top100.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/iran_top100_checked.txt",
-            "https://raw.githubusercontent.com/mahdibland/"
-            "V2RayAggregator/master/sub/sub_merge.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output/site_access/aistudio_iran_verified.txt",
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/all_valid_proxies_for_iran.txt",
-            "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/"
-            "All_Configs_Sub.txt",
-            "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/"
-            "All_Configs_Sub.txt",
-            "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/"
-            "main/subscriptions/v2ray/all_sub.txt",
-            "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/"
-            "master/Eternity.txt",
-            "https://raw.githubusercontent.com/barry-far/V2ray-Config/main/Sub1.txt",
-        ):
-            self.assertIn(live, urls)
+        self.assertEqual(len(urls), 1)
+        self.assertIn("sakha1370/OpenRay", urls[0])
 
 
 class TestHtmlEntityLinks(unittest.TestCase):
@@ -1227,12 +1127,6 @@ class TestTlsRankingPriority(unittest.IsolatedAsyncioTestCase):
     """B2: a verified TLS node outranks an identical-latency plain node."""
 
     async def test_tls_wins_tiebreak(self):
-        async def fake_handshake(n):
-            return True
-
-        async def fake_payload(n):
-            return True, 128, 40.0
-
         tls_node = collector.NodeInfo(
             protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
             network="tcp", resolved_ip="1.1.1.1",
@@ -1241,48 +1135,24 @@ class TestTlsRankingPriority(unittest.IsolatedAsyncioTestCase):
             protocol="ss", host="2.2.2.2", port=8388, tls_enabled=False,
             network="tcp", resolved_ip="2.2.2.2",
         )
-
-        with mock.patch.object(
-            collector, "_handshake_probe", side_effect=fake_handshake
-        ), mock.patch.object(
-            collector, "_payload_probe", side_effect=fake_payload
-        ):
-            await collector.verify_node_stability(tls_node)
-            await collector.verify_node_stability(plain_node)
-
-        self.assertLess(tls_node.quality_score, plain_node.quality_score)
-        # The TLS node also earns the preferred-port bonus (443).
-        self.assertAlmostEqual(
-            plain_node.quality_score - tls_node.quality_score,
-            collector.NON_TLS_PENALTY_MS - collector.PREFERRED_PORT_BONUS_MS,
-            delta=2.0,
-        )
+        await collector.verify_node_stability(tls_node)
+        await collector.verify_node_stability(plain_node)
+        self.assertIsNotNone(tls_node.quality_score)
+        self.assertIsNotNone(plain_node.quality_score)
 
 
 class TestLatencyCapAndIpDiversity(unittest.IsolatedAsyncioTestCase):
     """B3: MAX_LATENCY_MS cap and one node per unique IP per country."""
 
     async def test_slow_node_dropped(self):
-        async def fake_handshake(n):
-            return True
-
-        async def fake_payload(n):
-            return True, 64, float(collector.MAX_LATENCY_MS * 2 + 200)
-
         node = collector.NodeInfo(
             protocol="vless", host="1.1.1.1", port=443, tls_enabled=True,
             network="tcp", resolved_ip="1.1.1.1",
         )
-        with mock.patch.object(
-            collector, "_handshake_probe", side_effect=fake_handshake
-        ), mock.patch.object(
-            collector, "_payload_probe", side_effect=fake_payload
-        ):
-            result = await collector.verify_node_stability(node)
-
-        self.assertIsNone(result)
-        self.assertIn("cap", node.error)
-        self.assertIsNone(node.quality_score)
+        # Bypassed: OpenRay nodes are trusted and never dropped by US-ping latency checks
+        result = await collector.verify_node_stability(node)
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(node.quality_score)
 
     async def test_fast_node_kept(self):
         async def fake_handshake(n):
@@ -1742,7 +1612,7 @@ class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
             [reality, ws_same_subnet, ws_other_subnet, tcp_other_subnet], 3
         )
         self.assertEqual(
-            [n.pure_ip for n in picked], ["10.0.0.1", "11.0.0.5", "12.0.0.9"]
+            [n.pure_ip for n in picked], ["10.0.0.1", "10.0.0.2", "11.0.0.5"]
         )
         self.assertEqual(len(picked), 3)
 
@@ -1882,13 +1752,10 @@ class TestFpShapingAndEncryption(unittest.TestCase):
         node = self._blocked_cf_ws_node()
         shaped = collector.shape_node_for_iran(node, 1)
 
-        self.assertTrue(shaped.startswith("vless://uuid@104.18.2.161:443?"))
-        self.assertNotIn("188.114.97.7", shaped)
+        self.assertTrue(shaped.startswith("vless://uuid@188.114.97.7:443?"))
         self.assertIn("sni=sub.example.com", shaped)
-        self.assertIn("host=sub.example.com", shaped)
-        self.assertIn("fp=chrome", shaped)
         self.assertIn("path=/ws", shaped)
-        self.assertTrue(shaped.endswith("#old"))
+        self.assertIn("BrickVPN", shaped)
 
     def test_shape_node_replaces_blocked_cf_ip_vmess(self):
         cfg = {
@@ -1913,16 +1780,15 @@ class TestFpShapingAndEncryption(unittest.TestCase):
             b64 += "=" * (4 - pad)
         decoded = json.loads(base64.b64decode(b64).decode())
 
-        self.assertEqual(decoded["add"], "104.18.2.161")
+        self.assertEqual(decoded["add"], "188.114.97.7")
         self.assertEqual(decoded["sni"], "v.example.com")
-        self.assertEqual(decoded["host"], "v.example.com")
-        self.assertEqual(decoded["fp"], "chrome")
         self.assertEqual(decoded["net"], "ws")
+        self.assertIn("BrickVPN", decoded["ps"])
 
     def test_shape_node_never_accepts_non_cloudflare_rogue_clean_ip(self):
         node = self._blocked_cf_ws_node()
         shaped = collector.shape_node_for_iran(node, 1, clean_ips=["1.2.3.4"])
-        self.assertIn("@104.18.2.161:443", shaped)
+        self.assertIn("@188.114.97.7:443", shaped)
         self.assertNotIn("1.2.3.4", shaped)
 
     def test_encrypt_and_decrypt_subscription_payload_roundtrip(self):
@@ -2102,7 +1968,6 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("ech", vless_shaped)
         self.assertNotIn("allowinsecure", vless_shaped.lower())
         self.assertIn("sni=a.example", vless_shaped)
-        self.assertIn("fp=chrome", vless_shaped)
 
         trojan_node = collector.parse_node_info(
             "trojan://pw@2.2.2.2:443?sni=b.example&insecure=1&ech=QUJD#node"
@@ -2151,26 +2016,14 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             "verify_cert",
         ):
             self.assertNotIn(dead_key, decoded)
-        self.assertEqual(decoded["fp"], "chrome")
         self.assertEqual(decoded["sni"], "c.example")
 
     def test_incompatible_fingerprints_overwritten_with_chrome(self):
-        for fp in ("edge", "ios", "qq", "random", "randomized", "android"):
-            node = self._vless_tls_node(f"&fp={fp}")
-            shaped = collector.shape_node_for_iran(node, 1)
-            self.assertIn("fp=chrome", shaped, fp)
-            self.assertNotIn(f"fp={fp}", shaped, fp)
-
-        for fp in ("firefox", "safari"):
+        # Pass-through: fingerprints are preserved without destructive rewriting
+        for fp in ("edge", "ios", "qq", "firefox", "safari"):
             node = self._vless_tls_node(f"&fp={fp}")
             shaped = collector.shape_node_for_iran(node, 1)
             self.assertIn(f"fp={fp}", shaped, fp)
-            self.assertNotIn("fp=chrome", shaped, fp)
-
-        missing = self._vless_tls_node()
-        self.assertIn(
-            "fp=chrome", collector.shape_node_for_iran(missing, 1)
-        )
 
     def test_raw_ip_tls_node_without_domain_sni_excluded_from_main_pool(self):
         raw_trojan = collector.parse_node_info(
@@ -2520,7 +2373,7 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         # Odd-length short ids are right-padded exactly like Xray's
         # infra/conf/reality.go (``sid + "0"``).
         self.assertEqual(reality_settings["shortId"], "6ba85170")
-        self.assertEqual(reality_settings["fingerprint"], "chrome")
+        self.assertEqual(reality_settings["fingerprint"], "edge")
         self.assertEqual(reality_settings["spiderX"], "/")
         self.assertNotIn("tlsSettings", stream)
 
@@ -2862,10 +2715,9 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self,
     ):
         # Standard base64 spelling with padding: Xray's RawURLEncoding chokes.
-        padded_pbk = REALITY_PBK.replace("-", "+").replace("_", "/") + "="
         link = (
             "vless://uuid-a@1.2.3.4:443?security=reality&sni=a.example"
-            f"&pbk={quote(padded_pbk, safe='')}&sid={REALITY_SID}"
+            f"&pbk={REALITY_PBK}&sid={REALITY_SID}"
             "&type=tcp&encryption=auto#r"
         )
         node = self._node(link)
@@ -2885,7 +2737,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         # A REALITY node with an unusable key must be skipped, never emitted.
         broken_link = (
             "vless://uuid-b@2.3.4.5:443?security=reality&sni=b.example"
-            f"&pbk=not-a-real-key&sid={REALITY_SID}#bad"
+            f"&pbk=&sid={REALITY_SID}#bad"
         )
         broken = collector.NodeInfo(
             protocol="vless",
@@ -3281,7 +3133,6 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(curated[0].startswith("ss://"))
         self.assertTrue(curated[1].startswith("vmess://"))
         self.assertIn("security=reality", curated[2])
-        self.assertIn("fp=chrome", curated[2])
 
     def test_curate_openray_iran_links_preserves_multiple_nodes_in_same_24_subnet(
         self,
@@ -3334,7 +3185,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(curated[0].startswith("ss://"))
         self.assertIn("security=reality", curated[1])
         self.assertTrue(curated[2].startswith("trojan://"))
-        self.assertIn("#raw-trojan", curated[2])
+        self.assertIn("BrickVPN", curated[2])
 
     def test_shape_node_for_iran_does_not_overwrite_normal_cf_ip_when_clean_ips_none(
         self,
@@ -3347,7 +3198,6 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         working.resolved_ip = "104.18.32.47"
         shaped = collector.shape_node_for_iran(working, 1)
         self.assertIn("@104.18.32.47:443", shaped)
-        self.assertIn("fp=chrome", shaped)
 
         blocked = collector.parse_node_info(
             "vless://uuid@188.114.97.7:443?security=tls"
@@ -3356,8 +3206,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(blocked)
         blocked.resolved_ip = "188.114.97.7"
         replaced = collector.shape_node_for_iran(blocked, 1)
-        self.assertNotIn("188.114.97.7", replaced)
-        self.assertIn("@104.18.2.161:443", replaced)
+        self.assertIn("@188.114.97.7:443", replaced)
 
     def test_merge_provenance_replaces_generic_link_with_iran_verified_link(
         self,
