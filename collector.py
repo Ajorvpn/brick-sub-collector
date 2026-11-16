@@ -121,8 +121,8 @@ OPENRAY_CHECK_COUNTS_URLS: Tuple[str, ...] = (
 )
 OPENRAY_TELEMETRY_TIMEOUT = 5.0
 
-MAIN_QUOTA_PER_COUNTRY = 7
-TOTAL_MAIN_QUOTA = 21
+MAIN_QUOTA_PER_COUNTRY = 15
+TOTAL_MAIN_QUOTA = 45
 COUNTRY_FILE_QUOTA = 20
 # Per-operator subscription size (output/operators/{op}.txt).
 OPERATOR_QUOTA = 30
@@ -207,7 +207,7 @@ PURE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
 # Three powerhouse countries only: the 2026-11-16 v2rayN run kept DE, NL and
 # US nodes green, while FR/GB scarceley filled a single slot.
-# 3 countries x 7 nodes = TOTAL_MAIN_QUOTA slots.
+# 3 countries x 15 nodes = TOTAL_MAIN_QUOTA slots.
 ALLOWED_COUNTRIES: Dict[str, Tuple[str, str]] = {
     "DE": ("\U0001F1E9\U0001F1EA", "Germany"),
     "NL": ("\U0001F1F3\U0001F1F1", "Netherlands"),
@@ -1542,6 +1542,9 @@ def dedupe_by_pure_ip(nodes: List[NodeInfo]) -> List[NodeInfo]:
     Overflow nodes (same subnet, different IP) are still returned so a country
     with a thin IP pool can fill its quota, but only after every distinct
     subnet has had a chance to contribute.
+
+    Top Iran tier and Iran-verified nodes are exempt from /24 subnet culling,
+    allowing working clustered nodes (e.g. 169.40.42.*, 82.38.31.*) to coexist.
     """
     seen: Set[str] = set()
     by_ip: Dict[str, NodeInfo] = {}
@@ -1562,8 +1565,14 @@ def dedupe_by_pure_ip(nodes: List[NodeInfo]) -> List[NodeInfo]:
     overflow: List[NodeInfo] = []
     seen_subnets: Set[str] = set()
     for n in unique:
+        is_iran = bool(
+            getattr(n, "top_iran_tier", False) or getattr(n, "iran_verified", False)
+        )
         s24 = subnet24_key(n.pure_ip)
-        if s24 in seen_subnets:
+        if is_iran:
+            primary.append(n)
+            seen_subnets.add(s24)
+        elif s24 in seen_subnets:
             overflow.append(n)
         else:
             seen_subnets.add(s24)
@@ -1584,7 +1593,28 @@ def compute_streak_bonus_ms(node: NodeInfo) -> float:
 
 
 def _effective_sort_key(node: NodeInfo) -> Tuple[float, float]:
-    """Ranking key: Xray-verified, REALITY, VLESS first; raw TCP Trojan last."""
+    """Ranking key: Xray-verified, REALITY, VLESS first; raw TCP Trojan last.
+
+    For top_iran_tier and iran_verified nodes, incoming OpenRay order (openray_rank
+    or feed presence) is preserved without letting US-datacenter latency/ping variance
+    re-sort or demote them.
+    """
+    if getattr(node, "top_iran_tier", False):
+        rank = int(getattr(node, "openray_rank", 0) or 0)
+        trojan_pen = (
+            TROJAN_RAW_TLS_PENALTY_MS if _is_demoted_raw_trojan(node) else 0.0
+        )
+        return (-100000.0 + rank + trojan_pen, float(rank))
+
+    if getattr(node, "iran_verified", False):
+        src_idx = int(getattr(node, "source_index", 0) or 0)
+        rank = int(getattr(node, "openray_rank", 0) or 0)
+        order_idx = rank if rank > 0 else src_idx
+        trojan_pen = (
+            TROJAN_RAW_TLS_PENALTY_MS if _is_demoted_raw_trojan(node) else 0.0
+        )
+        return (-50000.0 + order_idx + trojan_pen, float(order_idx))
+
     quality = (
         node.quality_score if node.quality_score is not None else float("inf")
     )
@@ -1686,12 +1716,24 @@ def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo
 
     selected: List[NodeInfo] = []
     seen_subnets: Set[str] = set()
-    for tier in (tier_1_top, tier_2_verified, tier_3_trojan, unverified_tier):
+
+    # For top_iran_tier and iran_verified nodes, incoming OpenRay order is
+    # preserved directly without /24 subnet culling or US-ping re-sorting.
+    for tier in (tier_1_top, tier_2_verified, tier_3_trojan):
+        for n in tier:
+            if len(selected) >= quota:
+                break
+            selected.append(n)
+            seen_subnets.add(subnet24_key(n.pure_ip))
         if len(selected) >= quota:
             break
-        if not tier:
-            continue
-        _pick_diverse_tier(tier, quota - len(selected), selected, seen_subnets)
+
+    # Unverified scrapers fill remaining slots using transport round-robin and
+    # /24 subnet diversity.
+    if len(selected) < quota and unverified_tier:
+        _pick_diverse_tier(
+            unverified_tier, quota - len(selected), selected, seen_subnets
+        )
 
     if len(selected) < quota:
         selected_ids = {id(n) for n in selected}
@@ -1732,8 +1774,12 @@ def _pick_diverse_tier(
         for b in bucket_order:
             candidates = buckets.get(b, [])
             for idx, cand in enumerate(candidates):
+                is_iran = bool(
+                    getattr(cand, "top_iran_tier", False)
+                    or getattr(cand, "iran_verified", False)
+                )
                 s24 = subnet24_key(cand.pure_ip)
-                if s24 not in seen_subnets:
+                if is_iran or s24 not in seen_subnets:
                     selected.append(candidates.pop(idx))
                     seen_subnets.add(s24)
                     made_progress = True
@@ -3436,11 +3482,11 @@ async def _main_impl() -> int:
         by_protocol[n.protocol].append(n)
 
     for code, nodes in by_country.items():
-        nodes.sort(key=lambda n: (n.quality_score or float("inf")))
+        nodes.sort(key=_effective_sort_key)
         by_country[code] = dedupe_by_pure_ip(nodes)
 
     for proto in by_protocol:
-        by_protocol[proto].sort(key=lambda n: (n.quality_score or float("inf")))
+        by_protocol[proto].sort(key=_effective_sort_key)
 
     # --- Stage 8: Write outputs (every list is numbered independently) ----
     report = write_all_outputs(

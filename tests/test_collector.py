@@ -333,8 +333,8 @@ class TestBatchGeoIPFiltering(unittest.TestCase):
 
 
 class TestQuotaEnforcement(unittest.TestCase):
-    def test_main_quota_per_country_is_seven(self):
-        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 7)
+    def test_main_quota_per_country_is_fifteen(self):
+        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 15)
         tmp = tempfile.mkdtemp()
         patches = [
             mock.patch.object(collector, "OUTPUT_DIR", tmp),
@@ -356,7 +356,7 @@ class TestQuotaEnforcement(unittest.TestCase):
             patch.start()
         try:
             nodes = []
-            for i in range(12):
+            for i in range(20):
                 host = f"1.1.1.{i + 1}"
                 link = f"vless://uuid@{host}:443?security=tls&sni=a.example#n"
                 nodes.append(
@@ -377,12 +377,12 @@ class TestQuotaEnforcement(unittest.TestCase):
                     )
                 )
             collector.write_all_outputs(
-                {"DE": nodes}, {"vless": nodes}, total_tested=12, total_passed=12
+                {"DE": nodes}, {"vless": nodes}, total_tested=20, total_passed=20
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 7)
-            self.assertIn("Germany 07 |", lines[-1])
+            self.assertEqual(len(lines), 15)
+            self.assertIn("Germany 15 |", lines[-1])
         finally:
             for patch in patches:
                 patch.stop()
@@ -397,13 +397,13 @@ class TestQuotaEnforcement(unittest.TestCase):
                 main_links.append("link")
         self.assertEqual(len(main_links), 0)
 
-    def test_total_max_21(self):
-        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 21)
+    def test_total_max_45(self):
+        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 45)
         self.assertEqual(
-            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 21
+            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 45
         )
 
-    def test_three_countries_with_ten_nodes_emit_exactly_twenty_one(self):
+    def test_three_countries_with_twenty_nodes_emit_exactly_forty_five(self):
         tmp = tempfile.mkdtemp()
         patches = [
             mock.patch.object(collector, "OUTPUT_DIR", tmp),
@@ -428,7 +428,7 @@ class TestQuotaEnforcement(unittest.TestCase):
             all_nodes = []
             for idx, code in enumerate(sorted(collector.ALLOWED_COUNTRIES)):
                 nodes = []
-                for i in range(10):
+                for i in range(20):
                     host = f"10.{idx}.{i}.1"
                     node = collector.NodeInfo(
                         protocol="vless",
@@ -456,20 +456,162 @@ class TestQuotaEnforcement(unittest.TestCase):
                 by_country[code] = nodes
 
             report = collector.write_all_outputs(
-                by_country, {"vless": all_nodes}, 30, 30
+                by_country, {"vless": all_nodes}, 60, 60
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 21)
-            self.assertEqual(report["main_sub_count"], 21)
+            self.assertEqual(len(lines), 45)
+            self.assertEqual(report["main_sub_count"], 45)
             for code in ("Germany", "Netherlands", "United States"):
                 self.assertEqual(
-                    sum(1 for ln in lines if f" {code} " in ln), 7, code
+                    sum(1 for ln in lines if f" {code} " in ln), 15, code
                 )
         finally:
             for patch in patches:
                 patch.stop()
             shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_multiple_nodes_same_24_subnet_with_top_iran_tier_retained_and_selected(
+        self,
+    ):
+        node1 = collector.NodeInfo(
+            protocol="vless",
+            host="169.40.42.74",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+            network="tcp",
+            original_link=(
+                f"vless://uuid-1@169.40.42.74:443?security=reality&sni=www.apple.com"
+                f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#n1"
+            ),
+            raw_link=(
+                f"vless://uuid-1@169.40.42.74:443?security=reality&sni=www.apple.com"
+                f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#n1"
+            ),
+            resolved_ip="169.40.42.74",
+            country_code="US",
+            quality_score=200.0,
+            avg_latency_ms=200,
+            top_iran_tier=True,
+            openray_rank=1,
+        )
+        node2 = collector.NodeInfo(
+            protocol="vless",
+            host="169.40.42.35",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+            network="tcp",
+            original_link=(
+                f"vless://uuid-2@169.40.42.35:443?security=reality&sni=www.apple.com"
+                f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#n2"
+            ),
+            raw_link=(
+                f"vless://uuid-2@169.40.42.35:443?security=reality&sni=www.apple.com"
+                f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#n2"
+            ),
+            resolved_ip="169.40.42.35",
+            country_code="US",
+            quality_score=150.0,
+            avg_latency_ms=150,
+            top_iran_tier=True,
+            openray_rank=2,
+        )
+
+        # Deduplication must retain both nodes in the same /24 subnet without culling
+        deduped = collector.dedupe_by_pure_ip([node1, node2])
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped, [node1, node2])
+
+        # Selection must select both and preserve upstream OpenRay rank despite US-ping variance
+        selected = collector.select_diverse_top_nodes([node1, node2], quota=15)
+        self.assertEqual(len(selected), 2)
+        self.assertEqual(selected[0], node1)
+        self.assertEqual(selected[1], node2)
+
+    def test_openray_order_preserved_without_us_ping_resorting(self):
+        # Node with high US ping (400ms) but rank 1 in OpenRay
+        node1 = collector.NodeInfo(
+            protocol="vless",
+            host="1.1.1.1",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+            network="tcp",
+            original_link="vless://u1@1.1.1.1:443?security=reality#1",
+            raw_link="vless://u1@1.1.1.1:443?security=reality#1",
+            resolved_ip="1.1.1.1",
+            country_code="DE",
+            quality_score=400.0,
+            avg_latency_ms=400,
+            top_iran_tier=True,
+            openray_rank=1,
+        )
+        # Node with low US ping (50ms) but rank 2 in OpenRay
+        node2 = collector.NodeInfo(
+            protocol="vless",
+            host="2.2.2.2",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+            network="tcp",
+            original_link="vless://u2@2.2.2.2:443?security=reality#2",
+            raw_link="vless://u2@2.2.2.2:443?security=reality#2",
+            resolved_ip="2.2.2.2",
+            country_code="DE",
+            quality_score=50.0,
+            avg_latency_ms=50,
+            top_iran_tier=True,
+            openray_rank=2,
+        )
+        # Iran-verified non-elite node
+        node3 = collector.NodeInfo(
+            protocol="vless",
+            host="3.3.3.3",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+            network="tcp",
+            original_link="vless://u3@3.3.3.3:443?security=reality#3",
+            raw_link="vless://u3@3.3.3.3:443?security=reality#3",
+            resolved_ip="3.3.3.3",
+            country_code="DE",
+            quality_score=30.0,
+            avg_latency_ms=30,
+            iran_verified=True,
+            source_index=1,
+        )
+        # Unverified scraper node with very low US ping (5ms)
+        node4 = collector.NodeInfo(
+            protocol="vless",
+            host="4.4.4.4",
+            port=443,
+            tls_enabled=True,
+            sni="www.apple.com",
+            security="reality",
+            network="tcp",
+            original_link="vless://u4@4.4.4.4:443?security=reality#4",
+            raw_link="vless://u4@4.4.4.4:443?security=reality#4",
+            resolved_ip="4.4.4.4",
+            country_code="DE",
+            quality_score=5.0,
+            avg_latency_ms=5,
+        )
+
+        selected = collector.select_diverse_top_nodes(
+            [node4, node2, node1, node3], quota=3
+        )
+        self.assertEqual(len(selected), 3)
+        self.assertEqual(selected[0], node1)  # rank 1 top tier despite 400ms
+        self.assertEqual(selected[1], node2)  # rank 2 top tier
+        self.assertEqual(selected[2], node3)  # iran-verified tier
+        self.assertNotIn(node4, selected)
 
 
 class TestExtractLinks(unittest.TestCase):
@@ -1231,9 +1373,9 @@ class TestSequentialNumbering(unittest.TestCase):
         return nodes
 
     def test_numbering_restarts_per_output_list(self):
-        nodes = self._build_nodes(9)
+        nodes = self._build_nodes(18)
         report = collector.write_all_outputs(
-            {"DE": nodes}, {}, total_tested=20, total_passed=9
+            {"DE": nodes}, {}, total_tested=25, total_passed=18
         )
 
         with open(collector.SERVERS_FILE, encoding="utf-8") as f:
@@ -1244,13 +1386,13 @@ class TestSequentialNumbering(unittest.TestCase):
 
         with open(os.path.join(collector.COUNTRIES_DIR, "DE.txt"), encoding="utf-8") as f:
             country_lines = f.read().splitlines()
-        self.assertEqual(len(country_lines), 9)
+        self.assertEqual(len(country_lines), 18)
         for idx, line in enumerate(country_lines, start=1):
             self.assertIn(f"Germany {idx:02d} |", line)
 
         self.assertEqual(report["main_sub_count"], collector.MAIN_QUOTA_PER_COUNTRY)
-        self.assertEqual(report["total_tested"], 20)
-        self.assertEqual(report["total_passed"], 9)
+        self.assertEqual(report["total_tested"], 25)
+        self.assertEqual(report["total_passed"], 18)
         self.assertGreater(report["total_tested"], report["total_passed"])
 
     def test_status_json_records_probed_candidates(self):
