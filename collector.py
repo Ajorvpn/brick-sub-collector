@@ -193,6 +193,8 @@ DECOY_ONLY_HOSTS: Set[str] = {
     # ``current time 2026-11-16 is after 2026-07-12T23:59:59Z`` and
     # ``certificate is not valid for any names, wanted to match yichueng.org``.
     "09vpn.com", "yichueng.org",
+    # Proven broken decoy/tunnel hosts on Iran's network (2026-11-16)
+    "ignitelimit.com",
 }
 
 # Non-TLS transports/protocols that must answer the HTTP payload probe.
@@ -523,6 +525,13 @@ def is_main_pool_eligible(node: NodeInfo) -> bool:
         return False
     if _is_decoy_connect_host(node.host):
         return False
+    if is_blocked_cloudflare_ip(node.host) or (
+        getattr(node, "resolved_ip", None)
+        and is_blocked_cloudflare_ip(node.resolved_ip)
+    ):
+        return False
+    if (node.sni or "").strip().lower() == "gateway.icloud.com":
+        return False
     if not _port_allowed(node.port):
         return False
 
@@ -681,6 +690,8 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         node.sni = _resolve_sni(
             cfg.get("sni") or cfg.get("peer") or cfg.get("host"), host
         )
+        if (node.sni or "").strip().lower() == "gateway.icloud.com":
+            return None
         node.path = str(cfg.get("path", "") or "/")
         if not node.tls_enabled and node.port in PLAINTEXT_AND_ABUSED_PORTS:
             return None
@@ -782,6 +793,9 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         node.network = "tcp"
         node.security = ""
         node.sni = None
+
+    if (node.sni or "").strip().lower() == "gateway.icloud.com":
+        return None
 
     node.path = params.get("path") or "/"
 
@@ -2482,10 +2496,12 @@ async def fetch_openray_telemetry(
 
 
 def build_clean_name(
-    country_code: str, index: int, protocol: str, avg_latency_ms: int
+    country_code: str, index: int, protocol: str, avg_latency_ms: int = 0
 ) -> str:
     flag, name = ALLOWED_COUNTRIES[country_code]
-    return f"{flag} {name} {index:02d} | {protocol.upper()} | ⚡ {avg_latency_ms}ms | BrickVPN"
+    if avg_latency_ms and avg_latency_ms > 0:
+        return f"{flag} {name} {index:02d} | {protocol.upper()} | ⚡ {avg_latency_ms}ms | BrickVPN"
+    return f"{flag} {name} {index:02d} | {protocol.upper()} | BrickVPN"
 
 
 # ---------------------------------------------------------------------------

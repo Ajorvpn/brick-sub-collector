@@ -111,6 +111,10 @@ class TestBuildCleanName(unittest.TestCase):
         name = collector.build_clean_name("US", 5, "trojan", 120)
         self.assertEqual(name, "🇺🇸 United States 05 | TROJAN | ⚡ 120ms | BrickVPN")
 
+    def test_zero_latency_omits_ms_segment(self):
+        name = collector.build_clean_name("DE", 1, "vless", 0)
+        self.assertEqual(name, "🇩🇪 Germany 01 | VLESS | BrickVPN")
+
 
 
 
@@ -1016,30 +1020,33 @@ class TestSourcesFile(unittest.TestCase):
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 1)
-        expected = (
+        self.assertEqual(len(urls), 2)
+        expected_0 = (
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output_iran/iran_top100_checked.txt"
         )
-        self.assertEqual(urls[0], expected)
+        expected_1 = (
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output/site_access/aistudio_iran_verified.txt"
+        )
+        self.assertEqual(urls[0], expected_0)
+        self.assertEqual(urls[1], expected_1)
 
     def test_iran_verified_feeds_occupy_the_first_six_lines(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        expected = (
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/iran_top100_checked.txt"
-        )
-        self.assertEqual(urls[0], expected)
-        iran_ok, tags = collector.classify_source_url(urls[0])
-        self.assertTrue(iran_ok)
-        self.assertEqual(tags, {"mci", "irancell"})
+        self.assertEqual(len(urls), 2)
+        for u in urls:
+            iran_ok, tags = collector.classify_source_url(u)
+            self.assertTrue(iran_ok)
+            self.assertEqual(tags, {"mci", "irancell"})
 
     def test_keeps_working_high_yield_mirrors(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 1)
+        self.assertEqual(len(urls), 2)
         self.assertIn("sakha1370/OpenRay", urls[0])
+        self.assertIn("sakha1370/OpenRay", urls[1])
 
 
 class TestHtmlEntityLinks(unittest.TestCase):

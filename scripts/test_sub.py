@@ -109,6 +109,8 @@ def parse_link_to_outbound(link, tag):
         rest = clean[5:]
         if "#" in rest:
             rest, _ = rest.split("#", 1)
+        if "?" in rest:
+            rest, _ = rest.split("?", 1)
         if "@" in rest:
             user_b64, server_part = rest.split("@", 1)
             pad = len(user_b64) % 4
@@ -122,9 +124,13 @@ def parse_link_to_outbound(link, tag):
             if pad:
                 rest += "=" * (4 - pad)
             dec = base64.b64decode(rest).decode("utf-8", errors="ignore")
+            if "?" in dec:
+                dec, _ = dec.split("?", 1)
             user_part, server_part = dec.split("@", 1)
             method, password = user_part.split(":", 1)
             host, port = server_part.rsplit(":", 1)
+        if "/" in port:
+            port = port.split("/", 1)[0]
         return {
             "type": "shadowsocks",
             "tag": tag,
@@ -133,6 +139,9 @@ def parse_link_to_outbound(link, tag):
             "method": method,
             "password": password,
             "bind_interface": "wlan0",
+            "_proto": "SS",
+            "_host": host,
+            "_sni": "",
         }
     elif scheme == "vmess":
         rest = clean[8:]
@@ -158,6 +167,9 @@ def parse_link_to_outbound(link, tag):
             "security": cfg.get("scy", "auto") or "auto",
             "alter_id": alter_id,
             "bind_interface": "wlan0",
+            "_proto": "VMess",
+            "_host": host,
+            "_sni": sni if tls_enabled else "",
         }
         if tls_enabled:
             ob["tls"] = {"enabled": True, "server_name": sni, "insecure": True}
@@ -196,12 +208,16 @@ def parse_link_to_outbound(link, tag):
         sni = params.get("sni") or params.get("host") or host
         fp = params.get("fp", "chrome")
         flow = params.get("flow", "")
+        proto_tag = "VLESS" if scheme == "vless" else "Trojan"
         ob = {
             "type": scheme,
             "tag": tag,
             "server": host,
             "server_port": port,
             "bind_interface": "wlan0",
+            "_proto": proto_tag,
+            "_host": host,
+            "_sni": sni,
         }
         if scheme == "vless":
             ob["uuid"] = user
@@ -292,7 +308,6 @@ def test_batch(batch_items, start_port):
     inbounds = []
     outbounds = []
     rules = []
-    node_map = {}
 
     for idx, (node_name, ob) in enumerate(batch_items):
         port = start_port + idx
@@ -306,9 +321,10 @@ def test_batch(batch_items, start_port):
                 "listen_port": port,
             }
         )
-        outbounds.append(ob)
+        # copy dict without internal underscore keys
+        clean_ob = {k: v for k, v in ob.items() if not k.startswith("_")}
+        outbounds.append(clean_ob)
         rules.append({"inbound": [in_tag], "outbound": ob_tag})
-        node_map[port] = node_name
 
     outbounds.append({"type": "direct", "tag": "direct", "bind_interface": "wlan0"})
     cfg = {
@@ -333,13 +349,11 @@ def test_batch(batch_items, start_port):
     with open(cfg_file, "w") as f:
         json.dump(cfg, f)
 
-    # Validate configuration
     chk = run_cmd([SING_BOX, "check", "-c", cfg_file])
     if chk.returncode != 0:
-        # Fallback: mark all in batch as Config Error
         return [
-            (node_name, False, 0, "Config Check Failed")
-            for node_name, _ in batch_items
+            (node_name, False, 0, "Config Check Failed", ob)
+            for node_name, ob in batch_items
         ]
 
     proc = subprocess.Popen(
@@ -354,13 +368,13 @@ def test_batch(batch_items, start_port):
     try:
         with ThreadPoolExecutor(max_workers=len(batch_items)) as executor:
             future_to_info = {
-                executor.submit(probe_node_port, start_port + idx): batch_items[idx][0]
+                executor.submit(probe_node_port, start_port + idx): (batch_items[idx][0], batch_items[idx][1])
                 for idx in range(len(batch_items))
             }
             for fut in future_to_info:
-                name = future_to_info[fut]
+                name, ob = future_to_info[fut]
                 ok, lat, err = fut.result()
-                results.append((name, ok, lat, err))
+                results.append((name, ok, lat, err, ob))
     finally:
         proc.terminate()
         try:
@@ -375,31 +389,41 @@ def test_batch(batch_items, start_port):
     return results
 
 
+def fetch_subscription_data():
+    """Fetch live subscription content: try gh api first to bypass CDN caching."""
+    try:
+        res = subprocess.run(
+            ["gh", "api", "repos/Ajorvpn/brick-sub-collector/contents/sub.txt?ref=sub", "--jq", ".content"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return base64.b64decode(res.stdout.strip())
+    except Exception:
+        pass
+
+    req = urllib.request.Request(
+        SUB_URL,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; BrickSubTester/1.0)"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.read()
+
+
 def main():
-    # Step 1: sanity check
     sanity_check_iran()
 
-    # Step 2: fetch sub
     try:
-        req = urllib.request.Request(
-            SUB_URL,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; BrickSubTester/1.0)"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            raw_data = resp.read()
-    except Exception as e:
-        print(f"Error fetching subscription: {e}")
-        sys.exit(1)
-
-    try:
+        raw_data = fetch_subscription_data()
         decoded = base64.b64decode(raw_data).decode("utf-8", errors="ignore")
     except Exception as e:
-        print(f"Error decoding base64 subscription: {e}")
+        print(f"Error fetching/decoding subscription: {e}")
         sys.exit(1)
 
     raw_lines = [l.strip() for l in decoded.splitlines() if l.strip()]
 
-    # Step 3: parse nodes
     parsed_nodes = []
     error_counts = {}
     for idx, line in enumerate(raw_lines):
@@ -422,48 +446,52 @@ def main():
             if ob:
                 parsed_nodes.append((name, ob))
             else:
-                error_counts["Parse Unsupported"] = (
-                    error_counts.get("Parse Unsupported", 0) + 1
-                )
+                error_counts["Parse Unsupported"] = error_counts.get("Parse Unsupported", 0) + 1
         except Exception:
-            error_counts["Parse Exception"] = (
-                error_counts.get("Parse Exception", 0) + 1
-            )
+            error_counts["Parse Exception"] = error_counts.get("Parse Exception", 0) + 1
 
-    # Step 4: test in small batches
     working_nodes = []
+    failed_nodes = []
+    proto_stats = {"SS": [0, 0], "VLESS": [0, 0], "VMess": [0, 0], "Trojan": [0, 0]}
     base_port = 24000
+
     for i in range(0, len(parsed_nodes), BATCH_SIZE):
         batch = parsed_nodes[i : i + BATCH_SIZE]
         results = test_batch(batch, base_port + (i % 100))
-        for name, ok, lat, err in results:
+        for name, ok, lat, err, ob in results:
+            proto = ob.get("_proto", "Other")
+            if proto in proto_stats:
+                proto_stats[proto][1] += 1
             if ok:
                 working_nodes.append((name, lat))
+                if proto in proto_stats:
+                    proto_stats[proto][0] += 1
             else:
                 error_counts[err] = error_counts.get(err, 0) + 1
+                failed_nodes.append((proto, ob.get("_host", ""), ob.get("_sni", ""), err))
 
-    # Step 5: print concise <=15-line summary
     total = len(raw_lines)
     w_count = len(working_nodes)
     w_pct = (w_count / total * 100) if total > 0 else 0.0
-    avg_lat = (
-        int(sum(lat for _, lat in working_nodes) / w_count) if w_count > 0 else 0
-    )
+    avg_lat = int(sum(lat for _, lat in working_nodes) / w_count) if w_count > 0 else 0
 
     working_nodes.sort(key=lambda x: x[1])
     top_working = working_nodes[:5]
 
     top_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-    err_str = (
-        ", ".join(f"{cat}: {cnt}" for cat, cnt in top_errors)
-        if top_errors
-        else "None"
-    )
+    err_str = ", ".join(f"{cat}: {cnt}" for cat, cnt in top_errors) if top_errors else "None"
+    proto_str = ", ".join(f"{p}={w}/{t}" for p, (w, t) in proto_stats.items() if t > 0)
 
     print("=== Subscription Test Summary (Direct IR wlan0) ===")
     print(f"Total nodes: {total} | Working: {w_count} ({w_pct:.1f}%)")
+    print(f"Working by protocol: {proto_str}")
     print(f"Average latency: {avg_lat} ms")
     print(f"Top error categories: {err_str}")
+    if failed_nodes:
+        print("Sample failing nodes (up to 5):")
+        for p, h, s, e in failed_nodes[:5]:
+            sni_info = f" sni={s}" if s and s != h else ""
+            print(f"  - [{p}] host={h}{sni_info} ({e})")
     print("Top working nodes:")
     if top_working:
         for i, (name, lat) in enumerate(top_working, 1):
