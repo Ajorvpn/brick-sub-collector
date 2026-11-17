@@ -12,8 +12,8 @@ from concurrent.futures import ThreadPoolExecutor
 SING_BOX = os.path.expanduser("~/.local/bin/sing-box-direct")
 SUB_URL = "https://raw.githubusercontent.com/Ajorvpn/brick-sub-collector/sub/sub.txt"
 TRACE_URL = "https://cloudflare.com/cdn-cgi/trace"
-PROBE_URL = "https://www.google.com/generate_204"
-TIMEOUT_SECS = 5
+PROBE_URL = "https://cloudflare.com/cdn-cgi/trace"
+TIMEOUT_SECS = 6
 BATCH_SIZE = 8
 
 CLEAN_ENV = os.environ.copy()
@@ -266,16 +266,14 @@ def parse_link_to_outbound(link, tag):
 
 
 def probe_node_port(port):
-    """Probe HTTPS generate_204 on port 443 with full TLS handshake validation."""
+    """Probe full data-plane request to https://cloudflare.com/cdn-cgi/trace via proxy."""
     try:
         res = run_cmd(
             [
                 "curl",
                 "-s",
-                "-o",
-                "/dev/null",
                 "-w",
-                "%{http_code}:%{time_total}",
+                "\n%{http_code}:%{time_total}",
                 "-m",
                 str(TIMEOUT_SECS),
                 "-x",
@@ -285,10 +283,21 @@ def probe_node_port(port):
             timeout=TIMEOUT_SECS + 2,
         )
         if res.returncode == 0:
-            parts = res.stdout.strip().split(":")
-            if len(parts) == 2 and parts[0] in ("204", "200"):
-                return True, int(float(parts[1]) * 1000), "OK"
-            return False, 0, f"HTTP {parts[0]}" if parts else "HTTP Error"
+            output = res.stdout.strip()
+            lines = output.splitlines()
+            if not lines:
+                return False, 0, "Empty Response"
+            status_line = lines[-1].strip()
+            body = "\n".join(lines[:-1])
+            parts = status_line.split(":")
+            if len(parts) == 2:
+                http_code, total_time = parts[0], parts[1]
+                if http_code == "200":
+                    if "ip=" in body and "loc=" in body:
+                        return True, int(float(total_time) * 1000), "OK"
+                    return False, 0, "Invalid Trace Body"
+                return False, 0, f"HTTP {http_code}"
+            return False, 0, "Malformed Status"
         elif res.returncode == 28:
             return False, 0, "Timeout"
         elif res.returncode in (7, 52, 56):
