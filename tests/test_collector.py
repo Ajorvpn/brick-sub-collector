@@ -1015,12 +1015,12 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
 
 
 class TestSourcesFile(unittest.TestCase):
-    """S1: sources.txt holds exactly one verified source: iran_top100_checked.txt."""
+    """S1: sources.txt holds 4 verified sources from OpenRay."""
 
     def test_no_dead_urls(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 2)
+        self.assertEqual(len(urls), 4)
         expected_0 = (
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output_iran/iran_top100_checked.txt"
@@ -1029,24 +1029,34 @@ class TestSourcesFile(unittest.TestCase):
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output/site_access/aistudio_iran_verified.txt"
         )
+        expected_2 = (
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/mci_top100.txt"
+        )
+        expected_3 = (
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/irancell_top100.txt"
+        )
         self.assertEqual(urls[0], expected_0)
         self.assertEqual(urls[1], expected_1)
+        self.assertEqual(urls[2], expected_2)
+        self.assertEqual(urls[3], expected_3)
 
     def test_iran_verified_feeds_occupy_the_first_six_lines(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 2)
+        self.assertEqual(len(urls), 4)
         for u in urls:
             iran_ok, tags = collector.classify_source_url(u)
             self.assertTrue(iran_ok)
-            self.assertEqual(tags, {"mci", "irancell"})
+            self.assertTrue(tags.intersection({"mci", "irancell"}))
 
     def test_keeps_working_high_yield_mirrors(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 2)
-        self.assertIn("sakha1370/OpenRay", urls[0])
-        self.assertIn("sakha1370/OpenRay", urls[1])
+        self.assertEqual(len(urls), 4)
+        for u in urls:
+            self.assertIn("sakha1370/OpenRay", u)
 
 
 class TestHtmlEntityLinks(unittest.TestCase):
@@ -1480,13 +1490,21 @@ class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
             self.assertIn("5.5.5.5", f.read())
 
     def test_unsupported_xhttp_and_splithttp_rejected(self):
-        for net in ("xhttp", "splithttp", "kcp", "mkcp", "quic"):
+        for net in ("kcp", "mkcp", "quic"):
             self.assertIsNone(
                 collector.parse_node_info(
                     f"vless://uuid@1.2.3.4:443?security=tls&type={net}#x"
                 ),
                 f"transport {net} must be rejected",
             )
+
+        for net in ("xhttp", "splithttp"):
+            node = collector.parse_node_info(
+                f"vless://uuid@1.2.3.4:443?security=tls&sni=example.com&type={net}#x"
+            )
+            self.assertIsNotNone(node, f"transport {net} must be accepted")
+            self.assertEqual(node.network, net)
+            self.assertTrue(collector.is_main_pool_eligible(node))
 
         raw_node = collector.parse_node_info(
             "vless://uuid@1.2.3.4:443?security=tls&type=raw#x"
@@ -2051,6 +2069,20 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             shaped = collector.shape_node_for_iran(node, 1)
             self.assertIn(f"fp={fp}", shaped, fp)
 
+    def test_shape_node_rewrites_chrome_fp_to_firefox(self):
+        node = self._vless_tls_node("&fp=chrome")
+        shaped = collector.shape_node_for_iran(node, 1)
+        self.assertIn("fp=firefox", shaped)
+        self.assertNotIn("fp=chrome", shaped)
+
+        # REALITY without fp gets fp=firefox appended
+        reality = collector.parse_node_info(
+            "vless://uuid@1.2.3.4:443?security=reality&sni=example.com"
+            "&pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU&sid=1234&type=tcp#r"
+        )
+        shaped_r = collector.shape_node_for_iran(reality, 1)
+        self.assertIn("fp=firefox", shaped_r)
+
     def test_raw_ip_tls_node_without_domain_sni_excluded_from_main_pool(self):
         raw_trojan = collector.parse_node_info(
             "trojan://pass@216.152.147.7:443?security=tls#CA"
@@ -2416,7 +2448,7 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws_stream["tlsSettings"]["serverName"], "b.example")
         # Xray 26.2.6+ removed allowInsecure from tlsSettings entirely.
         self.assertNotIn("allowInsecure", ws_stream["tlsSettings"])
-        self.assertEqual(ws_stream["tlsSettings"]["fingerprint"], "chrome")
+        self.assertEqual(ws_stream["tlsSettings"]["fingerprint"], "firefox")
         self.assertEqual(ws_stream["wsSettings"]["path"], "/ws")
         self.assertEqual(ws_stream["wsSettings"]["headers"]["Host"], "b.example")
 
@@ -2567,7 +2599,7 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("allowInsecure", json.dumps(outbound))
             tls_settings = outbound["streamSettings"]["tlsSettings"]
             self.assertNotIn("allowInsecure", tls_settings)
-            self.assertEqual(tls_settings["fingerprint"], "chrome")
+            self.assertEqual(tls_settings["fingerprint"], "firefox")
             self.assertTrue(tls_settings["serverName"])
 
     def test_build_xray_outbound_strips_flow_on_non_tcp_transports(self):
@@ -3382,15 +3414,17 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         ss_link = "ss://aes-256-gcm:pw@82.38.31.5:8080#ss"
         ss = self._node(ss_link, country="NL", quality=10.0)
         ss.iran_verified = True
-        self.assertTrue(collector.is_main_pool_eligible(ss))
+        self.assertFalse(collector.is_main_pool_eligible(ss))
 
         vmess_cfg = {
             "add": "51.158.206.29",
-            "port": 1800,
+            "port": 443,
             "id": "uuid-v",
             "aid": 0,
             "scy": "auto",
             "net": "tcp",
+            "tls": "tls",
+            "sni": "example.com",
         }
         vmess = self._node(
             "vmess://"
@@ -3400,6 +3434,14 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         )
         vmess.iran_verified = True
         self.assertTrue(collector.is_main_pool_eligible(vmess))
+
+        vless_xhttp = self._node(
+            "vless://uuid-x@51.158.206.30:443?security=tls&sni=example.com&type=xhttp#vless",
+            country="NL",
+            quality=15.0,
+        )
+        vless_xhttp.iran_verified = True
+        self.assertTrue(collector.is_main_pool_eligible(vless_xhttp))
 
         # An unverified plaintext Shadowsocks node stays out of the main pool.
         unverified_ss = self._node(ss_link, country="NL", quality=30.0)
@@ -3426,18 +3468,19 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             patch.start()
         try:
             collector.write_all_outputs(
-                {"NL": [ss, vmess, unverified_ss]},
-                {"ss": [ss], "vmess": [vmess]},
+                {"NL": [vless_xhttp, vmess, ss]},
+                {"vless": [vless_xhttp], "vmess": [vmess], "ss": [ss]},
                 total_tested=3,
                 total_passed=3,
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
             self.assertEqual(len(lines), 2)
-            ss_lines = [ln for ln in lines if "| SS |" in ln]
-            self.assertEqual(len(ss_lines), 1)
-            self.assertIn("Netherlands 01 | SS |", ss_lines[0])
-            self.assertIn("| BrickVPN", ss_lines[0])
+            vless_lines = [ln for ln in lines if ln.startswith("vless://")]
+            self.assertEqual(len(vless_lines), 1)
+            self.assertIn("Netherlands 01 | VLESS |", vless_lines[0])
+            self.assertIn("| BrickVPN", vless_lines[0])
+            self.assertIn("type=xhttp", vless_lines[0])
             vmess_lines = [ln for ln in lines if ln.startswith("vmess://")]
             self.assertEqual(len(vmess_lines), 1)
             payload = vmess_lines[0][len("vmess://"):]

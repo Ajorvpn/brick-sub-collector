@@ -140,8 +140,8 @@ BLOCKED_PORTS: Set[int] = {
 # main subscription (80/8080/8008 are plain HTTP, the rest are abused proxies).
 PLAINTEXT_AND_ABUSED_PORTS: Set[int] = {80, 8080, 8008, 8880, 8388, 19999}
 
-# Transports sing-box cannot consume; a node using one is useless downstream.
-UNSUPPORTED_TRANSPORTS: Set[str] = {"xhttp", "splithttp", "kcp", "mkcp", "quic"}
+# Transports sing-box/Xray cannot consume; a node using one is useless downstream.
+UNSUPPORTED_TRANSPORTS: Set[str] = {"kcp", "mkcp", "quic"}
 
 # Ports a TLS proxy endpoint is realistically served on (ranking preference).
 PREFERRED_TLS_PORTS: Set[int] = {443, 8443, 2053, 2083, 2087, 2096}
@@ -513,15 +513,14 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
 
 
 def is_main_pool_eligible(node: NodeInfo) -> bool:
-    """Encrypted-only, sing-box compatible nodes may enter the main pool.
+    """Encrypted-only, sing-box/Xray compatible nodes may enter the main pool.
 
-    A TLS node that connects to a raw IP *and* carries no domain SNI can never
-    verify a certificate in Xray (``x509: certificate signed by unknown
-    authority``) and has no camouflage name, so it is excluded here wherever it
-    came from.
+    Excludes 30-second zombie protocols (raw ss:// and plaintext vmess://),
+    requiring TLS/REALITY and protocol in (vless, trojan, vmess).
     """
-    # Plaintext VLESS makes Xray 26.9.9 exit before it starts a single tunnel.
-    if node.protocol == "vless" and not node.tls_enabled:
+    if not node.tls_enabled:
+        return False
+    if node.protocol not in ("vless", "trojan", "vmess"):
         return False
     if _is_decoy_connect_host(node.host):
         return False
@@ -530,27 +529,23 @@ def is_main_pool_eligible(node: NodeInfo) -> bool:
         and is_blocked_cloudflare_ip(node.resolved_ip)
     ):
         return False
-    if (node.sni or "").strip().lower() == "gateway.icloud.com":
+    # Reject proven dead Iran endpoints from ls1_10.txt
+    host = (node.host or "").strip()
+    resolved = getattr(node, "resolved_ip", None) or ""
+    if host == "185.226.172.8" or resolved == "185.226.172.8":
+        return False
+    sni_lower = (node.sni or "").strip().lower()
+    if sni_lower == "gateway.icloud.com":
+        return False
+    if (host.startswith("169.40.42.") or resolved.startswith("169.40.42.")) and sni_lower.endswith("yahoo.com"):
         return False
     if not _port_allowed(node.port):
         return False
-
-    verified = bool(
-        getattr(node, "iran_verified", False)
-        or getattr(node, "top_iran_tier", False)
-    )
-    if not node.tls_enabled:
-        # Shadowsocks and AEAD VMess are natively supported by Xray/sing-box and
-        # are 30+ of the fastest inside-Iran rows; an inside-Iran feed must have
-        # vouched for them, because generic plaintext collectors ship junk.
-        return verified and node.protocol in ("ss", "vmess")
-
-    if node.protocol not in ("vless", "trojan", "vmess"):
-        return False
     if node.port in PLAINTEXT_AND_ABUSED_PORTS:
         return False
-    sni = (node.sni or "").strip()
-    return bool(sni) and not _is_ip_literal(sni)
+    if not sni_lower or _is_ip_literal(sni_lower):
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1752,7 +1747,7 @@ def _xray_network(value: str) -> str:
         return "tcp"
     if net == "http":
         return "h2"
-    if net in ("ws", "httpupgrade", "grpc", "h2"):
+    if net in ("ws", "httpupgrade", "grpc", "h2", "xhttp", "splithttp"):
         return net
     return "tcp"
 
@@ -1846,6 +1841,13 @@ def _xray_stream_network_settings(
                 "host": [host_header] if host_header else [],
             }
         }
+    if network in ("xhttp", "splithttp"):
+        return {
+            "xhttpSettings": {
+                "path": path or "/",
+                "host": host_header,
+            }
+        }
     return {}
 
 
@@ -1879,7 +1881,7 @@ def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
         # whole process at startup (migrated to "pinnedPeerCertSha256").
         stream["tlsSettings"] = {
             "serverName": sni or address,
-            "fingerprint": str(cfg.get("fp") or "chrome"),
+            "fingerprint": str(cfg.get("fp") or "firefox"),
         }
     stream.update(
         _xray_stream_network_settings(
@@ -1965,7 +1967,7 @@ def build_xray_outbound_for_node(
         # Xray 26.2.6+ removed "allowInsecure"; including it aborts startup.
         tls_settings: Dict[str, Any] = {
             "serverName": sni,
-            "fingerprint": params.get("fp") or "chrome",
+            "fingerprint": params.get("fp") or "firefox",
         }
         alpn_values = [
             a.strip() for a in (params.get("alpn") or "").split(",") if a.strip()
@@ -1984,7 +1986,7 @@ def build_xray_outbound_for_node(
             return None
         stream["realitySettings"] = {
             "serverName": sni,
-            "fingerprint": params.get("fp") or "chrome",
+            "fingerprint": params.get("fp") or "firefox",
             "publicKey": clean_pbk,
             "shortId": _xray_reality_short_id(raw_sid),
             "spiderX": _xray_reality_spider_x(unquote(params.get("spx") or "")),
@@ -2672,11 +2674,28 @@ def shape_node_for_iran(
             raw,
             flags=re.IGNORECASE,
         )
+        raw = re.sub(
+            r"([?&]fp=)chrome\b",
+            r"\1firefox",
+            raw,
+            flags=re.IGNORECASE,
+        )
         while "&&" in raw:
             raw = raw.replace("&&", "&")
         raw = raw.replace("?&", "?").replace("?#", "#").replace("&#", "#")
         if raw.endswith("?") or raw.endswith("&"):
             raw = raw[:-1]
+        is_reality = (node.security == "reality") or bool(
+            re.search(r"[?&]security=reality\b", raw, flags=re.IGNORECASE)
+        )
+        if is_reality and not re.search(r"[?&]fp=[^&#]*", raw, flags=re.IGNORECASE):
+            if "#" in raw:
+                base_part, frag_part = raw.split("#", 1)
+                sep = "&" if "?" in base_part else "?"
+                raw = f"{base_part}{sep}fp=firefox#{frag_part}"
+            else:
+                sep = "&" if "?" in raw else "?"
+                raw = f"{raw}{sep}fp=firefox"
     elif node.protocol == "vmess" and raw.startswith("vmess://"):
         try:
             b64_part = raw[8:]
@@ -2699,6 +2718,8 @@ def shape_node_for_iran(
                 "verify_cert",
             ):
                 cfg.pop(key, None)
+            if str(cfg.get("fp", "")).lower() == "chrome":
+                cfg["fp"] = "firefox"
             new_b64 = base64.b64encode(
                 json.dumps(cfg, separators=(",", ":")).encode("utf-8")
             ).decode("ascii")
@@ -2741,11 +2762,28 @@ def rename_node(
                 raw,
                 flags=re.IGNORECASE,
             )
+            raw = re.sub(
+                r"([?&]fp=)chrome\b",
+                r"\1firefox",
+                raw,
+                flags=re.IGNORECASE,
+            )
             while "&&" in raw:
                 raw = raw.replace("&&", "&")
             raw = raw.replace("?&", "?").replace("?#", "#").replace("&#", "#")
             if raw.endswith("?") or raw.endswith("&"):
                 raw = raw[:-1]
+            is_reality = (node.security == "reality") or bool(
+                re.search(r"[?&]security=reality\b", raw, flags=re.IGNORECASE)
+            )
+            if is_reality and not re.search(r"[?&]fp=[^&#]*", raw, flags=re.IGNORECASE):
+                if "#" in raw:
+                    base_part, frag_part = raw.split("#", 1)
+                    sep = "&" if "?" in base_part else "?"
+                    raw = f"{base_part}{sep}fp=firefox#{frag_part}"
+                else:
+                    sep = "&" if "?" in raw else "?"
+                    raw = f"{raw}{sep}fp=firefox"
         elif node.protocol == "vmess" and raw.startswith("vmess://"):
             try:
                 b64_part = raw[8:]
@@ -2768,6 +2806,8 @@ def rename_node(
                     "verify_cert",
                 ):
                     cfg.pop(key, None)
+                if str(cfg.get("fp", "")).lower() == "chrome":
+                    cfg["fp"] = "firefox"
                 new_b64 = base64.b64encode(
                     json.dumps(cfg, separators=(",", ":")).encode("utf-8")
                 ).decode("ascii")
