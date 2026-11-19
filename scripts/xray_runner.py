@@ -55,16 +55,16 @@ def start_wlan0_bridge() -> Tuple[subprocess.Popen, str]:
         stop_process(None, cfg_file)
         sys.exit(f"ABORT: sing-box config check failed: {chk.stderr}")
     proc = subprocess.Popen([SING_BOX_PATH, "run", "-c", cfg_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=CLEAN_ENV)
-    time.sleep(0.7)
-    try:
-        res = run_cmd(["curl", "-s", "-m", "5", "-x", f"socks5h://127.0.0.1:{BRIDGE_PORT}", TRACE_URL], timeout=7)
-        if not any(l.strip() == "loc=IR" for l in res.stdout.splitlines()):
-            stop_process(proc, cfg_file)
-            sys.exit("ABORT: wlan0 bridge check failed (loc=IR not returned)")
-    except Exception as e:
-        stop_process(proc, cfg_file)
-        sys.exit(f"ABORT: wlan0 bridge check failed: {e}")
-    return proc, cfg_file
+    time.sleep(0.8)
+    for _ in range(3):
+        try:
+            res = run_cmd(["curl", "-s", "-m", "7", "-x", f"socks5h://127.0.0.1:{BRIDGE_PORT}", TRACE_URL], timeout=9)
+            if any(l.strip() == "loc=IR" for l in res.stdout.splitlines()):
+                return proc, cfg_file
+        except Exception: pass
+        time.sleep(0.5)
+    stop_process(proc, cfg_file)
+    sys.exit("ABORT: wlan0 bridge check failed (loc=IR not returned)")
 def build_xray_batch_config(nodes: List[collector.NodeInfo], base_port: int) -> Tuple[Dict[str, Any], List[Tuple[collector.NodeInfo, int]]]:
     inbounds, outbounds, rules, paired = [], [], [], []
     bridge_ob = {"protocol": "socks", "tag": "wlan0-bridge", "settings": {"servers": [{"address": "127.0.0.1", "port": BRIDGE_PORT}]}}
