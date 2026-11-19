@@ -1,517 +1,243 @@
 #!/usr/bin/env python3
-import os
-import sys
-import json
-import base64
-import urllib.parse
-import urllib.request
-import subprocess
-import time
-from concurrent.futures import ThreadPoolExecutor
+"""Modular 2-stage 60-second non-Cloudflare zombie-trap tester."""
 
-SING_BOX = os.path.expanduser("~/.local/bin/sing-box-direct")
-SUB_URL = "https://raw.githubusercontent.com/Ajorvpn/brick-sub-collector/sub/sub.txt"
+from __future__ import annotations
+
+import argparse, base64, collections, json, os, select, shutil, subprocess, sys, threading, time, urllib.request
+from typing import Any, Dict, List, Optional, Tuple
+
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
+for p in (REPO_DIR, SCRIPTS_DIR):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+import collector, zombie_metrics
+
+SING_BOX_PATH = os.path.expanduser("~/.local/bin/sing-box-direct")
+BRIDGE_PORT = 19990
 TRACE_URL = "https://cloudflare.com/cdn-cgi/trace"
-PROBE_URL = "https://cloudflare.com/cdn-cgi/trace"
-TIMEOUT_SECS = 6
-BATCH_SIZE = 8
-
-CLEAN_ENV = os.environ.copy()
-for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]:
-    CLEAN_ENV.pop(k, None)
+G204_URL = "https://www.google.com/generate_204"
+STREAM_URL = "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+CLEAN_ENV = {k: v for k, v in os.environ.items() if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
 
 
-def run_cmd(cmd, env=None, timeout=None):
-    return subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env or CLEAN_ENV,
-        timeout=timeout,
-    )
+def run_cmd(cmd: List[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=CLEAN_ENV, timeout=timeout)
 
 
-def sanity_check_iran():
-    """Verify that direct outbound on wlan0 bypasses TUN and is on IR network."""
+def find_xray_bin() -> str:
+    for p in ("/usr/bin/xray", "/home/bellard/Documents/v2rayN-linux-64/xray", "/opt/v2rayN/xray"):
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    found = shutil.which("xray")
+    if found:
+        return found
+    raise FileNotFoundError("xray binary not found")
+
+
+def start_wlan0_bridge() -> subprocess.Popen:
     cfg = {
         "log": {"level": "warn"},
-        "dns": {
-            "servers": [
-                {
-                    "type": "udp",
-                    "tag": "dns-direct",
-                    "server": "1.1.1.1",
-                    "detour": "direct",
-                    "bind_interface": "wlan0",
-                }
-            ]
-        },
-        "inbounds": [
-            {
-                "type": "mixed",
-                "tag": "sanity-in",
-                "listen": "127.0.0.1",
-                "listen_port": 19998,
-            }
-        ],
+        "dns": {"servers": [{"type": "udp", "tag": "dns-direct", "server": "1.1.1.1", "detour": "direct", "bind_interface": "wlan0"}]},
+        "inbounds": [{"type": "mixed", "tag": "socks-in", "listen": "127.0.0.1", "listen_port": BRIDGE_PORT}],
         "outbounds": [{"type": "direct", "tag": "direct", "bind_interface": "wlan0"}],
     }
-    cfg_file = "/tmp/sb_sanity.json"
-    with open(cfg_file, "w") as f:
+    cfg_file = "/tmp/sb_wlan0_bridge.json"
+    with open(cfg_file, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
-
-    check = run_cmd([SING_BOX, "check", "-c", cfg_file])
-    if check.returncode != 0:
-        print("ABORT: not on direct IR network (sing-box sanity check failed)")
-        sys.exit(1)
-
-    proc = subprocess.Popen(
-        [SING_BOX, "run", "-c", cfg_file],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=CLEAN_ENV,
-    )
+    proc = subprocess.Popen([SING_BOX_PATH, "run", "-c", cfg_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=CLEAN_ENV)
     time.sleep(0.8)
     try:
-        curl_res = run_cmd(
-            [
-                "curl",
-                "-s",
-                "-m",
-                str(TIMEOUT_SECS),
-                "-x",
-                "socks5h://127.0.0.1:19998",
-                TRACE_URL,
-            ],
-            timeout=TIMEOUT_SECS + 2,
-        )
-        output = curl_res.stdout
-        is_ir = any(line.strip() == "loc=IR" for line in output.splitlines())
-        if not is_ir:
-            print("ABORT: not on direct IR network")
-            sys.exit(1)
-    except Exception:
-        print("ABORT: not on direct IR network")
-        sys.exit(1)
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except Exception:
+        res = run_cmd(["curl", "-s", "-m", "5", "-x", f"socks5h://127.0.0.1:{BRIDGE_PORT}", TRACE_URL], timeout=7)
+        if not any(l.strip() == "loc=IR" for l in res.stdout.splitlines()):
             proc.kill()
-
-
-def parse_link_to_outbound(link, tag):
-    scheme = link.split("://", 1)[0].lower()
-    clean = link
-    if scheme == "ss":
-        rest = clean[5:]
-        if "#" in rest:
-            rest, _ = rest.split("#", 1)
-        if "?" in rest:
-            rest, _ = rest.split("?", 1)
-        if "@" in rest:
-            user_b64, server_part = rest.split("@", 1)
-            pad = len(user_b64) % 4
-            if pad:
-                user_b64 += "=" * (4 - pad)
-            user_dec = base64.b64decode(user_b64).decode("utf-8", errors="ignore")
-            method, password = user_dec.split(":", 1)
-            host, port = server_part.rsplit(":", 1)
-        else:
-            pad = len(rest) % 4
-            if pad:
-                rest += "=" * (4 - pad)
-            dec = base64.b64decode(rest).decode("utf-8", errors="ignore")
-            if "?" in dec:
-                dec, _ = dec.split("?", 1)
-            user_part, server_part = dec.split("@", 1)
-            method, password = user_part.split(":", 1)
-            host, port = server_part.rsplit(":", 1)
-        if "/" in port:
-            port = port.split("/", 1)[0]
-        return {
-            "type": "shadowsocks",
-            "tag": tag,
-            "server": host,
-            "server_port": int(port),
-            "method": method,
-            "password": password,
-            "bind_interface": "wlan0",
-            "_proto": "SS",
-            "_host": host,
-            "_sni": "",
-        }
-    elif scheme == "vmess":
-        rest = clean[8:]
-        b64 = rest.split("#", 1)[0]
-        pad = len(b64) % 4
-        if pad:
-            b64 += "=" * (4 - pad)
-        cfg = json.loads(base64.b64decode(b64).decode("utf-8", errors="ignore"))
-        host = cfg.get("add", "")
-        port = int(cfg.get("port", 0))
-        uuid = cfg.get("id", "")
-        alter_id = int(cfg.get("aid", 0) or 0)
-        net = cfg.get("net", "").lower()
-        tls_enabled = str(cfg.get("tls", "")).lower() == "tls"
-        sni = cfg.get("sni") or cfg.get("host") or host
-        path = cfg.get("path", "")
-        ob = {
-            "type": "vmess",
-            "tag": tag,
-            "server": host,
-            "server_port": port,
-            "uuid": uuid,
-            "security": cfg.get("scy", "auto") or "auto",
-            "alter_id": alter_id,
-            "bind_interface": "wlan0",
-            "_proto": "VMess",
-            "_host": host,
-            "_sni": sni if tls_enabled else "",
-        }
-        if tls_enabled:
-            ob["tls"] = {"enabled": True, "server_name": sni, "insecure": True}
-            fp = cfg.get("fp")
-            if fp:
-                ob["tls"]["utls"] = {"enabled": True, "fingerprint": fp}
-        if net == "ws":
-            ws_headers = {}
-            if cfg.get("host"):
-                ws_headers["Host"] = cfg["host"]
-            ob["transport"] = {
-                "type": "ws",
-                "path": path or "/",
-                "headers": ws_headers,
-            }
-        elif net == "grpc":
-            ob["transport"] = {
-                "type": "grpc",
-                "service_name": cfg.get("path", "") or cfg.get("serviceName", ""),
-            }
-        elif net == "httpupgrade":
-            ob["transport"] = {
-                "type": "httpupgrade",
-                "path": path or "/",
-                "host": cfg.get("host", ""),
-            }
-        return ob
-    elif scheme in ("vless", "trojan"):
-        u = urllib.parse.urlsplit(clean)
-        params = dict(urllib.parse.parse_qsl(u.query))
-        host = u.hostname
-        port = u.port
-        user = u.username or u.path.lstrip("/")
-        sec = params.get("security", "").lower()
-        net = params.get("type", "").lower()
-        sni = params.get("sni") or params.get("host") or host
-        fp = params.get("fp", "chrome")
-        flow = params.get("flow", "")
-        proto_tag = "VLESS" if scheme == "vless" else "Trojan"
-        ob = {
-            "type": scheme,
-            "tag": tag,
-            "server": host,
-            "server_port": port,
-            "bind_interface": "wlan0",
-            "_proto": proto_tag,
-            "_host": host,
-            "_sni": sni,
-        }
-        if scheme == "vless":
-            ob["uuid"] = user
-            if flow:
-                ob["flow"] = flow
-        else:
-            ob["password"] = user
-
-        if sec in ("tls", "reality") or scheme == "trojan":
-            tls_cfg = {"enabled": True, "server_name": sni, "insecure": True}
-            if fp:
-                tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
-            alpn = [a.strip() for a in params.get("alpn", "").split(",") if a.strip()]
-            if alpn:
-                tls_cfg["alpn"] = alpn
-            if sec == "reality":
-                tls_cfg["reality"] = {
-                    "enabled": True,
-                    "public_key": params.get("pbk", ""),
-                    "short_id": params.get("sid", ""),
-                }
-            ob["tls"] = tls_cfg
-
-        if net == "ws":
-            headers = {}
-            if params.get("host"):
-                headers["Host"] = params["host"]
-            ob["transport"] = {
-                "type": "ws",
-                "path": params.get("path", "/"),
-                "headers": headers,
-            }
-        elif net == "grpc":
-            ob["transport"] = {
-                "type": "grpc",
-                "service_name": params.get("serviceName", ""),
-            }
-        elif net == "httpupgrade":
-            ob["transport"] = {
-                "type": "httpupgrade",
-                "path": params.get("path", "/"),
-                "host": params.get("host", ""),
-            }
-        return ob
-    return None
-
-
-def probe_node_port(port):
-    """Probe full data-plane request to https://cloudflare.com/cdn-cgi/trace via proxy."""
-    try:
-        res = run_cmd(
-            [
-                "curl",
-                "-s",
-                "-w",
-                "\n%{http_code}:%{time_total}",
-                "-m",
-                str(TIMEOUT_SECS),
-                "-x",
-                f"socks5h://127.0.0.1:{port}",
-                PROBE_URL,
-            ],
-            timeout=TIMEOUT_SECS + 2,
-        )
-        if res.returncode == 0:
-            output = res.stdout.strip()
-            lines = output.splitlines()
-            if not lines:
-                return False, 0, "Empty Response"
-            status_line = lines[-1].strip()
-            body = "\n".join(lines[:-1])
-            parts = status_line.split(":")
-            if len(parts) == 2:
-                http_code, total_time = parts[0], parts[1]
-                if http_code == "200":
-                    if "ip=" in body and "loc=" in body:
-                        return True, int(float(total_time) * 1000), "OK"
-                    return False, 0, "Invalid Trace Body"
-                return False, 0, f"HTTP {http_code}"
-            return False, 0, "Malformed Status"
-        elif res.returncode == 28:
-            return False, 0, "Timeout"
-        elif res.returncode in (7, 52, 56):
-            return False, 0, "Connection Error"
-        elif res.returncode == 35:
-            return False, 0, "TLS Handshake Error"
-        elif res.returncode == 60:
-            return False, 0, "SSL Cert Error"
-        elif res.returncode == 97:
-            return False, 0, "Proxy Handshake Error"
-        else:
-            return False, 0, f"Curl Error {res.returncode}"
-    except subprocess.TimeoutExpired:
-        return False, 0, "Timeout"
+            sys.exit("ABORT: wlan0 bridge check failed (loc=IR not returned)")
     except Exception as e:
-        return False, 0, type(e).__name__
+        proc.kill()
+        sys.exit(f"ABORT: wlan0 bridge check failed: {e}")
+    return proc
 
 
-def test_batch(batch_items, start_port):
-    """Test a batch of nodes concurrently via a single sing-box process."""
-    inbounds = []
-    outbounds = []
-    rules = []
-
-    for idx, (node_name, ob) in enumerate(batch_items):
-        port = start_port + idx
-        in_tag = f"in-{idx}"
-        ob_tag = ob["tag"]
-        inbounds.append(
-            {
-                "type": "mixed",
-                "tag": in_tag,
-                "listen": "127.0.0.1",
-                "listen_port": port,
-            }
-        )
-        # copy dict without internal underscore keys
-        clean_ob = {k: v for k, v in ob.items() if not k.startswith("_")}
-        outbounds.append(clean_ob)
-        rules.append({"inbound": [in_tag], "outbound": ob_tag})
-
-    outbounds.append({"type": "direct", "tag": "direct", "bind_interface": "wlan0"})
-    cfg = {
-        "log": {"level": "warn"},
-        "dns": {
-            "servers": [
-                {
-                    "type": "udp",
-                    "tag": "dns-direct",
-                    "server": "1.1.1.1",
-                    "detour": "direct",
-                    "bind_interface": "wlan0",
-                }
-            ]
-        },
-        "inbounds": inbounds,
-        "outbounds": outbounds,
-        "route": {"rules": rules},
-    }
-
-    cfg_file = f"/tmp/sb_batch_{start_port}.json"
-    with open(cfg_file, "w") as f:
-        json.dump(cfg, f)
-
-    chk = run_cmd([SING_BOX, "check", "-c", cfg_file])
-    if chk.returncode != 0:
-        return [
-            (node_name, False, 0, "Config Check Failed", ob)
-            for node_name, ob in batch_items
-        ]
-
-    proc = subprocess.Popen(
-        [SING_BOX, "run", "-c", cfg_file],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        env=CLEAN_ENV,
-    )
-    time.sleep(0.8)
-
-    results = []
+def fetch_sub_nodes() -> List[collector.NodeInfo]:
+    lines: List[str] = []
     try:
-        with ThreadPoolExecutor(max_workers=len(batch_items)) as executor:
-            future_to_info = {
-                executor.submit(probe_node_port, start_port + idx): (batch_items[idx][0], batch_items[idx][1])
-                for idx in range(len(batch_items))
-            }
-            for fut in future_to_info:
-                name, ob = future_to_info[fut]
-                ok, lat, err = fut.result()
-                results.append((name, ok, lat, err, ob))
-    finally:
-        proc.terminate()
-        try:
-            proc.wait(timeout=2)
-        except Exception:
-            proc.kill()
-        try:
-            os.remove(cfg_file)
-        except OSError:
-            pass
-
-    return results
-
-
-def fetch_subscription_data():
-    """Fetch live subscription content: try gh api first to bypass CDN caching."""
-    try:
-        res = subprocess.run(
+        raw_b64 = subprocess.check_output(
             ["gh", "api", "repos/Ajorvpn/brick-sub-collector/contents/sub.txt?ref=sub", "--jq", ".content"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=10,
-        )
-        if res.returncode == 0 and res.stdout.strip():
-            return base64.b64decode(res.stdout.strip())
+            text=True, env=CLEAN_ENV,
+        ).strip()
+        sub_b64 = base64.b64decode(raw_b64).decode("utf-8", errors="replace").strip()
+        lines = [l.strip() for l in base64.b64decode(sub_b64 + "===").decode("utf-8", errors="replace").splitlines() if l.strip()]
     except Exception:
-        pass
+        url = "https://raw.githubusercontent.com/Ajorvpn/brick-sub-collector/sub/sub.txt"
+        with urllib.request.urlopen(url, timeout=10) as r:
+            dec = base64.b64decode(r.read().decode("utf-8").strip() + "===").decode("utf-8", errors="replace")
+            lines = [l.strip() for l in dec.splitlines() if l.strip()]
+    nodes = []
+    for l in lines:
+        n = collector.parse_node_info(l)
+        if n:
+            nodes.append(n)
+    return nodes
 
-    req = urllib.request.Request(
-        SUB_URL,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; BrickSubTester/1.0)"},
-    )
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.read()
+
+def start_xray_batch(batch: List[Tuple[int, collector.NodeInfo]], base_port: int, xray_bin: str) -> Tuple[Optional[subprocess.Popen], str, List[int]]:
+    inbounds, outbounds, rules, ports = [], [], [], []
+    bridge_ob = {"protocol": "socks", "tag": "wlan0-bridge", "settings": {"servers": [{"address": "127.0.0.1", "port": BRIDGE_PORT}]}}
+    for idx, node in batch:
+        port = base_port + idx
+        ob = collector.build_xray_outbound_for_node(node, f"out-{idx}")
+        if not ob:
+            continue
+        ob.setdefault("streamSettings", {}).setdefault("sockopt", {})["dialerProxy"] = "wlan0-bridge"
+        inbounds.append({"tag": f"in-{idx}", "port": port, "listen": "127.0.0.1", "protocol": "socks", "settings": {"auth": "noauth"}})
+        outbounds.append(ob)
+        rules.append({"type": "field", "inboundTag": [f"in-{idx}"], "outboundTag": f"out-{idx}"})
+        ports.append(port)
+
+    if not outbounds:
+        return None, "", []
+    cfg = {"log": {"loglevel": "warning"}, "inbounds": inbounds, "outbounds": outbounds + [bridge_ob], "routing": {"domainStrategy": "AsIs", "rules": rules}}
+    cfg_file = f"/tmp/xray_batch_{base_port}.json"
+    with open(cfg_file, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    proc = subprocess.Popen([xray_bin, "run", "-c", cfg_file], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=CLEAN_ENV)
+    time.sleep(0.8)
+    return proc, cfg_file, ports
 
 
-def main():
-    sanity_check_iran()
+def test_stage1_node(port: int) -> bool:
+    try:
+        t_res = run_cmd(["curl", "-s", "-m", "5", "-x", f"socks5h://127.0.0.1:{port}", TRACE_URL], timeout=6)
+        loc = next((l.split("=", 1)[1].strip() for l in t_res.stdout.splitlines() if l.startswith("loc=")), None)
+        if not loc or loc == "IR":
+            return False
+        g_res = run_cmd(["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "-x", f"socks5h://127.0.0.1:{port}", G204_URL], timeout=6)
+        return g_res.stdout.strip() == "204"
+    except Exception:
+        return False
+
+
+def measure_node_stream(port: int, duration: int, rate_kbps: int) -> Tuple[List[float], bool]:
+    probe_t, probe_ok, samples = max(1, int(duration * 0.67)), False, []
+
+    def run_probe():
+        nonlocal probe_ok
+        p = run_cmd(["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "-x", f"socks5h://127.0.0.1:{port}", G204_URL], timeout=6)
+        probe_ok = (p.stdout.strip() == "204")
+
+    cmd = ["curl", "-s", "-N", "--limit-rate", f"{rate_kbps}k", "-x", f"socks5h://127.0.0.1:{port}", STREAM_URL]
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=CLEAN_ENV)
+    probe_th, start_t = None, time.monotonic()
+
+    for sec in range(duration):
+        sec_start, sec_bytes = time.monotonic(), 0
+        if not probe_th and (sec_start - start_t) >= probe_t:
+            probe_th = threading.Thread(target=run_probe)
+            probe_th.start()
+        while time.monotonic() - sec_start < 1.0:
+            if proc.poll() is not None:
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=CLEAN_ENV)
+            try:
+                r, _, _ = select.select([proc.stdout], [], [], max(0.01, 1.0 - (time.monotonic() - sec_start)))
+                if r:
+                    sec_bytes += len(os.read(proc.stdout.fileno(), 65536))
+            except Exception:
+                time.sleep(0.05)
+        samples.append(sec_bytes / 1024.0)
 
     try:
-        raw_data = fetch_subscription_data()
-        decoded = base64.b64decode(raw_data).decode("utf-8", errors="ignore")
-    except Exception as e:
-        print(f"Error fetching/decoding subscription: {e}")
-        sys.exit(1)
+        proc.terminate()
+        proc.wait(timeout=1)
+    except Exception:
+        proc.kill()
+    if probe_th:
+        probe_th.join(timeout=6)
+    return samples, probe_ok
 
-    raw_lines = [l.strip() for l in decoded.splitlines() if l.strip()]
 
-    parsed_nodes = []
-    error_counts = {}
-    for idx, line in enumerate(raw_lines):
-        name = f"Node #{idx + 1}"
-        if "#" in line:
-            name = urllib.parse.unquote(line.split("#", 1)[1].strip())
-        elif line.startswith("vmess://"):
+def main() -> None:
+    parser = argparse.ArgumentParser(description="2-Stage 60s Zombie-Trap Tester")
+    parser.add_argument("--duration", type=int, default=60)
+    parser.add_argument("--stage1-batch", type=int, default=25)
+    parser.add_argument("--stage2-batch", type=int, default=12)
+    parser.add_argument("--rate-limit-kbps", type=int, default=180)
+    parser.add_argument("--max-nodes", type=int, default=0)
+    args = parser.parse_args()
+
+    xray_bin = find_xray_bin()
+    bridge_proc = start_wlan0_bridge()
+    try:
+        nodes = fetch_sub_nodes()
+        if args.max_nodes > 0:
+            nodes = nodes[: args.max_nodes]
+        stage1_survivors: List[collector.NodeInfo] = []
+
+        # Stage 1
+        for i in range(0, len(nodes), args.stage1_batch):
+            chunk = list(enumerate(nodes[i : i + args.stage1_batch]))
+            xp, cfg_f, ports = start_xray_batch(chunk, 20000 + i, xray_bin)
+            if not xp:
+                continue
             try:
-                b64 = line[8:].split("#", 1)[0]
-                pad = len(b64) % 4
-                if pad:
-                    b64 += "=" * (4 - pad)
-                cfg = json.loads(base64.b64decode(b64).decode("utf-8", errors="ignore"))
-                if "ps" in cfg and cfg["ps"]:
-                    name = str(cfg["ps"]).strip()
-            except Exception:
-                pass
-        try:
-            ob = parse_link_to_outbound(line, f"node-{idx}")
-            if ob:
-                parsed_nodes.append((name, ob))
-            else:
-                error_counts["Parse Unsupported"] = error_counts.get("Parse Unsupported", 0) + 1
-        except Exception:
-            error_counts["Parse Exception"] = error_counts.get("Parse Exception", 0) + 1
+                for (sub_idx, node), port in zip(chunk, ports):
+                    if test_stage1_node(port):
+                        stage1_survivors.append(node)
+            finally:
+                xp.terminate()
+                xp.wait()
+                if os.path.exists(cfg_f):
+                    os.remove(cfg_f)
 
-    working_nodes = []
-    failed_nodes = []
-    proto_stats = {"SS": [0, 0], "VLESS": [0, 0], "VMess": [0, 0], "Trojan": [0, 0]}
-    base_port = 24000
+        # Stage 2
+        stage2_results: List[Dict[str, Any]] = []
+        rejections: collections.Counter[str] = collections.Counter()
+        failing_samples: List[str] = []
 
-    for i in range(0, len(parsed_nodes), BATCH_SIZE):
-        batch = parsed_nodes[i : i + BATCH_SIZE]
-        results = test_batch(batch, base_port + (i % 100))
-        for name, ok, lat, err, ob in results:
-            proto = ob.get("_proto", "Other")
-            if proto in proto_stats:
-                proto_stats[proto][1] += 1
-            if ok:
-                working_nodes.append((name, lat))
-                if proto in proto_stats:
-                    proto_stats[proto][0] += 1
-            else:
-                error_counts[err] = error_counts.get(err, 0) + 1
-                failed_nodes.append((proto, ob.get("_host", ""), ob.get("_sni", ""), err))
+        for i in range(0, len(stage1_survivors), args.stage2_batch):
+            chunk = list(enumerate(stage1_survivors[i : i + args.stage2_batch]))
+            xp, cfg_f, ports = start_xray_batch(chunk, 30000 + i, xray_bin)
+            if not xp:
+                continue
+            try:
+                for (sub_idx, node), port in zip(chunk, ports):
+                    samples, probe_ok = measure_node_stream(port, args.duration, args.rate_limit_kbps)
+                    res = zombie_metrics.evaluate_stream(samples, probe_ok)
+                    if res["passed"]:
+                        stage2_results.append({"node": node, "metrics": res})
+                    else:
+                        rejections[res["reason"]] += 1
+                        if len(failing_samples) < 5:
+                            failing_samples.append(f"{node.host}:{node.port} (sni={node.sni}) -> {res['reason']}")
+            finally:
+                xp.terminate()
+                xp.wait()
+                if os.path.exists(cfg_f):
+                    os.remove(cfg_f)
 
-    total = len(raw_lines)
-    w_count = len(working_nodes)
-    w_pct = (w_count / total * 100) if total > 0 else 0.0
-    avg_lat = int(sum(lat for _, lat in working_nodes) / w_count) if w_count > 0 else 0
+        stage2_results.sort(key=lambda x: x["metrics"]["m_late"], reverse=True)
+        plain_links = [s["node"].original_link for s in stage2_results if s["node"].original_link]
+        with open("/home/bellard/Documents/working_iran_sub.txt", "w", encoding="utf-8") as f:
+            f.write("\n".join(plain_links) + ("\n" if plain_links else ""))
+        with open("/home/bellard/Documents/working_iran_sub_b64.txt", "w", encoding="ascii") as f:
+            f.write(base64.b64encode(("\n".join(plain_links) + ("\n" if plain_links else "")).encode("utf-8")).decode("ascii"))
 
-    working_nodes.sort(key=lambda x: x[1])
-    top_working = working_nodes[:5]
-
-    top_errors = sorted(error_counts.items(), key=lambda x: x[1], reverse=True)[:3]
-    err_str = ", ".join(f"{cat}: {cnt}" for cat, cnt in top_errors) if top_errors else "None"
-    proto_str = ", ".join(f"{p}={w}/{t}" for p, (w, t) in proto_stats.items() if t > 0)
-
-    print("=== Subscription Test Summary (Direct IR wlan0) ===")
-    print(f"Total nodes: {total} | Working: {w_count} ({w_pct:.1f}%)")
-    print(f"Working by protocol: {proto_str}")
-    print(f"Average latency: {avg_lat} ms")
-    print(f"Top error categories: {err_str}")
-    if failed_nodes:
-        print("Sample failing nodes (up to 5):")
-        for p, h, s, e in failed_nodes[:5]:
-            sni_info = f" sni={s}" if s and s != h else ""
-            print(f"  - [{p}] host={h}{sni_info} ({e})")
-    print("Top working nodes:")
-    if top_working:
-        for i, (name, lat) in enumerate(top_working, 1):
-            print(f"  {i}. {name} ({lat} ms)")
-    else:
-        print("  (none)")
-    print("====================================================")
+        # Compact summary <= 25 lines
+        print("================== 60s ZOMBIE-TRAP SUMMARY ==================")
+        print(f"Engine: Native Xray ({xray_bin}) via sing-box wlan0 bridge")
+        print(f"Funnel: Total {len(nodes)} -> Stage 1: {len(stage1_survivors)} -> Stage 2: {len(stage2_results)}")
+        print(f"Zombie Rejections: {dict(rejections)}")
+        if failing_samples:
+            print("Failing Samples:")
+            for fs in failing_samples:
+                print(f"  * {fs}")
+        print("Top 10 True 60s Survivors:")
+        for idx, item in enumerate(stage2_results[:10], start=1):
+            n, m = item["node"], item["metrics"]
+            print(f"  #{idx:02d}: M_early={m['m_early']} -> M_late={m['m_late']} KB/s | D={m['decay']} | Z_max={m['z_max']}s | {n.protocol} | {n.host}:{n.port}")
+        print("=============================================================")
+    finally:
+        bridge_proc.kill()
 
 
 if __name__ == "__main__":
