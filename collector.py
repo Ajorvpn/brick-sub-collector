@@ -1669,11 +1669,27 @@ def _transport_bucket(node: NodeInfo) -> str:
     return "tcp-tls"
 
 
+def _protocol_survival_tier(node: NodeInfo) -> int:
+    proto = (node.protocol or "").lower()
+    net = (node.network or "tcp").lower()
+    sec = (node.security or "").lower()
+    is_reality = sec == "reality" or "security=reality" in (node.raw_link or "").lower()
+    if proto == "vless" and net in ("xhttp", "splithttp"):
+        return 0  # Highest late-2026 Iran survival
+    if proto == "vless" and is_reality:
+        return 1  # Second highest
+    if proto in ("vless", "vmess"):
+        return 2  # VLESS-TLS (ws/grpc/tcp) and VMess-TLS
+    return 3      # Trojan demoted to backfill only
+
+
 def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo]:
-    """Bypassed culling: purely take the top N nodes in exact input order."""
+    """Stable protocol-tier ordering (XHTTP -> REALITY -> VLESS/VMess-TLS -> Trojan).
+    Preserves exact upstream OpenRay order within each tier with zero /24 culling."""
     if quota <= 0:
         return []
-    return nodes[:quota]
+    ordered = sorted(nodes, key=_protocol_survival_tier)
+    return ordered[:quota]
 
 
 def _pick_diverse_tier(
@@ -1740,6 +1756,13 @@ def _pick_diverse_tier(
 # ---------------------------------------------------------------------------
 
 
+def _normalize_fp_value(fp: str) -> str:
+    val = (fp or "").strip()
+    if not val or val.lower() == "chrome":
+        return "firefox"
+    return val
+
+
 def _xray_network(value: str) -> str:
     """Map a share-link transport name onto an Xray stream network name."""
     net = (value or "").lower()
@@ -1747,7 +1770,9 @@ def _xray_network(value: str) -> str:
         return "tcp"
     if net == "http":
         return "h2"
-    if net in ("ws", "httpupgrade", "grpc", "h2", "xhttp", "splithttp"):
+    if net in ("xhttp", "splithttp"):
+        return "xhttp"
+    if net in ("ws", "httpupgrade", "grpc", "h2"):
         return net
     return "tcp"
 
@@ -1818,6 +1843,8 @@ def _xray_stream_network_settings(
     host_header: str,
     service_name: str = "",
     multi_mode: bool = False,
+    mode: str = "",
+    extra_raw: str = "",
 ) -> Dict[str, Any]:
     """Transport specific ``streamSettings`` block for an Xray outbound."""
     if network == "ws":
@@ -1842,12 +1869,19 @@ def _xray_stream_network_settings(
             }
         }
     if network in ("xhttp", "splithttp"):
-        return {
-            "xhttpSettings": {
-                "path": path or "/",
-                "host": host_header,
-            }
-        }
+        xhttp_cfg: Dict[str, Any] = {"path": path or "/"}
+        if host_header:
+            xhttp_cfg["host"] = host_header
+        if mode:
+            xhttp_cfg["mode"] = mode
+        if extra_raw:
+            try:
+                parsed_extra = json.loads(unquote(extra_raw))
+                if isinstance(parsed_extra, dict):
+                    xhttp_cfg["extra"] = parsed_extra
+            except Exception:
+                pass
+        return {"xhttpSettings": xhttp_cfg}
     return {}
 
 
@@ -1881,7 +1915,7 @@ def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
         # whole process at startup (migrated to "pinnedPeerCertSha256").
         stream["tlsSettings"] = {
             "serverName": sni or address,
-            "fingerprint": str(cfg.get("fp") or "firefox"),
+            "fingerprint": _normalize_fp_value(str(cfg.get("fp") or "")),
         }
     stream.update(
         _xray_stream_network_settings(
@@ -1890,6 +1924,8 @@ def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
             host_header,
             str(cfg.get("serviceName", "") or ""),
             str(cfg.get("mode", "")) == "multi",
+            mode=str(cfg.get("mode", "") or ""),
+            extra_raw=str(cfg.get("extra", "") or ""),
         )
     )
 
@@ -1967,7 +2003,7 @@ def build_xray_outbound_for_node(
         # Xray 26.2.6+ removed "allowInsecure"; including it aborts startup.
         tls_settings: Dict[str, Any] = {
             "serverName": sni,
-            "fingerprint": params.get("fp") or "firefox",
+            "fingerprint": _normalize_fp_value(params.get("fp") or ""),
         }
         alpn_values = [
             a.strip() for a in (params.get("alpn") or "").split(",") if a.strip()
@@ -1986,7 +2022,7 @@ def build_xray_outbound_for_node(
             return None
         stream["realitySettings"] = {
             "serverName": sni,
-            "fingerprint": params.get("fp") or "firefox",
+            "fingerprint": _normalize_fp_value(params.get("fp") or ""),
             "publicKey": clean_pbk,
             "shortId": _xray_reality_short_id(raw_sid),
             "spiderX": _xray_reality_spider_x(unquote(params.get("spx") or "")),
@@ -1999,6 +2035,8 @@ def build_xray_outbound_for_node(
             host_header,
             params.get("serviceName", ""),
             params.get("mode", "") == "multi",
+            mode=params.get("mode") or "",
+            extra_raw=params.get("extra") or "",
         )
     )
 
@@ -2655,6 +2693,57 @@ def _shape_vmess_link(
     return "vmess://" + new_b64
 
 
+def _sanitize_share_link_for_iran(node: NodeInfo, raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw:
+        return ""
+    if node.protocol in ("vless", "trojan"):
+        base_part, sep_hash, frag_part = raw.partition("#")
+        if "?" in base_part:
+            base_part = re.sub(
+                r"([?&])(?:ech|allowInsecure|allow_insecure|insecure)=[^&]*",
+                r"\1",
+                base_part,
+                flags=re.IGNORECASE,
+            )
+            base_part = re.sub(
+                r"([?&]fp=)(?:chrome\b|(?=&|$))",
+                r"\1firefox",
+                base_part,
+                flags=re.IGNORECASE,
+            )
+            while "&&" in base_part:
+                base_part = base_part.replace("&&", "&")
+            base_part = base_part.replace("?&", "?")
+            if base_part.endswith("?") or base_part.endswith("&"):
+                base_part = base_part[:-1]
+        is_reality = (node.security == "reality") or bool(
+            re.search(r"[?&]security=reality\b", base_part, flags=re.IGNORECASE)
+        )
+        if is_reality and not re.search(r"[?&]fp=[^&]+", base_part, flags=re.IGNORECASE):
+            q_sep = "&" if "?" in base_part else "?"
+            base_part = f"{base_part}{q_sep}fp=firefox"
+        return f"{base_part}{sep_hash}{frag_part}" if sep_hash else base_part
+    if node.protocol == "vmess" and raw.startswith("vmess://"):
+        b64_part, sep_hash, frag_part = raw[8:].partition("#")
+        try:
+            pad = len(b64_part) % 4
+            padded = b64_part + ("=" * (4 - pad) if pad else "")
+            cfg = json.loads(base64.b64decode(padded).decode("utf-8", errors="replace"))
+            if isinstance(cfg, dict):
+                for key in ("ech", "echConfigList", "allowInsecure", "allow_insecure", "insecure", "verify_cert"):
+                    cfg.pop(key, None)
+                if str(cfg.get("fp", "")).strip().lower() == "chrome":
+                    cfg["fp"] = "firefox"
+                new_b64 = base64.b64encode(
+                    json.dumps(cfg, separators=(",", ":")).encode("utf-8")
+                ).decode("ascii")
+                return f"vmess://{new_b64}{sep_hash}{frag_part}" if sep_hash else f"vmess://{new_b64}"
+        except Exception:
+            pass
+    return raw
+
+
 def shape_node_for_iran(
     node: NodeInfo,
     index: int = 1,
@@ -2665,70 +2754,8 @@ def shape_node_for_iran(
     raw = (link or node.original_link or node.raw_link or "").strip()
     if not raw:
         return ""
-
-    # 1. Very safely strip ech= and allowInsecure= using regex so we don't break the URL
-    if node.protocol in ("vless", "trojan") and "?" in raw:
-        raw = re.sub(
-            r"([?&])(?:ech|allowInsecure|allow_insecure|insecure)=[^&#]*",
-            r"\1",
-            raw,
-            flags=re.IGNORECASE,
-        )
-        raw = re.sub(
-            r"([?&]fp=)chrome\b",
-            r"\1firefox",
-            raw,
-            flags=re.IGNORECASE,
-        )
-        while "&&" in raw:
-            raw = raw.replace("&&", "&")
-        raw = raw.replace("?&", "?").replace("?#", "#").replace("&#", "#")
-        if raw.endswith("?") or raw.endswith("&"):
-            raw = raw[:-1]
-        is_reality = (node.security == "reality") or bool(
-            re.search(r"[?&]security=reality\b", raw, flags=re.IGNORECASE)
-        )
-        if is_reality and not re.search(r"[?&]fp=[^&#]*", raw, flags=re.IGNORECASE):
-            if "#" in raw:
-                base_part, frag_part = raw.split("#", 1)
-                sep = "&" if "?" in base_part else "?"
-                raw = f"{base_part}{sep}fp=firefox#{frag_part}"
-            else:
-                sep = "&" if "?" in raw else "?"
-                raw = f"{raw}{sep}fp=firefox"
-    elif node.protocol == "vmess" and raw.startswith("vmess://"):
-        try:
-            b64_part = raw[8:]
-            frag = ""
-            if "#" in b64_part:
-                b64_part, frag = b64_part.split("#", 1)
-                frag = "#" + frag
-            pad = len(b64_part) % 4
-            if pad:
-                b64_part += "=" * (4 - pad)
-            cfg = json.loads(
-                base64.b64decode(b64_part).decode("utf-8", errors="replace")
-            )
-            for key in (
-                "ech",
-                "echConfigList",
-                "allowInsecure",
-                "allow_insecure",
-                "insecure",
-                "verify_cert",
-            ):
-                cfg.pop(key, None)
-            if str(cfg.get("fp", "")).lower() == "chrome":
-                cfg["fp"] = "firefox"
-            new_b64 = base64.b64encode(
-                json.dumps(cfg, separators=(",", ":")).encode("utf-8")
-            ).decode("ascii")
-            raw = f"vmess://{new_b64}{frag}"
-        except Exception:
-            pass
-
-    # 2. Return the link with our clean BrickVPN remark name appended
-    return rename_node(node, index, link=raw)
+    sanitized = _sanitize_share_link_for_iran(node, raw)
+    return rename_node(node, index, link=sanitized)
 
 
 def rename_node(
@@ -2753,68 +2780,7 @@ def rename_node(
     node.clean_name = clean
 
     base_link = (link or node.original_link or node.raw_link or "").strip()
-    if link is None:
-        raw = base_link
-        if node.protocol in ("vless", "trojan") and "?" in raw:
-            raw = re.sub(
-                r"([?&])(?:ech|allowInsecure|allow_insecure|insecure)=[^&#]*",
-                r"\1",
-                raw,
-                flags=re.IGNORECASE,
-            )
-            raw = re.sub(
-                r"([?&]fp=)chrome\b",
-                r"\1firefox",
-                raw,
-                flags=re.IGNORECASE,
-            )
-            while "&&" in raw:
-                raw = raw.replace("&&", "&")
-            raw = raw.replace("?&", "?").replace("?#", "#").replace("&#", "#")
-            if raw.endswith("?") or raw.endswith("&"):
-                raw = raw[:-1]
-            is_reality = (node.security == "reality") or bool(
-                re.search(r"[?&]security=reality\b", raw, flags=re.IGNORECASE)
-            )
-            if is_reality and not re.search(r"[?&]fp=[^&#]*", raw, flags=re.IGNORECASE):
-                if "#" in raw:
-                    base_part, frag_part = raw.split("#", 1)
-                    sep = "&" if "?" in base_part else "?"
-                    raw = f"{base_part}{sep}fp=firefox#{frag_part}"
-                else:
-                    sep = "&" if "?" in raw else "?"
-                    raw = f"{raw}{sep}fp=firefox"
-        elif node.protocol == "vmess" and raw.startswith("vmess://"):
-            try:
-                b64_part = raw[8:]
-                frag = ""
-                if "#" in b64_part:
-                    b64_part, frag = b64_part.split("#", 1)
-                    frag = "#" + frag
-                pad = len(b64_part) % 4
-                if pad:
-                    b64_part += "=" * (4 - pad)
-                cfg = json.loads(
-                    base64.b64decode(b64_part).decode("utf-8", errors="replace")
-                )
-                for key in (
-                    "ech",
-                    "echConfigList",
-                    "allowInsecure",
-                    "allow_insecure",
-                    "insecure",
-                    "verify_cert",
-                ):
-                    cfg.pop(key, None)
-                if str(cfg.get("fp", "")).lower() == "chrome":
-                    cfg["fp"] = "firefox"
-                new_b64 = base64.b64encode(
-                    json.dumps(cfg, separators=(",", ":")).encode("utf-8")
-                ).decode("ascii")
-                raw = f"vmess://{new_b64}{frag}"
-            except Exception:
-                pass
-        base_link = raw
+    base_link = _sanitize_share_link_for_iran(node, base_link)
 
     if node.protocol == "vmess" and base_link.startswith("vmess://"):
         b64 = base_link[len("vmess://"):].split("#", 1)[0]

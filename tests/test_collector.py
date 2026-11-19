@@ -1042,7 +1042,7 @@ class TestSourcesFile(unittest.TestCase):
         self.assertEqual(urls[2], expected_2)
         self.assertEqual(urls[3], expected_3)
 
-    def test_iran_verified_feeds_occupy_the_first_six_lines(self):
+    def test_sources_contain_four_inside_iran_openray_feeds(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
         self.assertEqual(len(urls), 4)
@@ -1489,7 +1489,7 @@ class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
         ) as f:
             self.assertIn("5.5.5.5", f.read())
 
-    def test_unsupported_xhttp_and_splithttp_rejected(self):
+    def test_xhttp_and_splithttp_accepted_while_kcp_quic_rejected(self):
         for net in ("kcp", "mkcp", "quic"):
             self.assertIsNone(
                 collector.parse_node_info(
@@ -2062,7 +2062,7 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(dead_key, decoded)
         self.assertEqual(decoded["sni"], "c.example")
 
-    def test_incompatible_fingerprints_overwritten_with_chrome(self):
+    def test_chrome_fingerprint_rewritten_to_firefox(self):
         # Pass-through: fingerprints are preserved without destructive rewriting
         for fp in ("edge", "ios", "qq", "firefox", "safari"):
             node = self._vless_tls_node(f"&fp={fp}")
@@ -3408,7 +3408,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             len([n for n in picked if n in other_verified]), 3
         )
 
-    def test_iran_verified_ss_and_vmess_eligible_and_renamed_with_brickvpn_format(
+    def test_tls_vmess_eligible_while_raw_ss_excluded_from_main_pool(
         self,
     ):
         ss_link = "ss://aes-256-gcm:pw@82.38.31.5:8080#ss"
@@ -3546,6 +3546,116 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             collector._effective_sort_key(socket_only)[0],
             round(100.0 + collector.PROTOCOL_SORT_OFFSET["vless"], 2),
+        )
+
+    def test_is_main_pool_eligible_blocks_dead_iran_host_and_169_yahoo_sni(self):
+        dead_host_node = collector.parse_node_info(
+            "vless://uuid@185.226.172.8:443?security=tls&sni=example.com#dead"
+        )
+        self.assertIsNotNone(dead_host_node)
+        self.assertFalse(collector.is_main_pool_eligible(dead_host_node))
+
+        yahoo_sni_node = collector.parse_node_info(
+            "vless://uuid@169.40.42.90:443?security=tls&sni=yahoo.com#yahoo"
+        )
+        self.assertIsNotNone(yahoo_sni_node)
+        self.assertFalse(collector.is_main_pool_eligible(yahoo_sni_node))
+
+        apple_sni_node = collector.parse_node_info(
+            "vless://uuid@169.40.42.90:443?security=tls&sni=apple.com#apple"
+        )
+        self.assertIsNotNone(apple_sni_node)
+        self.assertTrue(collector.is_main_pool_eligible(apple_sni_node))
+
+    def test_sanitize_share_link_fixes_empty_fp_and_chrome_before_fragment(self):
+        raw_empty = (
+            f"vless://uuid@1.2.3.4:443?security=reality&sni=example.com&pbk={REALITY_PBK}&sid={REALITY_SID}&fp=#name"
+        )
+        node_empty = collector.parse_node_info(raw_empty)
+        self.assertIsNotNone(node_empty)
+        sanitized_empty = collector._sanitize_share_link_for_iran(node_empty, raw_empty)
+        base_part_empty, sep_empty, frag_part_empty = sanitized_empty.partition("#")
+        self.assertIn("fp=firefox", base_part_empty)
+        self.assertNotIn("fp=&", base_part_empty)
+        self.assertEqual(base_part_empty.count("fp="), 1)
+        self.assertEqual(frag_part_empty, "name")
+
+        raw_chrome = (
+            f"vless://uuid@1.2.3.4:443?security=reality&sni=example.com&pbk={REALITY_PBK}&sid={REALITY_SID}&fp=chrome#fp=chrome"
+        )
+        node_chrome = collector.parse_node_info(raw_chrome)
+        self.assertIsNotNone(node_chrome)
+        sanitized_chrome = collector._sanitize_share_link_for_iran(node_chrome, raw_chrome)
+        base_part_chrome, sep_chrome, frag_part_chrome = sanitized_chrome.partition("#")
+        self.assertIn("fp=firefox", base_part_chrome)
+        self.assertNotIn("fp=chrome", base_part_chrome)
+        self.assertEqual(base_part_chrome.count("fp="), 1)
+        self.assertEqual(frag_part_chrome, "fp=chrome")
+
+    def test_build_xray_outbound_normalizes_splithttp_mode_and_chrome_fp(self):
+        raw = (
+            "vless://uuid-x@1.2.3.4:443?security=tls&sni=example.com"
+            "&type=splithttp&mode=packet-up&fp=chrome&path=/xhttp#test"
+        )
+        node = collector.parse_node_info(raw)
+        self.assertIsNotNone(node)
+        outbound = collector.build_xray_outbound_for_node(node, "tag-xhttp")
+        self.assertIsNotNone(outbound)
+        stream = outbound["streamSettings"]
+        self.assertEqual(stream["network"], "xhttp")
+        self.assertEqual(stream["tlsSettings"]["fingerprint"], "firefox")
+        self.assertIn("xhttpSettings", stream)
+        self.assertEqual(stream["xhttpSettings"]["path"], "/xhttp")
+        self.assertEqual(stream["xhttpSettings"]["mode"], "packet-up")
+
+    def test_select_diverse_top_nodes_prioritizes_xhttp_and_reality_over_trojan_stably(self):
+        trojan1 = collector.NodeInfo(
+            protocol="trojan", host="1.1.1.1", port=443, tls_enabled=True,
+            sni="t1.example", original_link="trojan://p1@1.1.1.1:443#t1",
+            raw_link="trojan://p1@1.1.1.1:443#t1", country_code="DE", quality_score=10.0,
+        )
+        trojan2 = collector.NodeInfo(
+            protocol="trojan", host="1.1.1.2", port=443, tls_enabled=True,
+            sni="t2.example", original_link="trojan://p2@1.1.1.2:443#t2",
+            raw_link="trojan://p2@1.1.1.2:443#t2", country_code="DE", quality_score=20.0,
+        )
+        vless_xhttp1 = collector.NodeInfo(
+            protocol="vless", host="2.2.2.1", port=443, tls_enabled=True, network="xhttp",
+            sni="x1.example", original_link="vless://u1@2.2.2.1:443?security=tls&type=xhttp#x1",
+            raw_link="vless://u1@2.2.2.1:443?security=tls&type=xhttp#x1", country_code="DE", quality_score=100.0,
+        )
+        vless_xhttp2 = collector.NodeInfo(
+            protocol="vless", host="2.2.2.2", port=443, tls_enabled=True, network="splithttp",
+            sni="x2.example", original_link="vless://u2@2.2.2.2:443?security=tls&type=splithttp#x2",
+            raw_link="vless://u2@2.2.2.2:443?security=tls&type=splithttp#x2", country_code="DE", quality_score=200.0,
+        )
+        reality1 = collector.NodeInfo(
+            protocol="vless", host="3.3.3.1", port=443, tls_enabled=True, security="reality",
+            sni="r1.example", original_link="vless://r1@3.3.3.1:443?security=reality#r1",
+            raw_link="vless://r1@3.3.3.1:443?security=reality#r1", country_code="DE", quality_score=300.0,
+        )
+        reality2 = collector.NodeInfo(
+            protocol="vless", host="3.3.3.2", port=443, tls_enabled=True, security="reality",
+            sni="r2.example", original_link="vless://r2@3.3.3.2:443?security=reality#r2",
+            raw_link="vless://r2@3.3.3.2:443?security=reality#r2", country_code="DE", quality_score=400.0,
+        )
+        vless_ws = collector.NodeInfo(
+            protocol="vless", host="4.4.4.1", port=443, tls_enabled=True, network="ws",
+            sni="w.example", original_link="vless://w@4.4.4.1:443?security=tls&type=ws#w",
+            raw_link="vless://w@4.4.4.1:443?security=tls&type=ws#w", country_code="DE", quality_score=500.0,
+        )
+
+        input_nodes = [trojan1, vless_xhttp1, reality1, trojan2, reality2, vless_xhttp2, vless_ws]
+        selected = collector.select_diverse_top_nodes(input_nodes, quota=7)
+
+        # Expected tier ordering:
+        # Tier 0 (XHTTP/SplitHTTP): vless_xhttp1, vless_xhttp2 (in original order)
+        # Tier 1 (Reality): reality1, reality2 (in original order)
+        # Tier 2 (VLESS-TLS): vless_ws
+        # Tier 3 (Trojan): trojan1, trojan2 (in original order)
+        self.assertEqual(
+            selected,
+            [vless_xhttp1, vless_xhttp2, reality1, reality2, vless_ws, trojan1, trojan2],
         )
 
 
