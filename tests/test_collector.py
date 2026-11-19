@@ -2063,7 +2063,13 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decoded["sni"], "c.example")
 
     def test_chrome_fingerprint_rewritten_to_firefox(self):
-        # Pass-through: fingerprints are preserved without destructive rewriting
+        for chrome_val in ("chrome", "Chrome"):
+            node = self._vless_tls_node(f"&fp={chrome_val}")
+            shaped = collector.shape_node_for_iran(node, 1)
+            self.assertIn("fp=firefox", shaped)
+            self.assertNotIn(f"fp={chrome_val}", shaped)
+
+        # Pass-through: non-chrome fingerprints are preserved without destructive rewriting
         for fp in ("edge", "ios", "qq", "firefox", "safari"):
             node = self._vless_tls_node(f"&fp={fp}")
             shaped = collector.shape_node_for_iran(node, 1)
