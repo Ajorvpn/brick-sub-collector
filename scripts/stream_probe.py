@@ -8,16 +8,20 @@ if SCRIPTS_DIR not in sys.path: sys.path.insert(0, SCRIPTS_DIR)
 import xray_runner
 
 G204_URL = "https://www.google.com/generate_204"
-STREAM_URLS = ["https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb", "https://deb.debian.org/debian/ls-lR.gz"]
+STREAM_URLS = [
+    "https://deb.debian.org/debian/ls-lR.gz",
+    "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
+    "https://speed.cloudflare.com/__down?bytes=5000000",
+]
 MAX_ERROR_RESTARTS = 3
 
 def test_stage1_node(port: int) -> bool:
     try:
-        t = xray_runner.run_cmd(["curl", "-s", "-m", "5", "-x", f"socks5h://127.0.0.1:{port}", xray_runner.TRACE_URL], timeout=6)
-        loc = next((l.split("=", 1)[1].strip() for l in t.stdout.splitlines() if l.startswith("loc=")), None)
-        if not loc or loc == "IR": return False
-        g = xray_runner.run_cmd(["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "-x", f"socks5h://127.0.0.1:{port}", G204_URL], timeout=6)
-        return g.stdout.strip() == "204"
+        t = xray_runner.run_cmd(["curl", "-s", "-m", "8", "-x", f"socks5h://127.0.0.1:{port}", xray_runner.TRACE_URL], timeout=9)
+        lines = [l.strip() for l in t.stdout.splitlines()]
+        loc = next((l.split("=", 1)[1].strip() for l in lines if l.startswith("loc=")), None)
+        has_ip = any(l.startswith("ip=") for l in lines)
+        return bool(loc and loc != "IR" and has_ip)
     except Exception: return False
 
 def _close_proc(p: Optional[subprocess.Popen]) -> None:
@@ -34,12 +38,12 @@ def measure_node_stream(port: int, duration: int, rate_kbps: int) -> Tuple[List[
     def run_probe():
         nonlocal probe_ok
         try:
-            p = xray_runner.run_cmd(["curl", "-s", "-m", "5", "-o", "/dev/null", "-w", "%{http_code}", "-x", f"socks5h://127.0.0.1:{port}", G204_URL], timeout=6)
+            p = xray_runner.run_cmd(["curl", "-s", "-m", "8", "-o", "/dev/null", "-w", "%{http_code}", "-x", f"socks5h://127.0.0.1:{port}", G204_URL], timeout=9)
             probe_ok = (p.stdout.strip() == "204")
         except Exception: probe_ok = False
 
     def _spawn(url: str) -> subprocess.Popen:
-        return subprocess.Popen(["curl", "-s", "-N", "--limit-rate", f"{rate_kbps}k", "-x", f"socks5h://127.0.0.1:{port}", url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=xray_runner.CLEAN_ENV)
+        return subprocess.Popen(["curl", "-s", "-L", "-N", "--connect-timeout", "6", "--speed-time", "6", "--speed-limit", "512", "--limit-rate", f"{rate_kbps}k", "-x", f"socks5h://127.0.0.1:{port}", url], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=xray_runner.CLEAN_ENV)
 
     url_idx, err_restarts, proc_bytes, stream_dead = 0, 0, 0, False
     probe_th, start_t = None, time.monotonic()

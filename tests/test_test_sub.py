@@ -75,5 +75,30 @@ class TestTestSub(unittest.TestCase):
         finally:
             if os.path.exists(tmp_path): os.remove(tmp_path)
 
+    def test_stage1_accepts_valid_non_ir_trace_in_single_request(self):
+        with patch.object(stream_probe.xray_runner, "run_cmd", return_value=subprocess.CompletedProcess([], 0, "ip=1.2.3.4\nloc=NL\n", "")) as mock_cmd:
+            self.assertTrue(stream_probe.test_stage1_node(25000))
+            self.assertEqual(mock_cmd.call_count, 1)
+
+        with patch.object(stream_probe.xray_runner, "run_cmd", return_value=subprocess.CompletedProcess([], 0, "ip=1.2.3.4\nloc=IR\n", "")) as mock_cmd:
+            self.assertFalse(stream_probe.test_stage1_node(25000))
+            self.assertEqual(mock_cmd.call_count, 1)
+
+    def test_measure_node_stream_passes_anti_hang_curl_flags(self):
+        captured_cmd = None
+        def fake_popen(cmd, *args, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            r, w = os.pipe(); os.close(w)
+            p = MagicMock(); p.stdout = os.fdopen(r, "rb"); p.poll.return_value = 0; p.wait.return_value = 0
+            return p
+        with patch.object(stream_probe.subprocess, "Popen", side_effect=fake_popen), \
+             patch.object(stream_probe.time, "sleep", return_value=None), \
+             patch.object(stream_probe.xray_runner, "run_cmd", return_value=subprocess.CompletedProcess([], 0, "204", "")):
+            stream_probe.measure_node_stream(port=29999, duration=1, rate_kbps=180)
+        self.assertIsNotNone(captured_cmd)
+        for flag in ["-L", "--connect-timeout", "--speed-time", "--speed-limit"]:
+            self.assertIn(flag, captured_cmd)
+
 if __name__ == "__main__":
     unittest.main()
