@@ -1,0 +1,2 @@
+trojan://humanity@www.ignitelimit.com:443?Telegram=@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad&Telegram=@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad,@GozargahAzad&encryption=none&security=tls&sni=&alpn=http%2F1.1&fp=chrome&type=ws&path=%2Fassignment#🇺🇸 United States 01 | TROJAN | ⚡ 0ms | BrickVPN
+trojan://humanity@188.114.97.7:443?path=%2Fassignment&security=tls&type=ws&sni=www.ignitelimit.com#🇺🇸 United States 02 | TROJAN | ⚡ 0ms | BrickVPN

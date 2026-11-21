@@ -1,0 +1,66 @@
+{
+  "updated_at": "2026-11-21T18:37:55Z",
+  "total_tested": 53,
+  "total_passed": 53,
+  "main_sub_count": 34,
+  "encrypted_sub": false,
+  "countries": {
+    "DE": {
+      "count": 3,
+      "quota": 15,
+      "status": "low",
+      "avg_latency_ms": 0,
+      "country_name": "Germany",
+      "flag": "🇩🇪"
+    },
+    "FR": {
+      "count": 0,
+      "quota": 15,
+      "status": "empty",
+      "avg_latency_ms": null,
+      "country_name": "France",
+      "flag": "🇫🇷"
+    },
+    "GB": {
+      "count": 34,
+      "quota": 15,
+      "status": "healthy",
+      "avg_latency_ms": 0,
+      "country_name": "United Kingdom",
+      "flag": "🇬🇧"
+    },
+    "NL": {
+      "count": 2,
+      "quota": 15,
+      "status": "low",
+      "avg_latency_ms": 0,
+      "country_name": "Netherlands",
+      "flag": "🇳🇱"
+    },
+    "US": {
+      "count": 14,
+      "quota": 15,
+      "status": "low",
+      "avg_latency_ms": 0,
+      "country_name": "United States",
+      "flag": "🇺🇸"
+    }
+  },
+  "operators": {
+    "mci": {
+      "count": 30,
+      "quota": 30
+    },
+    "irancell": {
+      "count": 30,
+      "quota": 30
+    },
+    "tci": {
+      "count": 30,
+      "quota": 30
+    }
+  },
+  "alerts": [
+    "FR"
+  ]
+}
