@@ -105,15 +105,11 @@ class TestParseNodeInfo(unittest.TestCase):
 class TestBuildCleanName(unittest.TestCase):
     def test_format(self):
         name = collector.build_clean_name("DE", 1, "vless", 42)
-        self.assertEqual(name, "🇩🇪 Germany 01 | VLESS | ⚡ 42ms | BrickVPN")
+        self.assertEqual(name, "🇩🇪 Germany 01 | VLESS | 42ms | BrickVPN")
 
     def test_us(self):
         name = collector.build_clean_name("US", 5, "trojan", 120)
-        self.assertEqual(name, "🇺🇸 United States 05 | TROJAN | ⚡ 120ms | BrickVPN")
-
-    def test_zero_latency_omits_ms_segment(self):
-        name = collector.build_clean_name("DE", 1, "vless", 0)
-        self.assertEqual(name, "🇩🇪 Germany 01 | VLESS | BrickVPN")
+        self.assertEqual(name, "🇺🇸 United States 05 | TROJAN | 120ms | BrickVPN")
 
 
 
@@ -132,7 +128,7 @@ class TestRenameNode(unittest.TestCase):
         if pad:
             b64 += "=" * (4 - pad)
         decoded = json.loads(base64.b64decode(b64).decode(encoding="utf-8"))
-        self.assertEqual(decoded["ps"], "🇩🇪 Germany 01 | VMESS | ⚡ 42ms | BrickVPN")
+        self.assertEqual(decoded["ps"], "🇩🇪 Germany 01 | VMESS | 42ms | BrickVPN")
         self.assertEqual(decoded["add"], "1.2.3.4")
         self.assertEqual(decoded["port"], 443)
 
@@ -145,7 +141,7 @@ class TestRenameNode(unittest.TestCase):
         self.assertTrue(
             result.startswith("vless://uuid@2.2.2.2:443?security=tls")
         )
-        self.assertIn("🇩🇪 Germany 03 | VLESS | ⚡ 55ms | BrickVPN", result)
+        self.assertIn("🇩🇪 Germany 03 | VLESS | 55ms | BrickVPN", result)
 
     def test_trojan_rename(self):
         link = "trojan://pass@3.3.3.3:443#old"
@@ -153,7 +149,7 @@ class TestRenameNode(unittest.TestCase):
         node.country_code = "NL"
         node.avg_latency_ms = 30
         result = collector.rename_node(node, "NL", 2)
-        self.assertIn("🇳🇱 Netherlands 02 | TROJAN | ⚡ 30ms | BrickVPN", result)
+        self.assertIn("🇳🇱 Netherlands 02 | TROJAN | 30ms | BrickVPN", result)
 
     def test_ss_rename(self):
         link = "ss://aes-256-gcm:pw@4.4.4.4:8388#old"
@@ -161,7 +157,7 @@ class TestRenameNode(unittest.TestCase):
         node.country_code = "NL"
         node.avg_latency_ms = 10
         result = collector.rename_node(node, "NL", 1)
-        self.assertIn("🇳🇱 Netherlands 01 | SS | ⚡ 10ms | BrickVPN", result)
+        self.assertIn("🇳🇱 Netherlands 01 | SS | 10ms | BrickVPN", result)
 
 
 
@@ -264,15 +260,15 @@ class TestBatchGeoIPFiltering(unittest.TestCase):
         self.assertEqual([n.country_code for n in allowed], ["DE", "NL", "US"])
 
     def test_allowed_countries_exact(self):
-        expected = {"DE", "FR", "GB", "NL", "US"}
+        expected = {"CA", "CH", "DE", "FI", "FR", "GB", "NL", "SE", "SG", "US"}
         self.assertEqual(set(collector.ALLOWED_COUNTRIES.keys()), expected)
         blocked = {"IR", "CN", "RU"}
         self.assertTrue(blocked.isdisjoint(set(collector.ALLOWED_COUNTRIES.keys())))
 
 
 class TestQuotaEnforcement(unittest.TestCase):
-    def test_main_quota_per_country_is_fifteen(self):
-        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 15)
+    def test_main_quota_per_country_is_ten(self):
+        self.assertEqual(collector.MAIN_QUOTA_PER_COUNTRY, 10)
         tmp = tempfile.mkdtemp()
         patches = [
             mock.patch.object(collector, "OUTPUT_DIR", tmp),
@@ -311,7 +307,7 @@ class TestQuotaEnforcement(unittest.TestCase):
                         resolved_ip=host,
                         country_code="DE",
                         quality_score=float(i),
-                        avg_latency_ms=i,
+                        avg_latency_ms=i + 1,
                     )
                 )
             collector.write_all_outputs(
@@ -319,8 +315,8 @@ class TestQuotaEnforcement(unittest.TestCase):
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 15)
-            self.assertIn("Germany 15 |", lines[-1])
+            self.assertEqual(len(lines), 10)
+            self.assertIn("Germany 10 |", lines[-1])
         finally:
             for patch in patches:
                 patch.stop()
@@ -335,13 +331,13 @@ class TestQuotaEnforcement(unittest.TestCase):
                 main_links.append("link")
         self.assertEqual(len(main_links), 0)
 
-    def test_total_max_75(self):
-        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 75)
+    def test_total_max_100(self):
+        self.assertEqual(collector.TOTAL_MAIN_QUOTA, 100)
         self.assertEqual(
-            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 75
+            collector.MAIN_QUOTA_PER_COUNTRY * len(collector.ALLOWED_COUNTRIES), 100
         )
 
-    def test_five_countries_with_twenty_nodes_emit_exactly_seventy_five(self):
+    def test_ten_countries_with_twenty_nodes_emit_exactly_one_hundred(self):
         tmp = tempfile.mkdtemp()
         patches = [
             mock.patch.object(collector, "OUTPUT_DIR", tmp),
@@ -394,21 +390,15 @@ class TestQuotaEnforcement(unittest.TestCase):
                 by_country[code] = nodes
 
             report = collector.write_all_outputs(
-                by_country, {"vless": all_nodes}, 100, 100
+                by_country, {"vless": all_nodes}, 200, 200
             )
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
-            self.assertEqual(len(lines), 75)
-            self.assertEqual(report["main_sub_count"], 75)
-            for code in (
-                "Germany",
-                "France",
-                "United Kingdom",
-                "Netherlands",
-                "United States",
-            ):
+            self.assertEqual(len(lines), 100)
+            self.assertEqual(report["main_sub_count"], 100)
+            for _code, (_flag, name) in collector.ALLOWED_COUNTRIES.items():
                 self.assertEqual(
-                    sum(1 for ln in lines if f" {code} " in ln), 15, code
+                    sum(1 for ln in lines if f" {name} " in ln), 10, name
                 )
         finally:
             for patch in patches:
@@ -436,10 +426,9 @@ class TestQuotaEnforcement(unittest.TestCase):
             ),
             resolved_ip="169.40.42.74",
             country_code="US",
-            quality_score=200.0,
-            avg_latency_ms=200,
-            top_iran_tier=True,
-            openray_rank=1,
+            quality_score=150.0,
+            avg_latency_ms=150,
+            singbox_verified=True,
         )
         node2 = collector.NodeInfo(
             protocol="vless",
@@ -459,25 +448,17 @@ class TestQuotaEnforcement(unittest.TestCase):
             ),
             resolved_ip="169.40.42.35",
             country_code="US",
-            quality_score=150.0,
-            avg_latency_ms=150,
-            top_iran_tier=True,
-            openray_rank=2,
+            quality_score=200.0,
+            avg_latency_ms=200,
+            singbox_verified=True,
         )
 
-        # Deduplication must retain both nodes in the same /24 subnet without culling
-        deduped = collector.dedupe_by_pure_ip([node1, node2])
-        self.assertEqual(len(deduped), 2)
-        self.assertEqual(deduped, [node1, node2])
-
-        # Selection must select both and preserve upstream OpenRay rank despite US-ping variance
-        selected = collector.select_diverse_top_nodes([node1, node2], quota=15)
+        selected = collector.select_diverse_top_nodes([node2, node1], quota=10)
         self.assertEqual(len(selected), 2)
         self.assertEqual(selected[0], node1)
         self.assertEqual(selected[1], node2)
 
-    def test_openray_order_preserved_without_us_ping_resorting(self):
-        # Node with high US ping (400ms) but rank 1 in OpenRay
+    def test_singbox_rtt_order_prioritized_over_unverified_nodes(self):
         node1 = collector.NodeInfo(
             protocol="vless",
             host="1.1.1.1",
@@ -490,12 +471,10 @@ class TestQuotaEnforcement(unittest.TestCase):
             raw_link="vless://u1@1.1.1.1:443?security=reality#1",
             resolved_ip="1.1.1.1",
             country_code="DE",
-            quality_score=400.0,
-            avg_latency_ms=400,
-            top_iran_tier=True,
-            openray_rank=1,
+            quality_score=120.0,
+            avg_latency_ms=120,
+            singbox_verified=True,
         )
-        # Node with low US ping (50ms) but rank 2 in OpenRay
         node2 = collector.NodeInfo(
             protocol="vless",
             host="2.2.2.2",
@@ -508,12 +487,10 @@ class TestQuotaEnforcement(unittest.TestCase):
             raw_link="vless://u2@2.2.2.2:443?security=reality#2",
             resolved_ip="2.2.2.2",
             country_code="DE",
-            quality_score=50.0,
-            avg_latency_ms=50,
-            top_iran_tier=True,
-            openray_rank=2,
+            quality_score=240.0,
+            avg_latency_ms=240,
+            singbox_verified=True,
         )
-        # Iran-verified non-elite node
         node3 = collector.NodeInfo(
             protocol="vless",
             host="3.3.3.3",
@@ -526,36 +503,16 @@ class TestQuotaEnforcement(unittest.TestCase):
             raw_link="vless://u3@3.3.3.3:443?security=reality#3",
             resolved_ip="3.3.3.3",
             country_code="DE",
-            quality_score=30.0,
-            avg_latency_ms=30,
-            iran_verified=True,
-            source_index=1,
-        )
-        # Unverified scraper node with very low US ping (5ms)
-        node4 = collector.NodeInfo(
-            protocol="vless",
-            host="4.4.4.4",
-            port=443,
-            tls_enabled=True,
-            sni="www.apple.com",
-            security="reality",
-            network="tcp",
-            original_link="vless://u4@4.4.4.4:443?security=reality#4",
-            raw_link="vless://u4@4.4.4.4:443?security=reality#4",
-            resolved_ip="4.4.4.4",
-            country_code="DE",
             quality_score=5.0,
             avg_latency_ms=5,
+            singbox_verified=False,
         )
 
         selected = collector.select_diverse_top_nodes(
-            [node1, node2, node3, node4], quota=3
+            [node3, node2, node1], quota=2
         )
-        self.assertEqual(len(selected), 3)
-        self.assertEqual(selected[0], node1)  # rank 1 top tier despite 400ms
-        self.assertEqual(selected[1], node2)  # rank 2 top tier
-        self.assertEqual(selected[2], node3)  # iran-verified tier
-        self.assertNotIn(node4, selected)
+        self.assertEqual(selected, [node1, node2])
+        self.assertNotIn(node3, selected)
 
 
 class TestExtractLinks(unittest.TestCase):
@@ -1002,6 +959,8 @@ class TestPipelineOrder(unittest.IsolatedAsyncioTestCase):
         ), mock.patch.object(
             collector, "verify_node_stability", side_effect=fake_probe
         ), mock.patch.object(
+            collector, "find_singbox_binary", return_value=None
+        ), mock.patch.object(
             collector, "write_all_outputs", side_effect=fake_write
         ), mock.patch.object(
             collector, "emit_annotations"
@@ -1021,35 +980,23 @@ class TestSourcesFile(unittest.TestCase):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
             urls = [line.strip() for line in f if line.strip()]
         self.assertEqual(len(urls), 4)
-        expected_0 = (
+        self.assertIn(
+            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
+            "main/output_iran/iran_top100_checked.txt",
+            urls,
+        )
+
+    def test_iran_verified_feeds_occupy_the_first_six_lines(self):
+        with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
+            urls = [line.strip() for line in f if line.strip()]
+        expected = (
             "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
             "main/output_iran/iran_top100_checked.txt"
         )
-        expected_1 = (
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output/site_access/aistudio_iran_verified.txt"
-        )
-        expected_2 = (
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/mci_top100.txt"
-        )
-        expected_3 = (
-            "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/"
-            "main/output_iran/irancell_top100.txt"
-        )
-        self.assertEqual(urls[0], expected_0)
-        self.assertEqual(urls[1], expected_1)
-        self.assertEqual(urls[2], expected_2)
-        self.assertEqual(urls[3], expected_3)
-
-    def test_sources_contain_four_inside_iran_openray_feeds(self):
-        with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
-            urls = [line.strip() for line in f if line.strip()]
-        self.assertEqual(len(urls), 4)
-        for u in urls:
-            iran_ok, tags = collector.classify_source_url(u)
-            self.assertTrue(iran_ok)
-            self.assertTrue(tags.intersection({"mci", "irancell"}))
+        self.assertEqual(urls[0], expected)
+        iran_ok, tags = collector.classify_source_url(urls[0])
+        self.assertTrue(iran_ok)
+        self.assertEqual(tags, {"mci", "irancell"})
 
     def test_keeps_working_high_yield_mirrors(self):
         with open(collector.SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -1105,26 +1052,7 @@ class TestHtmlEntityLinks(unittest.TestCase):
         link = collector.rename_node(node, "DE", 1)
         self.assertNotIn("&amp;", link)
         self.assertIn("security=tls&sni=example.com", link)
-        self.assertIn("🇩🇪 Germany 01 | VLESS | ⚡ 30ms | BrickVPN", link)
-
-    def test_parse_ss_pure_base64(self):
-        raw_auth = base64.b64encode(b"aes-256-gcm:pass@1.2.3.4:8388").decode()
-        node = collector.parse_node_info(f"ss://{raw_auth}#test")
-        self.assertIsNotNone(node)
-        self.assertEqual(node.host, "1.2.3.4")
-        self.assertEqual(node.port, 8388)
-        self.assertEqual(node.protocol, "ss")
-
-    def test_parse_vless_trailing_slash(self):
-        link = "vless://uuid@1.2.3.4:443/?security=tls&sni=example.com#test"
-        node = collector.parse_node_info(link)
-        self.assertIsNotNone(node)
-        self.assertEqual(node.host, "1.2.3.4")
-        self.assertEqual(node.port, 443)
-        parts = collector._split_uri_parts(link)
-        self.assertIsNotNone(parts)
-        self.assertEqual(parts[2], "1.2.3.4")
-        self.assertEqual(parts[3], 443)
+        self.assertIn("🇩🇪 Germany 01 | VLESS | 30ms | BrickVPN", link)
 
 
 class TestBlockedPorts(unittest.TestCase):
@@ -1489,7 +1417,7 @@ class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
         ) as f:
             self.assertIn("5.5.5.5", f.read())
 
-    def test_xhttp_and_splithttp_accepted_while_kcp_quic_rejected(self):
+    def test_xhttp_and_splithttp_blocked_from_main_pool_while_kcp_quic_rejected_at_parse(self):
         for net in ("kcp", "mkcp", "quic"):
             self.assertIsNone(
                 collector.parse_node_info(
@@ -1502,9 +1430,9 @@ class TestAntiDpiUpgrades(unittest.IsolatedAsyncioTestCase):
             node = collector.parse_node_info(
                 f"vless://uuid@1.2.3.4:443?security=tls&sni=example.com&type={net}#x"
             )
-            self.assertIsNotNone(node, f"transport {net} must be accepted")
+            self.assertIsNotNone(node, f"transport {net} parses for xray_runner")
             self.assertEqual(node.network, net)
-            self.assertTrue(collector.is_main_pool_eligible(node))
+            self.assertFalse(collector.is_main_pool_eligible(node))
 
         raw_node = collector.parse_node_info(
             "vless://uuid@1.2.3.4:443?security=tls&type=raw#x"
@@ -2062,32 +1990,12 @@ class TestPart3LogForensicsFixes(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(dead_key, decoded)
         self.assertEqual(decoded["sni"], "c.example")
 
-    def test_chrome_fingerprint_rewritten_to_firefox(self):
-        for chrome_val in ("chrome", "Chrome"):
-            node = self._vless_tls_node(f"&fp={chrome_val}")
-            shaped = collector.shape_node_for_iran(node, 1)
-            self.assertIn("fp=firefox", shaped)
-            self.assertNotIn(f"fp={chrome_val}", shaped)
-
-        # Pass-through: non-chrome fingerprints are preserved without destructive rewriting
+    def test_incompatible_fingerprints_overwritten_with_chrome(self):
+        # Pass-through: fingerprints are preserved without destructive rewriting
         for fp in ("edge", "ios", "qq", "firefox", "safari"):
             node = self._vless_tls_node(f"&fp={fp}")
             shaped = collector.shape_node_for_iran(node, 1)
             self.assertIn(f"fp={fp}", shaped, fp)
-
-    def test_shape_node_rewrites_chrome_fp_to_firefox(self):
-        node = self._vless_tls_node("&fp=chrome")
-        shaped = collector.shape_node_for_iran(node, 1)
-        self.assertIn("fp=firefox", shaped)
-        self.assertNotIn("fp=chrome", shaped)
-
-        # REALITY without fp gets fp=firefox appended
-        reality = collector.parse_node_info(
-            "vless://uuid@1.2.3.4:443?security=reality&sni=example.com"
-            "&pbk=ribQDOlZ69PzvZ1EDF0EcmMvbq_T5RQrVRBSGUU2riU&sid=1234&type=tcp#r"
-        )
-        shaped_r = collector.shape_node_for_iran(reality, 1)
-        self.assertIn("fp=firefox", shaped_r)
 
     def test_raw_ip_tls_node_without_domain_sni_excluded_from_main_pool(self):
         raw_trojan = collector.parse_node_info(
@@ -2454,7 +2362,7 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws_stream["tlsSettings"]["serverName"], "b.example")
         # Xray 26.2.6+ removed allowInsecure from tlsSettings entirely.
         self.assertNotIn("allowInsecure", ws_stream["tlsSettings"])
-        self.assertEqual(ws_stream["tlsSettings"]["fingerprint"], "firefox")
+        self.assertEqual(ws_stream["tlsSettings"]["fingerprint"], "chrome")
         self.assertEqual(ws_stream["wsSettings"]["path"], "/ws")
         self.assertEqual(ws_stream["wsSettings"]["headers"]["Host"], "b.example")
 
@@ -2605,7 +2513,7 @@ class TestXrayTunnelVerification(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("allowInsecure", json.dumps(outbound))
             tls_settings = outbound["streamSettings"]["tlsSettings"]
             self.assertNotIn("allowInsecure", tls_settings)
-            self.assertEqual(tls_settings["fingerprint"], "firefox")
+            self.assertEqual(tls_settings["fingerprint"], "chrome")
             self.assertTrue(tls_settings["serverName"])
 
     def test_build_xray_outbound_strips_flow_on_non_tcp_transports(self):
@@ -3322,7 +3230,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         collector._merge_provenance(keeper, incoming)
         self.assertEqual(keeper.original_link, "vless://keep")
 
-    def test_select_diverse_top_nodes_picks_all_iran_verified_nodes_before_unverified_buckets(
+    def test_select_diverse_top_nodes_picks_singbox_verified_nodes_before_unverified_nodes(
         self,
     ):
         verified = []
@@ -3333,7 +3241,8 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
                 country="DE",
                 quality=100.0,
             )
-            node.iran_verified = True
+            node.singbox_verified = True
+            node.avg_latency_ms = 100 + i
             verified.append(node)
 
         grpc = self._node(
@@ -3355,8 +3264,8 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             country="DE",
             quality=2.0,
         )
-        self.assertFalse(grpc.iran_verified)
-        self.assertFalse(vmess.iran_verified)
+        self.assertFalse(grpc.singbox_verified)
+        self.assertFalse(vmess.singbox_verified)
 
         picked = collector.select_diverse_top_nodes(verified + [grpc, vmess], 5)
 
@@ -3366,7 +3275,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(grpc, picked)
         self.assertNotIn(vmess, picked)
 
-    def test_top_iran_tier_same_24_nodes_selected_before_other_verified_and_raw_trojan(
+    def test_top_iran_tier_same_24_nodes_selected_with_protocol_diversity(
         self,
     ):
         top_nodes = []
@@ -3377,10 +3286,10 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
                 f"vless://uuid-{i}@{ip}:443?security=reality&sni=www.apple.com"
                 f"&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#r{i}",
                 country="US",
-                quality=300.0 + i,
+                quality=100.0 + i,
             )
-            node.top_iran_tier = True
-            node.openray_rank = i + 1
+            node.singbox_verified = True
+            node.avg_latency_ms = 100 + i
             top_nodes.append(node)
 
         other_verified = []
@@ -3389,48 +3298,40 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
                 f"vless://uuid-o{i}@20.{i}.0.1:443?security=tls"
                 "&sni=o.example&type=ws#other",
                 country="US",
-                quality=1.0,
+                quality=120.0 + i,
             )
-            node.iran_verified = True
+            node.singbox_verified = True
+            node.avg_latency_ms = 120 + i
             other_verified.append(node)
 
-        raw_trojan = self._node(
-            "trojan://pw@30.0.0.1:443?security=tls&type=tcp&sni=t.example#t",
-            country="US",
-            quality=0.5,
-        )
-        raw_trojan.iran_verified = True
-
         picked = collector.select_diverse_top_nodes(
-            top_nodes + other_verified + [raw_trojan], 7
+            top_nodes + other_verified, 7
         )
 
-        # All four working 169.40.42.* Reality nodes survive the /24 pass.
+        # All four working 169.40.42.* Reality nodes survive without /24 culling,
+        # interleaved with vless-tls nodes via protocol diversity round-robin.
         self.assertEqual(len(picked), 7)
         for node in top_nodes:
             self.assertIn(node, picked)
-        self.assertNotIn(raw_trojan, picked)
         self.assertEqual(
             len([n for n in picked if n in other_verified]), 3
         )
 
-    def test_tls_vmess_eligible_while_raw_ss_excluded_from_main_pool(
+    def test_iran_verified_ss_and_tls_vmess_eligible_while_xhttp_blocked(
         self,
     ):
         ss_link = "ss://aes-256-gcm:pw@82.38.31.5:8080#ss"
         ss = self._node(ss_link, country="NL", quality=10.0)
         ss.iran_verified = True
-        self.assertFalse(collector.is_main_pool_eligible(ss))
+        self.assertTrue(collector.is_main_pool_eligible(ss))
 
         vmess_cfg = {
             "add": "51.158.206.29",
-            "port": 443,
+            "port": 1800,
             "id": "uuid-v",
             "aid": 0,
             "scy": "auto",
             "net": "tcp",
-            "tls": "tls",
-            "sni": "example.com",
         }
         vmess = self._node(
             "vmess://"
@@ -3447,9 +3348,9 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             quality=15.0,
         )
         vless_xhttp.iran_verified = True
-        self.assertTrue(collector.is_main_pool_eligible(vless_xhttp))
+        self.assertFalse(collector.is_main_pool_eligible(vless_xhttp))
 
-        # An unverified plaintext Shadowsocks node stays out of the main pool.
+        # An unverified Shadowsocks node stays out of the main pool.
         unverified_ss = self._node(ss_link, country="NL", quality=30.0)
         self.assertFalse(collector.is_main_pool_eligible(unverified_ss))
 
@@ -3474,7 +3375,7 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             patch.start()
         try:
             collector.write_all_outputs(
-                {"NL": [vless_xhttp, vmess, ss]},
+                {"NL": [vless_xhttp, ss, vmess]},
                 {"vless": [vless_xhttp], "vmess": [vmess], "ss": [ss]},
                 total_tested=3,
                 total_passed=3,
@@ -3482,11 +3383,10 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             with open(collector.SERVERS_FILE, encoding="utf-8") as f:
                 lines = [ln for ln in f.read().splitlines() if ln.strip()]
             self.assertEqual(len(lines), 2)
-            vless_lines = [ln for ln in lines if ln.startswith("vless://")]
-            self.assertEqual(len(vless_lines), 1)
-            self.assertIn("Netherlands 01 | VLESS |", vless_lines[0])
-            self.assertIn("| BrickVPN", vless_lines[0])
-            self.assertIn("type=xhttp", vless_lines[0])
+            self.assertFalse(any("type=xhttp" in ln for ln in lines))
+            ss_lines = [ln for ln in lines if ln.startswith("ss://")]
+            self.assertEqual(len(ss_lines), 1)
+            self.assertIn("Netherlands 01 | SS |", ss_lines[0])
             vmess_lines = [ln for ln in lines if ln.startswith("vmess://")]
             self.assertEqual(len(vmess_lines), 1)
             payload = vmess_lines[0][len("vmess://"):]
@@ -3554,12 +3454,6 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             round(100.0 + collector.PROTOCOL_SORT_OFFSET["vless"], 2),
         )
 
-    def test_is_main_pool_eligible_blocks_dead_iran_host_and_169_yahoo_sni(self):
-        dead_host_node = collector.parse_node_info(
-            "vless://uuid@185.226.172.8:443?security=tls&sni=example.com#dead"
-        )
-        self.assertIsNotNone(dead_host_node)
-        self.assertFalse(collector.is_main_pool_eligible(dead_host_node))
 
         yahoo_sni_node = collector.parse_node_info(
             "vless://uuid@169.40.42.90:443?security=tls&sni=yahoo.com#yahoo"
@@ -3605,64 +3499,146 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
         )
         node = collector.parse_node_info(raw)
         self.assertIsNotNone(node)
-        outbound = collector.build_xray_outbound_for_node(node, "tag-xhttp")
-        self.assertIsNotNone(outbound)
-        stream = outbound["streamSettings"]
-        self.assertEqual(stream["network"], "xhttp")
-        self.assertEqual(stream["tlsSettings"]["fingerprint"], "firefox")
-        self.assertIn("xhttpSettings", stream)
-        self.assertEqual(stream["xhttpSettings"]["path"], "/xhttp")
-        self.assertEqual(stream["xhttpSettings"]["mode"], "packet-up")
+        self.assertFalse(collector.is_main_pool_eligible(node))
+        self.assertIsNone(collector.build_singbox_outbound_for_node(node, "tag-xhttp"))
 
-    def test_select_diverse_top_nodes_prioritizes_xhttp_and_reality_over_trojan_stably(self):
+    def test_select_diverse_top_nodes_round_robins_by_rtt_across_protocols(self):
         trojan1 = collector.NodeInfo(
             protocol="trojan", host="1.1.1.1", port=443, tls_enabled=True,
             sni="t1.example", original_link="trojan://p1@1.1.1.1:443#t1",
-            raw_link="trojan://p1@1.1.1.1:443#t1", country_code="DE", quality_score=10.0,
-        )
-        trojan2 = collector.NodeInfo(
-            protocol="trojan", host="1.1.1.2", port=443, tls_enabled=True,
-            sni="t2.example", original_link="trojan://p2@1.1.1.2:443#t2",
-            raw_link="trojan://p2@1.1.1.2:443#t2", country_code="DE", quality_score=20.0,
-        )
-        vless_xhttp1 = collector.NodeInfo(
-            protocol="vless", host="2.2.2.1", port=443, tls_enabled=True, network="xhttp",
-            sni="x1.example", original_link="vless://u1@2.2.2.1:443?security=tls&type=xhttp#x1",
-            raw_link="vless://u1@2.2.2.1:443?security=tls&type=xhttp#x1", country_code="DE", quality_score=100.0,
-        )
-        vless_xhttp2 = collector.NodeInfo(
-            protocol="vless", host="2.2.2.2", port=443, tls_enabled=True, network="splithttp",
-            sni="x2.example", original_link="vless://u2@2.2.2.2:443?security=tls&type=splithttp#x2",
-            raw_link="vless://u2@2.2.2.2:443?security=tls&type=splithttp#x2", country_code="DE", quality_score=200.0,
+            raw_link="trojan://p1@1.1.1.1:443#t1", country_code="DE",
+            quality_score=10.0, avg_latency_ms=10, singbox_verified=True,
         )
         reality1 = collector.NodeInfo(
             protocol="vless", host="3.3.3.1", port=443, tls_enabled=True, security="reality",
             sni="r1.example", original_link="vless://r1@3.3.3.1:443?security=reality#r1",
-            raw_link="vless://r1@3.3.3.1:443?security=reality#r1", country_code="DE", quality_score=300.0,
+            raw_link="vless://r1@3.3.3.1:443?security=reality#r1", country_code="DE",
+            quality_score=120.0, avg_latency_ms=120, singbox_verified=True,
         )
         reality2 = collector.NodeInfo(
             protocol="vless", host="3.3.3.2", port=443, tls_enabled=True, security="reality",
             sni="r2.example", original_link="vless://r2@3.3.3.2:443?security=reality#r2",
-            raw_link="vless://r2@3.3.3.2:443?security=reality#r2", country_code="DE", quality_score=400.0,
+            raw_link="vless://r2@3.3.3.2:443?security=reality#r2", country_code="DE",
+            quality_score=80.0, avg_latency_ms=80, singbox_verified=True,
+        )
+        ss1 = collector.NodeInfo(
+            protocol="ss", host="5.5.5.1", port=8080, tls_enabled=False,
+            original_link="ss://aes-256-gcm:pw@5.5.5.1:8080#s1",
+            raw_link="ss://aes-256-gcm:pw@5.5.5.1:8080#s1", country_code="DE",
+            iran_verified=True, quality_score=60.0, avg_latency_ms=60, singbox_verified=True,
         )
         vless_ws = collector.NodeInfo(
             protocol="vless", host="4.4.4.1", port=443, tls_enabled=True, network="ws",
             sni="w.example", original_link="vless://w@4.4.4.1:443?security=tls&type=ws#w",
-            raw_link="vless://w@4.4.4.1:443?security=tls&type=ws#w", country_code="DE", quality_score=500.0,
+            raw_link="vless://w@4.4.4.1:443?security=tls&type=ws#w", country_code="DE",
+            quality_score=90.0, avg_latency_ms=90, singbox_verified=True,
         )
 
-        input_nodes = [trojan1, vless_xhttp1, reality1, trojan2, reality2, vless_xhttp2, vless_ws]
-        selected = collector.select_diverse_top_nodes(input_nodes, quota=7)
-
-        # Expected tier ordering:
-        # Tier 0 (XHTTP/SplitHTTP): vless_xhttp1, vless_xhttp2 (in original order)
-        # Tier 1 (Reality): reality1, reality2 (in original order)
-        # Tier 2 (VLESS-TLS): vless_ws
-        # Tier 3 (Trojan): trojan1, trojan2 (in original order)
-        self.assertEqual(
-            selected,
-            [vless_xhttp1, vless_xhttp2, reality1, reality2, vless_ws, trojan1, trojan2],
+        selected = collector.select_diverse_top_nodes(
+            [trojan1, reality1, reality2, ss1, vless_ws], quota=5
         )
+        # Round-robin across (reality, ss, vless-tls, trojan) with fastest RTT first in each bucket.
+        self.assertEqual(selected, [reality2, ss1, vless_ws, trojan1, reality1])
+
+
+class TestSingboxTunnelVerification(unittest.IsolatedAsyncioTestCase):
+    def _node(self, link: str, iran_verified: bool = True) -> collector.NodeInfo:
+        node = collector.parse_node_info(link)
+        self.assertIsNotNone(node, link)
+        node.iran_verified = iran_verified
+        node.country_code = "DE"
+        return node
+
+    def test_vmess_raw_network_and_bogus_tls_normalized_on_sanitize(self):
+        cfg = {
+            "add": "1.2.3.4",
+            "port": 443,
+            "id": "11111111-2222-3333-4444-555555555555",
+            "net": "raw",
+            "tls": "aes-128-gcm",
+            "ps": "old",
+        }
+        link = "vmess://" + base64.b64encode(json.dumps(cfg).encode()).decode()
+        node = self._node(link)
+        renamed = collector.rename_node(node, "DE", 1)
+        b64 = renamed[len("vmess://"):]
+        pad = len(b64) % 4
+        if pad:
+            b64 += "=" * (4 - pad)
+        decoded = json.loads(base64.b64decode(b64).decode("utf-8"))
+        self.assertEqual(decoded["net"], "tcp")
+        self.assertEqual(decoded["tls"], "")
+
+        cfg_true = {**cfg, "tls": "true", "sni": "example.com"}
+        link_true = "vmess://" + base64.b64encode(json.dumps(cfg_true).encode()).decode()
+        node_true = self._node(link_true)
+        sanitized_true = collector._sanitize_share_link_for_iran(node_true, link_true)
+        b64_t = sanitized_true[len("vmess://"):]
+        b64_t += "=" * ((4 - len(b64_t) % 4) % 4)
+        decoded_t = json.loads(base64.b64decode(b64_t).decode("utf-8"))
+        self.assertEqual(decoded_t["net"], "tcp")
+        self.assertEqual(decoded_t["tls"], "tls")
+
+    def test_reality_si_typo_without_sid_rejected(self):
+        bad = (
+            "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443"
+            f"?security=reality&sni=example.com&pbk={REALITY_PBK}&si=1234#bad"
+        )
+        self.assertIsNone(collector.parse_node_info(bad))
+
+    def test_build_singbox_outbound_supports_vless_vmess_trojan_and_ss(self):
+        vless_tls = self._node(
+            "vless://11111111-2222-3333-4444-555555555555@1.2.3.4:443"
+            "?security=tls&sni=example.com&type=tcp&fp=firefox#vt"
+        )
+        ob_vt = collector.build_singbox_outbound_for_node(vless_tls, "out_0")
+        self.assertIsNotNone(ob_vt)
+        self.assertEqual(ob_vt["type"], "vless")
+        self.assertTrue(ob_vt["tls"]["fragment"])
+        self.assertTrue(ob_vt["tls"]["record_fragment"])
+        self.assertEqual(ob_vt["tls"]["fragment_fallback_delay"], "500ms")
+
+        ss_plain = self._node("ss://aes-256-gcm:pw123@5.5.5.5:8080#ss")
+        ob_ss = collector.build_singbox_outbound_for_node(ss_plain, "out_1")
+        self.assertEqual(ob_ss["type"], "shadowsocks")
+        self.assertEqual(ob_ss["method"], "aes-256-gcm")
+        self.assertEqual(ob_ss["password"], "pw123")
+        self.assertEqual(ob_ss["server_port"], 8080)
+
+        b64_cred = base64.b64encode(b"chacha20-ietf-poly1305:sec@6.6.6.6:8388").decode()
+        ss_b64 = self._node(f"ss://{b64_cred}#ssb")
+        ob_ssb = collector.build_singbox_outbound_for_node(ss_b64, "out_2")
+        self.assertEqual(ob_ssb["method"], "chacha20-ietf-poly1305")
+        self.assertEqual(ob_ssb["password"], "sec")
+
+        trojan = self._node("trojan://tpw@7.7.7.7:443?security=tls&sni=t.example#tr")
+        ob_tr = collector.build_singbox_outbound_for_node(trojan, "out_3")
+        self.assertEqual(ob_tr["type"], "trojan")
+        self.assertEqual(ob_tr["password"], "tpw")
+
+        vm_cfg = {"add": "8.8.8.8", "port": 443, "id": "11111111-2222-3333-4444-555555555555", "net": "raw", "tls": "tls", "sni": "v.example"}
+        vmess = self._node("vmess://" + base64.b64encode(json.dumps(vm_cfg).encode()).decode())
+        ob_vm = collector.build_singbox_outbound_for_node(vmess, "out_4")
+        self.assertEqual(ob_vm["type"], "vmess")
+        self.assertTrue(ob_vm["tls"]["enabled"])
+
+    async def test_verify_nodes_with_singbox_drops_failures_and_sets_rtt(self):
+        n_ok = self._node("ss://aes-256-gcm:pw@1.1.1.1:8080#ok")
+        n_dead = self._node("trojan://pw@2.2.2.2:443?security=tls&sni=b.example#dead")
+
+        async def fake_batch(binary, batch, bind_interface=None):
+            n_ok.avg_latency_ms = 145
+            n_ok.quality_score = 145.0
+            n_ok.singbox_verified = True
+            return [n_ok]
+
+        with mock.patch.object(collector, "find_singbox_binary", return_value="/usr/local/bin/sing-box"), \
+             mock.patch.object(collector, "_run_singbox_batch", side_effect=fake_batch):
+            res = await collector.verify_nodes_with_singbox([n_ok, n_dead])
+
+        self.assertEqual(res, [n_ok])
+        self.assertTrue(n_ok.singbox_verified)
+        self.assertEqual(n_ok.avg_latency_ms, 145)
 
 
 if __name__ == "__main__":

@@ -121,8 +121,8 @@ OPENRAY_CHECK_COUNTS_URLS: Tuple[str, ...] = (
 )
 OPENRAY_TELEMETRY_TIMEOUT = 5.0
 
-MAIN_QUOTA_PER_COUNTRY = 15
-TOTAL_MAIN_QUOTA = 75
+MAIN_QUOTA_PER_COUNTRY = 10
+TOTAL_MAIN_QUOTA = 100
 COUNTRY_FILE_QUOTA = 20
 # Per-operator subscription size (output/operators/{op}.txt).
 OPERATOR_QUOTA = 30
@@ -140,8 +140,10 @@ BLOCKED_PORTS: Set[int] = {
 # main subscription (80/8080/8008 are plain HTTP, the rest are abused proxies).
 PLAINTEXT_AND_ABUSED_PORTS: Set[int] = {80, 8080, 8008, 8880, 8388, 19999}
 
-# Transports sing-box/Xray cannot consume; a node using one is useless downstream.
-UNSUPPORTED_TRANSPORTS: Set[str] = {"kcp", "mkcp", "quic"}
+# Transports sing-box v1.14.4 cannot consume in Brick VPN; blocked from main pool.
+UNSUPPORTED_TRANSPORTS: Set[str] = {"xhttp", "splithttp", "kcp", "mkcp", "quic"}
+# Transports rejected unconditionally at parse time.
+PARSE_BLOCKED_TRANSPORTS: Set[str] = {"kcp", "mkcp", "quic"}
 
 # Ports a TLS proxy endpoint is realistically served on (ranking preference).
 PREFERRED_TLS_PORTS: Set[int] = {443, 8443, 2053, 2083, 2087, 2096}
@@ -193,8 +195,6 @@ DECOY_ONLY_HOSTS: Set[str] = {
     # ``current time 2026-11-16 is after 2026-07-12T23:59:59Z`` and
     # ``certificate is not valid for any names, wanted to match yichueng.org``.
     "09vpn.com", "yichueng.org",
-    # Proven broken decoy/tunnel hosts on Iran's network (2026-11-16)
-    "ignitelimit.com",
 }
 
 # Non-TLS transports/protocols that must answer the HTTP payload probe.
@@ -207,14 +207,18 @@ PROXY_LINK_RE = re.compile(
 
 PURE_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=\s]+$")
 
-# Three powerhouse countries only: the 2026-11-16 v2rayN run kept DE, NL and
-# US nodes green, while FR/GB scarceley filled a single slot.
-# 3 countries x 15 nodes = TOTAL_MAIN_QUOTA slots.
+# Active European/North American/APAC hubs aligned with Brick VPN v0.4.0.
+# 10 countries x 10 nodes = TOTAL_MAIN_QUOTA slots.
 ALLOWED_COUNTRIES: Dict[str, Tuple[str, str]] = {
+    "CA": ("\U0001F1E8\U0001F1E6", "Canada"),
+    "CH": ("\U0001F1E8\U0001F1ED", "Switzerland"),
     "DE": ("\U0001F1E9\U0001F1EA", "Germany"),
+    "FI": ("\U0001F1EB\U0001F1EE", "Finland"),
     "FR": ("\U0001F1EB\U0001F1F7", "France"),
     "GB": ("\U0001F1EC\U0001F1E7", "United Kingdom"),
     "NL": ("\U0001F1F3\U0001F1F1", "Netherlands"),
+    "SE": ("\U0001F1F8\U0001F1EA", "Sweden"),
+    "SG": ("\U0001F1F8\U0001F1EC", "Singapore"),
     "US": ("\U0001F1FA\U0001F1F8", "United States"),
 }
 
@@ -237,6 +241,8 @@ class NodeInfo:
     operator_tags: Set[str] = field(default_factory=set)
     # Set only when the node answered generate_204 through a real Xray tunnel.
     xray_verified: bool = False
+    # Set only when the node answered generate_204 through sing-box v1.14.4.
+    singbox_verified: bool = False
     global_streak: int = 0
     iran_streak: int = 0
     # Position at which the node first appeared in an OpenRay Iran feed, so the
@@ -448,13 +454,18 @@ def is_top_iran_tier_url(url: str) -> bool:
 
 # OpenRay remarks embed the country, e.g. ``[OpenRay] \U0001F1FA\U0001F1F8 US-2473``.
 _OPENRAY_COUNTRY_RE = re.compile(
-    r"(?:^|[^A-Za-z])(DE|FR|GB|NL|US)-[0-9]+", re.IGNORECASE
+    r"(?:^|[^A-Za-z])(CA|CH|DE|FI|FR|GB|NL|SE|SG|US)-[0-9]+", re.IGNORECASE
 )
 _COUNTRY_FLAG_HINTS: Tuple[Tuple[str, str], ...] = (
+    ("\U0001F1E8\U0001F1E6", "CA"),
+    ("\U0001F1E8\U0001F1ED", "CH"),
     ("\U0001F1E9\U0001F1EA", "DE"),
+    ("\U0001F1EB\U0001F1EE", "FI"),
     ("\U0001F1EB\U0001F1F7", "FR"),
     ("\U0001F1EC\U0001F1E7", "GB"),
     ("\U0001F1F3\U0001F1F1", "NL"),
+    ("\U0001F1F8\U0001F1EA", "SE"),
+    ("\U0001F1F8\U0001F1EC", "SG"),
     ("\U0001F1FA\U0001F1F8", "US"),
 )
 
@@ -513,14 +524,18 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
 
 
 def is_main_pool_eligible(node: NodeInfo) -> bool:
-    """Encrypted-only, sing-box/Xray compatible nodes may enter the main pool.
+    """Encrypted/authenticated sing-box v1.14.4 compatible nodes for main pool.
 
-    Excludes 30-second zombie protocols (raw ss:// and plaintext vmess://),
-    requiring TLS/REALITY and protocol in (vless, trojan, vmess).
+    Allows:
+    * ``vless`` (TLS or Reality only; rejects ``si=`` typo without ``sid=``)
+    * ``trojan`` (TLS only)
+    * ``vmess`` (TLS or Iran-verified AEAD VMess)
+    * ``ss`` (Iran-verified Shadowsocks, including ports like 8080)
+
+    Blocks ``xhttp``/``splithttp``/``kcp``/``mkcp``/``quic``, decoy hosts,
+    blocked CF edge IPs, and legacy dead endpoints.
     """
-    if not node.tls_enabled:
-        return False
-    if node.protocol not in ("vless", "trojan", "vmess"):
+    if (node.network or "").lower() in UNSUPPORTED_TRANSPORTS:
         return False
     if _is_decoy_connect_host(node.host):
         return False
@@ -541,10 +556,40 @@ def is_main_pool_eligible(node: NodeInfo) -> bool:
         return False
     if not _port_allowed(node.port):
         return False
+
+    verified = bool(
+        getattr(node, "iran_verified", False)
+        or getattr(node, "top_iran_tier", False)
+        or getattr(node, "singbox_verified", False)
+    )
+    if node.protocol == "ss":
+        return verified
+    if node.protocol == "vmess":
+        if not node.tls_enabled:
+            return verified and node.port not in PLAINTEXT_AND_ABUSED_PORTS
+        if node.port in PLAINTEXT_AND_ABUSED_PORTS:
+            return False
+        return bool(sni_lower) and not _is_ip_literal(sni_lower)
+
+    if node.protocol not in ("vless", "trojan"):
+        return False
+    if not node.tls_enabled:
+        return False
     if node.port in PLAINTEXT_AND_ABUSED_PORTS:
         return False
     if not sni_lower or _is_ip_literal(sni_lower):
         return False
+
+    if node.protocol == "vless" and (node.security or "").lower() == "reality":
+        q = _link_query(node.original_link or node.raw_link or "")
+        if q:
+            params = _extract_query_params(q)
+            if "si" in params and "sid" not in params:
+                return False
+            pbk = (params.get("pbk") or "").strip()
+            sid = (params.get("sid") or "").strip()
+            if not is_valid_reality_pbk(pbk) or not is_valid_reality_sid(sid):
+                return False
     return True
 
 
@@ -674,19 +719,17 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         net = str(cfg.get("net", "") or "").lower()
         if net in ("", "raw"):
             net = "tcp"
-        if net in UNSUPPORTED_TRANSPORTS:
+        if net in PARSE_BLOCKED_TRANSPORTS:
             return None
 
         node.host = host
         node.port = port
         node.network = net
-        node.tls_enabled = str(cfg.get("tls", "")).lower() == "tls"
+        node.tls_enabled = str(cfg.get("tls", "") or "").strip().lower() in ("tls", "true", "1")
         node.security = "tls" if node.tls_enabled else ""
         node.sni = _resolve_sni(
             cfg.get("sni") or cfg.get("peer") or cfg.get("host"), host
         )
-        if (node.sni or "").strip().lower() == "gateway.icloud.com":
-            return None
         node.path = str(cfg.get("path", "") or "/")
         if not node.tls_enabled and node.port in PLAINTEXT_AND_ABUSED_PORTS:
             return None
@@ -724,11 +767,6 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
     else:
         authority = rest_no_query
 
-    if "/" in authority:
-        authority, path_part = authority.split("/", 1)
-        if "path" not in params and path_part:
-            params["path"] = "/" + path_part
-
     if authority.startswith("["):
         end = authority.find("]")
         if end == -1:
@@ -765,7 +803,7 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
     net = (params.get("type", "") or "").lower()
     if net in ("", "raw"):
         net = "tcp"
-    if net in UNSUPPORTED_TRANSPORTS:
+    if net in PARSE_BLOCKED_TRANSPORTS:
         return None
 
     # ``peer`` is the older alias aggregators still emit; ``host`` is the
@@ -789,14 +827,13 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         node.security = ""
         node.sni = None
 
-    if (node.sni or "").strip().lower() == "gateway.icloud.com":
-        return None
-
     node.path = params.get("path") or "/"
 
     if node.security == "reality":
-        # Reality needs a domain SNI, a 32-byte X25519 public key and an
-        # even-length hex short id; anything else dies in Xray 26.9.9.
+        # Reality needs a domain SNI, a 32-byte X25519 public key and a
+        # valid hex short id (reject bogus ``si=`` typo without ``sid=``).
+        if "si" in params and "sid" not in params:
+            return None
         pbk = (params.get("pbk") or "").strip()
         sid = (params.get("sid") or "").strip()
         if not node.sni or _is_ip_literal(node.sni):
@@ -1669,27 +1706,92 @@ def _transport_bucket(node: NodeInfo) -> str:
     return "tcp-tls"
 
 
-def _protocol_survival_tier(node: NodeInfo) -> int:
+def _protocol_diversity_bucket(node: NodeInfo) -> str:
     proto = (node.protocol or "").lower()
-    net = (node.network or "tcp").lower()
     sec = (node.security or "").lower()
     is_reality = sec == "reality" or "security=reality" in (node.raw_link or "").lower()
-    if proto == "vless" and net in ("xhttp", "splithttp"):
-        return 0  # Highest late-2026 Iran survival
     if proto == "vless" and is_reality:
-        return 1  # Second highest
-    if proto in ("vless", "vmess"):
-        return 2  # VLESS-TLS (ws/grpc/tcp) and VMess-TLS
-    return 3      # Trojan demoted to backfill only
+        return "reality"
+    if proto == "ss":
+        return "ss"
+    if proto == "vmess":
+        return "vmess"
+    if proto == "vless":
+        return "vless-tls"
+    return "trojan"
+
+
+def _singbox_rank_key(node: NodeInfo, original_idx: int) -> Tuple[int, int, float, int]:
+    """Rank singbox-verified nodes by measured RTT, then quality/input order."""
+    sb_tier = 0 if getattr(node, "singbox_verified", False) else 1
+    rtt = (
+        int(node.avg_latency_ms)
+        if node.avg_latency_ms is not None and int(node.avg_latency_ms) > 0
+        else 999999
+    )
+    quality = (
+        float(node.quality_score)
+        if node.quality_score is not None
+        else 999999.0
+    )
+    return (sb_tier, rtt, quality, original_idx)
+
+
+def _round_robin_protocol_buckets(
+    nodes: Sequence[Tuple[int, NodeInfo]], quota: int
+) -> List[NodeInfo]:
+    if quota <= 0 or not nodes:
+        return []
+    buckets: Dict[str, List[Tuple[Tuple[int, int, float, int], NodeInfo]]] = {}
+    for orig_idx, node in nodes:
+        bucket = _protocol_diversity_bucket(node)
+        buckets.setdefault(bucket, []).append((_singbox_rank_key(node, orig_idx), node))
+    for entries in buckets.values():
+        entries.sort(key=lambda item: item[0])
+
+    bucket_order = ("reality", "ss", "vmess", "vless-tls", "trojan")
+    selected: List[NodeInfo] = []
+    while len(selected) < quota:
+        progressed = False
+        for b in bucket_order:
+            entries = buckets.get(b)
+            if entries:
+                _, chosen = entries.pop(0)
+                selected.append(chosen)
+                progressed = True
+                if len(selected) >= quota:
+                    break
+        if not progressed:
+            break
+    return selected
 
 
 def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo]:
-    """Stable protocol-tier ordering (XHTTP -> REALITY -> VLESS/VMess-TLS -> Trojan).
-    Preserves exact upstream OpenRay order within each tier with zero /24 culling."""
-    if quota <= 0:
+    """Select up to *quota* nodes sorted by real RTT/quality with protocol diversity.
+
+    Tunnel-verified nodes (``singbox_verified`` / ``xray_verified``) always fill
+    slots before unverified nodes, round-robining across protocol buckets
+    (``reality``, ``ss``, ``vmess``, ``vless-tls``, ``trojan``) with the
+    fastest live nodes first.
+    """
+    if quota <= 0 or not nodes:
         return []
-    ordered = sorted(nodes, key=_protocol_survival_tier)
-    return ordered[:quota]
+    verified = [
+        (idx, n)
+        for idx, n in enumerate(nodes)
+        if getattr(n, "singbox_verified", False) or getattr(n, "xray_verified", False)
+    ]
+    unverified = [
+        (idx, n)
+        for idx, n in enumerate(nodes)
+        if not (getattr(n, "singbox_verified", False) or getattr(n, "xray_verified", False))
+    ]
+    selected = _round_robin_protocol_buckets(verified, quota)
+    if len(selected) < quota and unverified:
+        selected.extend(
+            _round_robin_protocol_buckets(unverified, quota - len(selected))
+        )
+    return selected
 
 
 def _pick_diverse_tier(
@@ -1756,13 +1858,6 @@ def _pick_diverse_tier(
 # ---------------------------------------------------------------------------
 
 
-def _normalize_fp_value(fp: str) -> str:
-    val = (fp or "").strip()
-    if not val or val.lower() == "chrome":
-        return "firefox"
-    return val
-
-
 def _xray_network(value: str) -> str:
     """Map a share-link transport name onto an Xray stream network name."""
     net = (value or "").lower()
@@ -1770,8 +1865,6 @@ def _xray_network(value: str) -> str:
         return "tcp"
     if net == "http":
         return "h2"
-    if net in ("xhttp", "splithttp"):
-        return "xhttp"
     if net in ("ws", "httpupgrade", "grpc", "h2"):
         return net
     return "tcp"
@@ -1793,9 +1886,6 @@ def _split_uri_parts(
         rest, query = rest.split("?", 1)
 
     userinfo, _sep, authority = rest.rpartition("@")
-    path_part = ""
-    if "/" in authority:
-        authority, path_part = authority.split("/", 1)
     if authority.startswith("["):
         end = authority.find("]")
         if end == -1:
@@ -1810,10 +1900,7 @@ def _split_uri_parts(
         port = int(port_str)
     except (TypeError, ValueError):
         return None
-    params = _extract_query_params(query)
-    if "path" not in params and path_part:
-        params["path"] = "/" + path_part
-    return scheme, userinfo, host.strip(), port, params
+    return scheme, userinfo, host.strip(), port, _extract_query_params(query)
 
 
 def _xray_reality_short_id(sid: str) -> str:
@@ -1843,8 +1930,6 @@ def _xray_stream_network_settings(
     host_header: str,
     service_name: str = "",
     multi_mode: bool = False,
-    mode: str = "",
-    extra_raw: str = "",
 ) -> Dict[str, Any]:
     """Transport specific ``streamSettings`` block for an Xray outbound."""
     if network == "ws":
@@ -1868,20 +1953,6 @@ def _xray_stream_network_settings(
                 "host": [host_header] if host_header else [],
             }
         }
-    if network in ("xhttp", "splithttp"):
-        xhttp_cfg: Dict[str, Any] = {"path": path or "/"}
-        if host_header:
-            xhttp_cfg["host"] = host_header
-        if mode:
-            xhttp_cfg["mode"] = mode
-        if extra_raw:
-            try:
-                parsed_extra = json.loads(unquote(extra_raw))
-                if isinstance(parsed_extra, dict):
-                    xhttp_cfg["extra"] = parsed_extra
-            except Exception:
-                pass
-        return {"xhttpSettings": xhttp_cfg}
     return {}
 
 
@@ -1915,7 +1986,7 @@ def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
         # whole process at startup (migrated to "pinnedPeerCertSha256").
         stream["tlsSettings"] = {
             "serverName": sni or address,
-            "fingerprint": _normalize_fp_value(str(cfg.get("fp") or "")),
+            "fingerprint": str(cfg.get("fp") or "chrome"),
         }
     stream.update(
         _xray_stream_network_settings(
@@ -1924,8 +1995,6 @@ def _build_xray_vmess_outbound(link: str, tag: str) -> Optional[Dict[str, Any]]:
             host_header,
             str(cfg.get("serviceName", "") or ""),
             str(cfg.get("mode", "")) == "multi",
-            mode=str(cfg.get("mode", "") or ""),
-            extra_raw=str(cfg.get("extra", "") or ""),
         )
     )
 
@@ -2003,7 +2072,7 @@ def build_xray_outbound_for_node(
         # Xray 26.2.6+ removed "allowInsecure"; including it aborts startup.
         tls_settings: Dict[str, Any] = {
             "serverName": sni,
-            "fingerprint": _normalize_fp_value(params.get("fp") or ""),
+            "fingerprint": params.get("fp") or "chrome",
         }
         alpn_values = [
             a.strip() for a in (params.get("alpn") or "").split(",") if a.strip()
@@ -2022,7 +2091,7 @@ def build_xray_outbound_for_node(
             return None
         stream["realitySettings"] = {
             "serverName": sni,
-            "fingerprint": _normalize_fp_value(params.get("fp") or ""),
+            "fingerprint": params.get("fp") or "chrome",
             "publicKey": clean_pbk,
             "shortId": _xray_reality_short_id(raw_sid),
             "spiderX": _xray_reality_spider_x(unquote(params.get("spx") or "")),
@@ -2035,8 +2104,6 @@ def build_xray_outbound_for_node(
             host_header,
             params.get("serviceName", ""),
             params.get("mode", "") == "multi",
-            mode=params.get("mode") or "",
-            extra_raw=params.get("extra") or "",
         )
     )
 
@@ -2409,6 +2476,570 @@ async def verify_nodes_with_xray(
 
 
 # ---------------------------------------------------------------------------
+# sing-box v1.14.4 end-to-end tunnel verification (generate_204)
+# ---------------------------------------------------------------------------
+
+SINGBOX_PROBE_URL = "https://cp.cloudflare.com/generate_204"
+SINGBOX_FALLBACK_PROBE_URL = "http://connectivitycheck.gstatic.com/generate_204"
+SINGBOX_PROBE_TIMEOUT = 5.0
+SINGBOX_CONNECT_TIMEOUT = "3s"
+SINGBOX_BATCH_SIZE = 32
+SINGBOX_MAX_CONCURRENT = 16
+SINGBOX_READY_TIMEOUT = 4.0
+
+
+def find_singbox_binary(singbox_bin: Optional[str] = None) -> Optional[str]:
+    """Locate the sing-box binary (explicit arg -> SINGBOX_BIN -> PATH -> ~/.local/bin/sing-box-direct)."""
+    candidates = [
+        singbox_bin,
+        os.environ.get("SINGBOX_BIN"),
+        shutil.which("sing-box"),
+        os.path.expanduser("~/.local/bin/sing-box-direct"),
+    ]
+    for path in candidates:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
+
+def _parse_ss_credentials(link: str) -> Optional[Tuple[str, str, str, int]]:
+    """Parse both plain ``method:pass@host:port`` and base64 ``ss://`` URIs."""
+    raw = (link or "").strip()
+    if not raw.lower().startswith("ss://"):
+        return None
+    rest = raw[5:].split("#", 1)[0].split("?", 1)[0].strip()
+    if "@" not in rest:
+        pad = len(rest) % 4
+        if pad:
+            rest += "=" * (4 - pad)
+        try:
+            rest = base64.urlsafe_b64decode(rest.encode("ascii")).decode("utf-8", errors="replace")
+        except Exception:
+            try:
+                rest = base64.b64decode(rest).decode("utf-8", errors="replace")
+            except Exception:
+                return None
+    if "@" not in rest:
+        return None
+    userinfo, authority = rest.rsplit("@", 1)
+    if ":" not in userinfo:
+        pad = len(userinfo) % 4
+        if pad:
+            userinfo += "=" * (4 - pad)
+        try:
+            userinfo = base64.urlsafe_b64decode(userinfo.encode("ascii")).decode("utf-8", errors="replace")
+        except Exception:
+            try:
+                userinfo = base64.b64decode(userinfo).decode("utf-8", errors="replace")
+            except Exception:
+                return None
+    if ":" not in userinfo:
+        return None
+    method, password = userinfo.split(":", 1)
+    method = unquote(method).strip()
+    password = unquote(password)
+    if authority.startswith("["):
+        end = authority.find("]")
+        if end == -1 or not authority[end + 1:].startswith(":"):
+            return None
+        host = authority[1:end].strip()
+        port_str = authority[end + 2:].strip()
+    else:
+        if ":" not in authority:
+            return None
+        host, port_str = authority.rsplit(":", 1)
+        host = host.strip()
+    try:
+        port = int(port_str)
+    except (TypeError, ValueError):
+        return None
+    if not method or not password or not host or not _port_allowed(port):
+        return None
+    return method, password, host, port
+
+
+def _singbox_transport_dict(
+    net: str, path: str, host_header: str, service_name: str
+) -> Optional[Dict[str, Any]]:
+    if net == "ws":
+        tr: Dict[str, Any] = {"type": "ws", "path": path or "/"}
+        if host_header:
+            tr["headers"] = {"Host": host_header}
+        return tr
+    if net == "grpc":
+        return {"type": "grpc", "service_name": service_name or ""}
+    if net == "httpupgrade":
+        tr_hu: Dict[str, Any] = {"type": "httpupgrade", "path": path or "/"}
+        if host_header:
+            tr_hu["host"] = host_header
+        return tr_hu
+    return None
+
+
+def _normalize_fp_value(fp: str) -> str:
+    val = (fp or "").strip().lower()
+    if val in PQC_SAFE_FINGERPRINTS:
+        return val if val != "chrome" else "firefox"
+    return "firefox"
+
+
+def build_singbox_outbound_for_node(
+    node: NodeInfo, tag: str, bind_interface: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Build a sing-box v1.14.4 outbound JSON object for *node*."""
+    if not is_main_pool_eligible(node):
+        return None
+    net = (node.network or "tcp").lower()
+    if net in UNSUPPORTED_TRANSPORTS:
+        return None
+
+    iface = (
+        bind_interface
+        if bind_interface is not None
+        else os.environ.get("BRICK_SINGBOX_BIND_INTERFACE", "")
+    ).strip()
+    dial_opts: Dict[str, Any] = {"connect_timeout": SINGBOX_CONNECT_TIMEOUT}
+    if iface:
+        dial_opts["bind_interface"] = iface
+
+    link = (node.original_link or node.raw_link or "").strip()
+    if not link:
+        return None
+
+    if node.protocol == "ss":
+        creds = _parse_ss_credentials(link)
+        if creds is None:
+            return None
+        method, password, host, port = creds
+        return {
+            "type": "shadowsocks",
+            "tag": tag,
+            "server": host,
+            "server_port": port,
+            "method": method,
+            "password": password,
+            **dial_opts,
+        }
+
+    if node.protocol == "vmess":
+        b64 = link[len("vmess://"):].split("#", 1)[0]
+        pad = len(b64) % 4
+        if pad:
+            b64 += "=" * (4 - pad)
+        try:
+            cfg = json.loads(base64.b64decode(b64).decode("utf-8", errors="replace"))
+        except Exception:
+            return None
+        if not isinstance(cfg, dict):
+            return None
+        host = str(cfg.get("add", "")).strip()
+        uuid = str(cfg.get("id", "")).strip()
+        try:
+            port = int(cfg.get("port", 0))
+            alter_id = int(cfg.get("aid", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if not host or not uuid or not _port_allowed(port):
+            return None
+        vm_net = str(cfg.get("net", "") or "").strip().lower()
+        if vm_net in ("", "raw"):
+            vm_net = "tcp"
+        if vm_net in UNSUPPORTED_TRANSPORTS:
+            return None
+        tls_val = str(cfg.get("tls", "") or "").strip().lower()
+        tls_enabled = tls_val in ("tls", "true", "1")
+        out_vm: Dict[str, Any] = {
+            "type": "vmess",
+            "tag": tag,
+            "server": host,
+            "server_port": port,
+            "uuid": uuid,
+            "alter_id": alter_id,
+            "security": str(cfg.get("scy", "") or "auto"),
+            **dial_opts,
+        }
+        if tls_enabled:
+            sni = _resolve_sni(cfg.get("sni") or cfg.get("peer") or cfg.get("host"), host)
+            if not sni or _is_ip_literal(sni):
+                return None
+            fp = _normalize_fp_value(str(cfg.get("fp", "") or ""))
+            tls_obj: Dict[str, Any] = {
+                "enabled": True,
+                "server_name": sni,
+                "utls": {"enabled": True, "fingerprint": fp},
+            }
+            if vm_net == "tcp":
+                tls_obj.update({
+                    "record_fragment": True,
+                    "fragment": True,
+                    "fragment_fallback_delay": "500ms",
+                })
+            out_vm["tls"] = tls_obj
+        tr = _singbox_transport_dict(
+            vm_net,
+            str(cfg.get("path", "") or "/"),
+            str(cfg.get("host", "") or ""),
+            str(cfg.get("path", "") or ""),
+        )
+        if tr:
+            out_vm["transport"] = tr
+        return out_vm
+
+    if node.protocol not in ("vless", "trojan"):
+        return None
+    parts = _split_uri_parts(link)
+    if parts is None:
+        return None
+    scheme, userinfo, host, port, params = parts
+    if scheme not in ("vless", "trojan") or not host or not userinfo:
+        return None
+
+    security = (params.get("security") or "").strip().lower()
+    if scheme == "trojan" and not security:
+        security = "tls"
+    if security not in ("tls", "reality"):
+        return None
+
+    sni = _resolve_sni(params.get("sni") or params.get("peer") or params.get("host") or "", host)
+    if not sni or _is_ip_literal(sni):
+        return None
+
+    fp = _normalize_fp_value(params.get("fp", ""))
+    tls_obj_vt: Dict[str, Any] = {
+        "enabled": True,
+        "server_name": sni,
+        "utls": {"enabled": True, "fingerprint": fp},
+    }
+    if security == "reality":
+        if "si" in params and "sid" not in params:
+            return None
+        pbk = (params.get("pbk") or "").strip()
+        sid = (params.get("sid") or "").strip()
+        if not is_valid_reality_pbk(pbk) or not is_valid_reality_sid(sid):
+            return None
+        tls_obj_vt["reality"] = {
+            "enabled": True,
+            "public_key": pbk,
+            "short_id": sid,
+        }
+    else:
+        alpn_values = [
+            a.strip() for a in (params.get("alpn") or "").split(",") if a.strip()
+        ]
+        valid_alpn = [a for a in alpn_values if a in ("h3", "h2", "http/1.1")]
+        if valid_alpn:
+            tls_obj_vt["alpn"] = valid_alpn
+        if net == "tcp":
+            tls_obj_vt.update({
+                "record_fragment": True,
+                "fragment": True,
+                "fragment_fallback_delay": "500ms",
+            })
+
+    if scheme == "vless":
+        out_vt: Dict[str, Any] = {
+            "type": "vless",
+            "tag": tag,
+            "server": host,
+            "server_port": port,
+            "uuid": userinfo,
+            **dial_opts,
+        }
+        flow = (params.get("flow") or "").strip()
+        if flow and net == "tcp":
+            out_vt["flow"] = flow
+    else:
+        out_vt = {
+            "type": "trojan",
+            "tag": tag,
+            "server": host,
+            "server_port": port,
+            "password": userinfo,
+            **dial_opts,
+        }
+    out_vt["tls"] = tls_obj_vt
+
+    tr = _singbox_transport_dict(
+        net,
+        unquote(params.get("path") or "/"),
+        unquote(params.get("host") or ""),
+        unquote(params.get("serviceName") or params.get("servicename") or ""),
+    )
+    if tr:
+        out_vt["transport"] = tr
+    return out_vt
+
+
+def _build_singbox_batch_config(
+    entries: Sequence[Tuple[NodeInfo, int, Dict[str, Any]]],
+    bind_interface: Optional[str] = None,
+) -> Dict[str, Any]:
+    inbounds: List[Dict[str, Any]] = []
+    outbounds: List[Dict[str, Any]] = []
+    rules: List[Dict[str, Any]] = []
+    for idx, (_node, port, ob) in enumerate(entries):
+        in_tag = f"in_{idx}"
+        out_tag = ob["tag"]
+        inbounds.append({
+            "type": "http",
+            "tag": in_tag,
+            "listen": "127.0.0.1",
+            "listen_port": port,
+        })
+        outbounds.append(ob)
+        rules.append({"inbound": [in_tag], "outbound": out_tag})
+
+    direct_ob: Dict[str, Any] = {"type": "direct", "tag": "direct"}
+    iface = (
+        bind_interface
+        if bind_interface is not None
+        else os.environ.get("BRICK_SINGBOX_BIND_INTERFACE", "")
+    ).strip()
+    if iface:
+        direct_ob["bind_interface"] = iface
+    outbounds.append(direct_ob)
+
+    return {
+        "log": {"level": "error"},
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "route": {"rules": rules, "final": "direct"},
+    }
+
+
+async def _singbox_check_config(
+    binary: str, cfg: Dict[str, Any]
+) -> bool:
+    fd, cfg_path = tempfile.mkstemp(prefix="sb_chk_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "check",
+            "-c",
+            cfg_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        return proc.returncode == 0
+    except Exception:
+        return False
+    finally:
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+
+
+async def _bisect_valid_singbox_entries(
+    binary: str,
+    entries: List[Tuple[NodeInfo, int, Dict[str, Any]]],
+    bind_interface: Optional[str] = None,
+) -> List[Tuple[NodeInfo, int, Dict[str, Any]]]:
+    if not entries:
+        return []
+    if await _singbox_check_config(
+        binary, _build_singbox_batch_config(entries, bind_interface=bind_interface)
+    ):
+        return entries
+    if len(entries) == 1:
+        return []
+    mid = len(entries) // 2
+    left = await _bisect_valid_singbox_entries(
+        binary, entries[:mid], bind_interface=bind_interface
+    )
+    right = await _bisect_valid_singbox_entries(
+        binary, entries[mid:], bind_interface=bind_interface
+    )
+    return left + right
+
+
+async def _probe_singbox_http_proxy(
+    session: aiohttp.ClientSession,
+    port: int,
+    url: str = SINGBOX_PROBE_URL,
+    timeout_s: float = SINGBOX_PROBE_TIMEOUT,
+) -> Optional[float]:
+    """Return measured RTT in ms on HTTP 200/204, else ``None``."""
+    proxy = f"http://127.0.0.1:{port}"
+    started = time.monotonic()
+    try:
+        async with session.get(
+            url,
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=timeout_s),
+            allow_redirects=False,
+        ) as resp:
+            if resp.status in (200, 204):
+                return max(1.0, (time.monotonic() - started) * 1000.0)
+    except Exception:
+        return None
+    return None
+
+
+async def _wait_for_tcp_port(port: int, timeout_s: float = SINGBOX_READY_TIMEOUT) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", port), timeout=0.3
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except Exception:
+            await asyncio.sleep(0.05)
+    return False
+
+
+def _allocate_free_ports(count: int) -> List[int]:
+    """Allocate *count* distinct free ephemeral TCP ports on 127.0.0.1."""
+    socks: List[socket.socket] = []
+    ports: List[int] = []
+    try:
+        for _ in range(max(0, count)):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            ports.append(s.getsockname()[1])
+            socks.append(s)
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return ports
+
+
+async def _run_singbox_batch(
+    binary: str,
+    batch: Sequence[NodeInfo],
+    bind_interface: Optional[str] = None,
+) -> List[NodeInfo]:
+    ports = _allocate_free_ports(len(batch))
+    raw_entries: List[Tuple[NodeInfo, int, Dict[str, Any]]] = []
+    for idx, (node, port) in enumerate(zip(batch, ports)):
+        ob = build_singbox_outbound_for_node(
+            node, f"out_{idx}", bind_interface=bind_interface
+        )
+        if ob is not None:
+            raw_entries.append((node, port, ob))
+    if not raw_entries:
+        return []
+
+    valid_entries = await _bisect_valid_singbox_entries(
+        binary, raw_entries, bind_interface=bind_interface
+    )
+    if not valid_entries:
+        return []
+
+    cfg = _build_singbox_batch_config(valid_entries, bind_interface=bind_interface)
+    fd, cfg_path = tempfile.mkstemp(prefix="sb_run_", suffix=".json")
+    proc = None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        proc = await asyncio.create_subprocess_exec(
+            binary,
+            "run",
+            "-c",
+            cfg_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        first_port = valid_entries[0][1]
+        if not await _wait_for_tcp_port(first_port):
+            return []
+
+        sem = asyncio.Semaphore(SINGBOX_MAX_CONCURRENT)
+        survivors: List[NodeInfo] = []
+        connector = aiohttp.TCPConnector(limit=SINGBOX_MAX_CONCURRENT * 2)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async def _probe_one(node: NodeInfo, port: int) -> None:
+                async with sem:
+                    rtt = await _probe_singbox_http_proxy(
+                        session, port, SINGBOX_PROBE_URL, SINGBOX_PROBE_TIMEOUT
+                    )
+                    if rtt is None:
+                        rtt = await _probe_singbox_http_proxy(
+                            session, port, SINGBOX_FALLBACK_PROBE_URL, SINGBOX_PROBE_TIMEOUT
+                        )
+                    if rtt is not None:
+                        node.avg_latency_ms = max(1, int(round(rtt)))
+                        node.quality_score = float(node.avg_latency_ms)
+                        node.singbox_verified = True
+                        survivors.append(node)
+
+            await asyncio.gather(*(_probe_one(n, p) for n, p, _ in valid_entries))
+        return survivors
+    finally:
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.terminate()
+                await asyncio.wait_for(proc.wait(), timeout=3.0)
+            except Exception:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+        try:
+            os.remove(cfg_path)
+        except OSError:
+            pass
+
+
+async def verify_nodes_with_singbox(
+    nodes: List[NodeInfo],
+    singbox_bin: Optional[str] = None,
+    bind_interface: Optional[str] = None,
+) -> List[NodeInfo]:
+    """Verify nodes end-to-end through sing-box v1.14.4 ``generate_204``.
+
+    Drops every node that fails ``sing-box check`` or ``generate_204`` and
+    records measured RTT in ``avg_latency_ms``. Fails open only if the
+    ``sing-box`` binary is missing or 0 nodes survive globally.
+    """
+    if not nodes:
+        return nodes
+    binary = find_singbox_binary(singbox_bin)
+    if not binary:
+        print(
+            "[info] sing-box binary not found; keeping nodes without sing-box tunnel check"
+        )
+        return nodes
+
+    eligible = [n for n in nodes if is_main_pool_eligible(n)]
+    if not eligible:
+        return nodes
+
+    survivors: List[NodeInfo] = []
+    for start in range(0, len(eligible), SINGBOX_BATCH_SIZE):
+        batch = eligible[start:start + SINGBOX_BATCH_SIZE]
+        try:
+            batch_passed = await _run_singbox_batch(
+                binary, batch, bind_interface=bind_interface
+            )
+            survivors.extend(batch_passed)
+        except Exception as exc:
+            print(f"[warn] sing-box batch failed: {exc}")
+
+    print(
+        f"[info] sing-box tunnel check: {len(survivors)}/{len(eligible)} "
+        "candidate(s) passed generate_204"
+    )
+    if not survivors:
+        print(
+            "[warn] sing-box tunnel check produced 0 survivors globally; "
+            "failing open to preserve subscription"
+        )
+        return nodes
+    return survivors
+
+
+# ---------------------------------------------------------------------------
 # OpenRay streak / carrier telemetry (output/check_counts.json)
 # ---------------------------------------------------------------------------
 
@@ -2536,11 +3167,11 @@ async def fetch_openray_telemetry(
 
 
 def build_clean_name(
-    country_code: str, index: int, protocol: str, avg_latency_ms: int = 0
+    country_code: str, index: int, protocol: str, avg_latency_ms: int
 ) -> str:
-    flag, name = ALLOWED_COUNTRIES[country_code]
+    flag, name = ALLOWED_COUNTRIES.get(country_code, ("\U0001F310", country_code))
     if avg_latency_ms and avg_latency_ms > 0:
-        return f"{flag} {name} {index:02d} | {protocol.upper()} | ⚡ {avg_latency_ms}ms | BrickVPN"
+        return f"{flag} {name} {index:02d} | {protocol.upper()} | {avg_latency_ms}ms | BrickVPN"
     return f"{flag} {name} {index:02d} | {protocol.upper()} | BrickVPN"
 
 
@@ -2733,6 +3364,14 @@ def _sanitize_share_link_for_iran(node: NodeInfo, raw: str) -> str:
             if isinstance(cfg, dict):
                 for key in ("ech", "echConfigList", "allowInsecure", "allow_insecure", "insecure", "verify_cert"):
                     cfg.pop(key, None)
+                net_val = str(cfg.get("net", "") or "").strip().lower()
+                if net_val in ("", "raw"):
+                    cfg["net"] = "tcp"
+                tls_val = str(cfg.get("tls", "") or "").strip().lower()
+                if tls_val in ("tls", "true", "1"):
+                    cfg["tls"] = "tls"
+                elif tls_val in ("none", "", "false", "0", "auto", "aes-128-gcm", "chacha20-poly1305"):
+                    cfg["tls"] = ""
                 if str(cfg.get("fp", "")).strip().lower() == "chrome":
                     cfg["fp"] = "firefox"
                 new_b64 = base64.b64encode(
@@ -2754,8 +3393,51 @@ def shape_node_for_iran(
     raw = (link or node.original_link or node.raw_link or "").strip()
     if not raw:
         return ""
-    sanitized = _sanitize_share_link_for_iran(node, raw)
-    return rename_node(node, index, link=sanitized)
+
+    # 1. Very safely strip ech= and allowInsecure= using regex so we don't break the URL
+    if node.protocol in ("vless", "trojan") and "?" in raw:
+        raw = re.sub(
+            r"([?&])(?:ech|allowInsecure|allow_insecure|insecure)=[^&#]*",
+            r"\1",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        while "&&" in raw:
+            raw = raw.replace("&&", "&")
+        raw = raw.replace("?&", "?").replace("?#", "#").replace("&#", "#")
+        if raw.endswith("?") or raw.endswith("&"):
+            raw = raw[:-1]
+    elif node.protocol == "vmess" and raw.startswith("vmess://"):
+        try:
+            b64_part = raw[8:]
+            frag = ""
+            if "#" in b64_part:
+                b64_part, frag = b64_part.split("#", 1)
+                frag = "#" + frag
+            pad = len(b64_part) % 4
+            if pad:
+                b64_part += "=" * (4 - pad)
+            cfg = json.loads(
+                base64.b64decode(b64_part).decode("utf-8", errors="replace")
+            )
+            for key in (
+                "ech",
+                "echConfigList",
+                "allowInsecure",
+                "allow_insecure",
+                "insecure",
+                "verify_cert",
+            ):
+                cfg.pop(key, None)
+            new_b64 = base64.b64encode(
+                json.dumps(cfg, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            raw = f"vmess://{new_b64}{frag}"
+        except Exception:
+            pass
+
+    # 2. Return the link with our clean BrickVPN remark name appended
+    return rename_node(node, index, link=raw)
 
 
 def rename_node(
@@ -3426,7 +4108,14 @@ async def _main_impl() -> int:
         print(f"[info] After dual-probe stability: {len(passed)} node(s)")
         _mark("probe")
 
-        # --- Stage 5b: optional Xray tunnel verification (OFF by default) ---
+        # --- Stage 5b: sing-box v1.14.4 tunnel verification (default ON) ---
+        if os.environ.get("BRICK_DISABLE_SINGBOX_STAGE") != "1":
+            passed = await verify_nodes_with_singbox(passed)
+        else:
+            print("[info] sing-box tunnel stage disabled (BRICK_DISABLE_SINGBOX_STAGE == 1)")
+        _mark("singbox tunnel")
+
+        # --- Stage 5c: optional Xray tunnel verification (OFF by default) ---
         # The OpenRay inside-Iran feeds are already tunnel-checked upstream, and
         # batching them through Xray rejected whole VLESS/REALITY batches (17-24
         # survivors instead of ~700). The socket probes above are the production

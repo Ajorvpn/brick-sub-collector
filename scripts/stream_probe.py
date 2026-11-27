@@ -29,9 +29,13 @@ def _close_proc(p: Optional[subprocess.Popen]) -> None:
     try:
         if p.stdout: p.stdout.close()
     except Exception: pass
-    try: p.terminate(); p.wait(timeout=1)
+    try:
+        p.terminate()
+        p.wait(timeout=1)
     except Exception:
-        try: p.kill()
+        try:
+            p.kill()
+            p.wait(timeout=1)
         except Exception: pass
 def measure_node_stream(port: int, duration: int, rate_kbps: int) -> Tuple[List[float], bool]:
     probe_t, probe_ok, samples = max(1, int(duration * 0.67)), False, []

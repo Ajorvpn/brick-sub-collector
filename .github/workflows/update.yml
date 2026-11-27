@@ -4,7 +4,7 @@ on:
   push:
     branches: [main, 'test/**']
   schedule:
-    - cron: "0 */12 * * *"
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
 permissions:
@@ -27,6 +27,15 @@ jobs:
           python-version: "3.12"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Install sing-box v1.14.4
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/sing-box.tar.gz \
+            "https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz"
+          tar -xzf /tmp/sing-box.tar.gz -C /tmp
+          sudo install -m 0755 /tmp/sing-box-1.14.4-linux-amd64/sing-box /usr/local/bin/sing-box
+          rm -rf /tmp/sing-box.tar.gz /tmp/sing-box-1.14.4-linux-amd64
+          sing-box version
       - name: Collect and test subscriptions
         env:
           GITHUB_ACTIONS: "true"
