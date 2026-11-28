@@ -1,0 +1,5 @@
+vless://03fcc618-b93d-6796-6aed-8a38c975d581@66.163.113.9:443?security=tls&type=tcp&packetEncoding=xudp&sni=kuruish.org&fp=firefox#🇨🇦 Canada 01 | VLESS | 5931ms | BrickVPN
+ss://YWVzLTEyOC1nY206c2hhZG93c29ja3M=@149.22.95.183:443#🇨🇦 Canada 02 | SS | 217ms | BrickVPN
+ss://Y2hhY2hhMjAtaWV0Zi1wb2x5MTMwNTpQbUNxSzk4V3FoU0NAMTM0LjE5NS4xOTguMTYzOjQ0Mw==#🇨🇦 Canada 03 | SS | 323ms | BrickVPN
+ss://YWVzLTI1Ni1nY206aXR6dnBuQDMyMQ@192.99.151.230:8388#🇨🇦 Canada 04 | SS | 312ms | BrickVPN
+ss://YWVzLTI1Ni1nY206Y2RCSURWNDJEQ3duZklOQDUxLjc5Ljg1LjE4NTo4MTE4#🇨🇦 Canada 05 | SS | 1879ms | BrickVPN

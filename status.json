@@ -1,0 +1,105 @@
+{
+  "updated_at": "2026-11-28T14:39:34Z",
+  "total_tested": 374,
+  "total_passed": 189,
+  "main_sub_count": 47,
+  "candidates_count": 78,
+  "encrypted_sub": false,
+  "countries": {
+    "CA": {
+      "count": 5,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 1732,
+      "country_name": "Canada",
+      "flag": "🇨🇦"
+    },
+    "CH": {
+      "count": 5,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 1026,
+      "country_name": "Switzerland",
+      "flag": "🇨🇭"
+    },
+    "DE": {
+      "count": 8,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 2330,
+      "country_name": "Germany",
+      "flag": "🇩🇪"
+    },
+    "FI": {
+      "count": 1,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 917,
+      "country_name": "Finland",
+      "flag": "🇫🇮"
+    },
+    "FR": {
+      "count": 8,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 852,
+      "country_name": "France",
+      "flag": "🇫🇷"
+    },
+    "GB": {
+      "count": 1,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 941,
+      "country_name": "United Kingdom",
+      "flag": "🇬🇧"
+    },
+    "NL": {
+      "count": 43,
+      "quota": 10,
+      "status": "healthy",
+      "avg_latency_ms": 901,
+      "country_name": "Netherlands",
+      "flag": "🇳🇱"
+    },
+    "SE": {
+      "count": 4,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 945,
+      "country_name": "Sweden",
+      "flag": "🇸🇪"
+    },
+    "SG": {
+      "count": 8,
+      "quota": 10,
+      "status": "low",
+      "avg_latency_ms": 1216,
+      "country_name": "Singapore",
+      "flag": "🇸🇬"
+    },
+    "US": {
+      "count": 52,
+      "quota": 10,
+      "status": "healthy",
+      "avg_latency_ms": 823,
+      "country_name": "United States",
+      "flag": "🇺🇸"
+    }
+  },
+  "operators": {
+    "mci": {
+      "count": 18,
+      "quota": 30
+    },
+    "irancell": {
+      "count": 18,
+      "quota": 30
+    },
+    "tci": {
+      "count": 18,
+      "quota": 30
+    }
+  },
+  "alerts": []
+}

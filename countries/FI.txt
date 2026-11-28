@@ -1,0 +1,1 @@
+vless://e307f400-d65e-4afd-bfe2-9a54deca5678@2.27.122.255:443?type=tcp&security=reality&flow=xtls-rprx-vision&fp=firefox&pbk=Uig-31Ux76EreEvx8Ntb0BwS1TkUGbu0LcsQsiAH6wg&sid=d52d3ecf49447c2a&sni=sun9-37.userapi.com&encryption=none#🇫🇮 Finland 01 | VLESS | 917ms | BrickVPN
