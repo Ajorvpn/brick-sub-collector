@@ -67,6 +67,8 @@ PROTOCOLS_DIR = os.path.join(OUTPUT_DIR, "protocols")
 
 SERVERS_FILE = os.path.join(OUTPUT_DIR, "servers.txt")
 SUB_FILE = os.path.join(OUTPUT_DIR, "sub.txt")
+CANDIDATES_FILE = os.path.join(OUTPUT_DIR, "candidates.txt")
+CANDIDATES_META_FILE = os.path.join(OUTPUT_DIR, "candidates_meta.json")
 STATUS_FILE = os.path.join(OUTPUT_DIR, "status.json")
 
 FETCH_TIMEOUT = 15.0
@@ -89,6 +91,10 @@ MAX_CONCURRENT_DNS = 200
 # Offline MaxMind GeoLite2 Country database (free, cached locally).
 CACHE_DIR = ".cache"
 MMDB_CACHE_PATH = os.path.join(CACHE_DIR, "Country.mmdb")
+IPDATA_CACHE_PATH = os.path.join(CACHE_DIR, "ipdata_cache.json")
+IPDATA_CACHE_TTL_SECONDS = 24 * 3600
+IPDATA_MAX_LOOKUPS_PER_RUN = 100
+IPDATA_TIMEOUT = 4.0
 MMDB_TMP_PATH = os.path.join("/tmp", "Country.mmdb")
 MMDB_MIN_BYTES = 100_000
 MMDB_CANDIDATE_URLS: List[str] = [
@@ -124,6 +130,13 @@ OPENRAY_TELEMETRY_TIMEOUT = 5.0
 MAIN_QUOTA_PER_COUNTRY = 10
 TOTAL_MAIN_QUOTA = 100
 COUNTRY_FILE_QUOTA = 20
+MIN_COUNTRY_NODES_FOR_MAIN = 2
+MIN_HEALTHY_COUNTRIES_GUARD = 3
+CANDIDATES_MAX_TOTAL = 100
+CANDIDATES_PER_COUNTRY = 20
+MAX_AISTUDIO_ONLY_SHARE = 0.20
+MAX_NODES_PER_SUBNET24 = 2
+TRUST_SCORE_BONUS_MS_PER_POINT = 2.0
 # Per-operator subscription size (output/operators/{op}.txt).
 OPERATOR_QUOTA = 30
 OPERATOR_TAGS: Tuple[str, ...] = ("mci", "irancell", "tci")
@@ -248,12 +261,19 @@ class NodeInfo:
     # Position at which the node first appeared in an OpenRay Iran feed, so the
     # upstream (inside-Iran) ordering can be preserved end to end.
     source_index: int = 0
-    # True for OpenRay's elite inside-Iran feeds (iran_top100_checked,
-    # aistudio_iran_verified); openray_rank keeps their upstream order.
+    # True for OpenRay's primary inside-Iran feeds (iran_top100_checked,
+    # mci_top100, irancell_top100); openray_rank keeps their upstream order.
     top_iran_tier: bool = False
+    aistudio_only: bool = False
     openray_rank: int = 0
 
     resolved_ip: Optional[str] = None
+    exit_ip: Optional[str] = None
+    exit_country: Optional[str] = None
+    exit_ip_consistent: bool = True
+    exit_asn: Optional[str] = None
+    exit_route: Optional[str] = None
+    trust_score: Optional[int] = None
     country_code: Optional[str] = None
     country_name: Optional[str] = None
     latency_1: Optional[float] = None
@@ -440,16 +460,22 @@ def classify_source_url(url: str) -> Tuple[bool, Set[str]]:
 
 TOP_IRAN_TIER_MARKERS: Tuple[str, ...] = (
     "iran_top100_checked",
-    "aistudio_iran_verified",
+    "mci_top100",
+    "irancell_top100",
 )
 
 
 def is_top_iran_tier_url(url: str) -> bool:
-    """True for OpenRay's elite, individually checked inside-Iran feeds."""
+    """True for primary inside-Iran feeds (secondary backfill like aistudio excluded)."""
     u = (url or "").strip().lower()
     return "sakha1370/openray" in u and any(
         marker in u for marker in TOP_IRAN_TIER_MARKERS
     )
+
+
+def is_aistudio_url(url: str) -> bool:
+    """True for the secondary aistudio_iran_verified backfill feed."""
+    return "aistudio_iran_verified" in (url or "").strip().lower()
 
 
 # OpenRay remarks embed the country, e.g. ``[OpenRay] \U0001F1FA\U0001F1F8 US-2473``.
@@ -511,6 +537,12 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
             target.path = other.path
     target.iran_verified = target.iran_verified or other.iran_verified
     target.top_iran_tier = target_top or other_top
+    if target.top_iran_tier:
+        target.aistudio_only = False
+    else:
+        target.aistudio_only = bool(getattr(target, "aistudio_only", False)) and bool(
+            getattr(other, "aistudio_only", False)
+        )
     other_rank = int(getattr(other, "openray_rank", 0) or 0)
     if other_rank > 0:
         target_rank = int(getattr(target, "openray_rank", 0) or 0)
@@ -521,6 +553,44 @@ def _merge_provenance(target: NodeInfo, other: NodeInfo) -> None:
     target.xray_verified = target.xray_verified or other.xray_verified
     target.global_streak = max(target.global_streak, other.global_streak)
     target.iran_streak = max(target.iran_streak, other.iran_streak)
+
+
+_STD_BASE64_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+_SS2022_KEY_BYTES: Dict[str, Tuple[int, bool]] = {
+    "2022-blake3-aes-128-gcm": (16, True),
+    "2022-blake3-aes-256-gcm": (32, True),
+    "2022-blake3-chacha20-poly1305": (32, False),
+}
+
+
+def is_valid_ss2022_key(method: str, password: str) -> bool:
+    """Validate Shadowsocks 2022 key material identically to sing-box v1.14.4.
+
+    Non-``2022-blake3-*`` ciphers return ``True``. Unknown ``2022-blake3-*``
+    ciphers return ``False``. ``aes-128-gcm`` requires 16-byte standard-Base64
+    ``:``-delimited key parts; ``aes-256-gcm`` requires 32-byte ``:``-delimited
+    parts; ``chacha20-poly1305`` requires a single 32-byte key (no ``:``).
+    """
+    m = (method or "").strip().lower()
+    if not m.startswith("2022-blake3-"):
+        return True
+    spec = _SS2022_KEY_BYTES.get(m)
+    if spec is None or not password:
+        return False
+    expected_len, allow_multi = spec
+    if not allow_multi and ":" in password:
+        return False
+    parts = password.split(":") if allow_multi else [password]
+    for part in parts:
+        if not part or len(part) % 4 != 0 or not _STD_BASE64_RE.fullmatch(part):
+            return False
+        try:
+            decoded = base64.b64decode(part.encode("ascii"), validate=True)
+        except Exception:
+            return False
+        if len(decoded) != expected_len:
+            return False
+    return True
 
 
 def is_main_pool_eligible(node: NodeInfo) -> bool:
@@ -563,7 +633,14 @@ def is_main_pool_eligible(node: NodeInfo) -> bool:
         or getattr(node, "singbox_verified", False)
     )
     if node.protocol == "ss":
-        return verified
+        if not verified:
+            return False
+        raw_ss = (node.original_link or node.raw_link or "").strip()
+        if raw_ss.lower().startswith("ss://"):
+            creds = _parse_ss_credentials(raw_ss)
+            if creds is None or not is_valid_ss2022_key(creds[0], creds[1]):
+                return False
+        return True
     if node.protocol == "vmess":
         if not node.tls_enabled:
             return verified and node.port not in PLAINTEXT_AND_ABUSED_PORTS
@@ -822,6 +899,10 @@ def parse_node_info(link: str) -> Optional[NodeInfo]:
         node.security = security if security in ("tls", "reality") else ""
         node.sni = _resolve_sni(sni_candidate, host)
     else:
+        if scheme == "ss":
+            creds = _parse_ss_credentials(clean)
+            if creds is None or not is_valid_ss2022_key(creds[0], creds[1]):
+                return None
         node.tls_enabled = False
         node.network = "tcp"
         node.security = ""
@@ -1081,7 +1162,7 @@ async def filter_by_geoip(
 
     allowed: List[NodeInfo] = []
     for n in unique:
-        cc = ip_to_country.get(n.pure_ip)
+        cc = getattr(n, "exit_country", None) or ip_to_country.get(n.pure_ip)
         if (not cc or cc == "XX") and (
             getattr(n, "top_iran_tier", False) or n.iran_verified
         ):
@@ -1721,77 +1802,340 @@ def _protocol_diversity_bucket(node: NodeInfo) -> str:
     return "trojan"
 
 
-def _singbox_rank_key(node: NodeInfo, original_idx: int) -> Tuple[int, int, float, int]:
-    """Rank singbox-verified nodes by measured RTT, then quality/input order."""
-    sb_tier = 0 if getattr(node, "singbox_verified", False) else 1
-    rtt = (
-        int(node.avg_latency_ms)
-        if node.avg_latency_ms is not None and int(node.avg_latency_ms) > 0
-        else 999999
-    )
+def _singbox_rank_key(
+    node: NodeInfo, original_idx: int
+) -> Tuple[int, int, int, float, float, float, int]:
+    """Rank verified nodes preferring consistent exit IP, primary feeds, trust score, and low RTT."""
+    sb_tier = 0 if (getattr(node, "singbox_verified", False) or getattr(node, "xray_verified", False)) else 1
+    consistent_tier = 0 if getattr(node, "exit_ip_consistent", True) else 1
+    aistudio_tier = 1 if getattr(node, "aistudio_only", False) else 0
     quality = (
         float(node.quality_score)
         if node.quality_score is not None
         else 999999.0
     )
-    return (sb_tier, rtt, quality, original_idx)
+    raw_rtt = (
+        float(node.avg_latency_ms)
+        if node.avg_latency_ms is not None and int(node.avg_latency_ms) > 0
+        else quality
+    )
+    ts = getattr(node, "trust_score", None)
+    trust_adj = (
+        -(max(0, min(100, int(ts))) * TRUST_SCORE_BONUS_MS_PER_POINT)
+        if ts is not None
+        else 0.0
+    )
+    effective_rtt = round(raw_rtt + trust_adj, 2)
+    return (sb_tier, consistent_tier, aistudio_tier, effective_rtt, raw_rtt, quality, original_idx)
 
 
-def _round_robin_protocol_buckets(
-    nodes: Sequence[Tuple[int, NodeInfo]], quota: int
+def dedupe_by_exit_ip(nodes: Sequence[NodeInfo]) -> List[NodeInfo]:
+    """Keep at most one node per unique non-empty ``exit_ip`` (best-ranked wins)."""
+    best_by_exit: Dict[str, Tuple[Tuple[Any, ...], int, NodeInfo]] = {}
+    passthrough: List[Tuple[int, NodeInfo]] = []
+    for idx, node in enumerate(nodes):
+        eip = (getattr(node, "exit_ip", None) or "").strip()
+        if not eip:
+            passthrough.append((idx, node))
+            continue
+        rank = _singbox_rank_key(node, idx)
+        cur = best_by_exit.get(eip)
+        if cur is None or rank < cur[0]:
+            best_by_exit[eip] = (rank, idx, node)
+    combined: List[Tuple[int, NodeInfo]] = list(passthrough)
+    for _rank, idx, node in best_by_exit.values():
+        combined.append((idx, node))
+    combined.sort(key=lambda item: item[0])
+    return [node for _idx, node in combined]
+
+
+def _pick_diverse_round_robin(
+    groups: Sequence[Sequence[Tuple[int, NodeInfo]]],
+    quota: int,
+    max_aistudio_share: float = MAX_AISTUDIO_ONLY_SHARE,
+    backfill_min_nodes: int = 0,
 ) -> List[NodeInfo]:
-    if quota <= 0 or not nodes:
+    if quota <= 0:
         return []
-    buckets: Dict[str, List[Tuple[Tuple[int, int, float, int], NodeInfo]]] = {}
-    for orig_idx, node in nodes:
-        bucket = _protocol_diversity_bucket(node)
-        buckets.setdefault(bucket, []).append((_singbox_rank_key(node, orig_idx), node))
-    for entries in buckets.values():
-        entries.sort(key=lambda item: item[0])
-
     bucket_order = ("reality", "ss", "vmess", "vless-tls", "trojan")
+    group_buckets: List[Dict[str, List[Tuple[Tuple[Any, ...], NodeInfo]]]] = []
+    for grp in groups:
+        buckets: Dict[str, List[Tuple[Tuple[Any, ...], NodeInfo]]] = {}
+        for orig_idx, node in grp:
+            bucket = _protocol_diversity_bucket(node)
+            buckets.setdefault(bucket, []).append((_singbox_rank_key(node, orig_idx), node))
+        for entries in buckets.values():
+            entries.sort(key=lambda item: item[0])
+        group_buckets.append(buckets)
+
+    entry_s24_counts: Dict[str, int] = {}
+    exit_s24_counts: Dict[str, int] = {}
+    aistudio_count = 0
+    max_aistudio = max(0, int(quota * max_aistudio_share))
     selected: List[NodeInfo] = []
-    while len(selected) < quota:
-        progressed = False
-        for b in bucket_order:
-            entries = buckets.get(b)
-            if entries:
-                _, chosen = entries.pop(0)
-                selected.append(chosen)
-                progressed = True
-                if len(selected) >= quota:
+
+    def _can_pick(
+        cand: NodeInfo,
+        relax_subnet: bool = False,
+        relax_aistudio: bool = False,
+    ) -> bool:
+        if (
+            not relax_aistudio
+            and getattr(cand, "aistudio_only", False)
+            and aistudio_count >= max_aistudio
+        ):
+            return False
+        if not relax_subnet:
+            e24 = subnet24_key(cand.pure_ip)
+            if e24 and entry_s24_counts.get(e24, 0) >= MAX_NODES_PER_SUBNET24:
+                return False
+            x24 = subnet24_key(cand.exit_ip) if getattr(cand, "exit_ip", None) else ""
+            if x24 and exit_s24_counts.get(x24, 0) >= MAX_NODES_PER_SUBNET24:
+                return False
+        return True
+
+    def _record_pick(cand: NodeInfo) -> None:
+        nonlocal aistudio_count
+        selected.append(cand)
+        if getattr(cand, "aistudio_only", False):
+            aistudio_count += 1
+        e24 = subnet24_key(cand.pure_ip)
+        if e24:
+            entry_s24_counts[e24] = entry_s24_counts.get(e24, 0) + 1
+        x24 = subnet24_key(cand.exit_ip) if getattr(cand, "exit_ip", None) else ""
+        if x24:
+            exit_s24_counts[x24] = exit_s24_counts.get(x24, 0) + 1
+
+    def _drain_pass(target_count: int, relax_subnet: bool, relax_aistudio: bool) -> None:
+        if len(selected) >= target_count:
+            return
+        for buckets in group_buckets:
+            while len(selected) < target_count:
+                progressed = False
+                for b in bucket_order:
+                    entries = buckets.get(b)
+                    if not entries:
+                        continue
+                    chosen_pos = None
+                    for pos, (_rk, cand) in enumerate(entries):
+                        if _can_pick(
+                            cand,
+                            relax_subnet=relax_subnet,
+                            relax_aistudio=relax_aistudio,
+                        ):
+                            chosen_pos = pos
+                            break
+                    if chosen_pos is not None:
+                        _, chosen = entries.pop(chosen_pos)
+                        _record_pick(chosen)
+                        progressed = True
+                        if len(selected) >= target_count:
+                            break
+                if not progressed:
                     break
-        if not progressed:
-            break
+
+    # Pass 1 (strict): enforce /24 exit + entry caps and aistudio_only share cap.
+    _drain_pass(quota, relax_subnet=False, relax_aistudio=False)
+
+    # Pass 1b: controlled thin-country backfill up to backfill_min_nodes while
+    # still strictly enforcing MAX_NODES_PER_SUBNET24 = 2.
+    backfill_target = min(quota, max(0, int(backfill_min_nodes)))
+    _drain_pass(backfill_target, relax_subnet=False, relax_aistudio=True)
+
+    # Pass 2: relax /24 cap ONLY if country has < MIN_COUNTRY_NODES_FOR_MAIN.
+    relax_target = min(quota, MIN_COUNTRY_NODES_FOR_MAIN)
+    _drain_pass(relax_target, relax_subnet=True, relax_aistudio=False)
+
     return selected
 
 
-def select_diverse_top_nodes(nodes: List[NodeInfo], quota: int) -> List[NodeInfo]:
-    """Select up to *quota* nodes sorted by real RTT/quality with protocol diversity.
+def select_diverse_top_nodes(
+    nodes: List[NodeInfo],
+    quota: int,
+    max_aistudio_share: float = MAX_AISTUDIO_ONLY_SHARE,
+    backfill_min_nodes: int = 0,
+) -> List[NodeInfo]:
+    """Select up to *quota* exit-deduped nodes with /24, aistudio, and protocol diversity.
 
     Tunnel-verified nodes (``singbox_verified`` / ``xray_verified``) always fill
     slots before unverified nodes, round-robining across protocol buckets
-    (``reality``, ``ss``, ``vmess``, ``vless-tls``, ``trojan``) with the
-    fastest live nodes first.
+    (``reality``, ``ss``, ``vmess``, ``vless-tls``, ``trojan``) while enforcing
+    1 node per ``exit_ip``, max 2 per entry/exit ``/24`` subnet (relaxed only
+    if `< MIN_COUNTRY_NODES_FOR_MAIN`), ``max_aistudio_share``, and optional
+    thin-country backfill up to ``backfill_min_nodes`` with strict ``/24`` cap.
     """
     if quota <= 0 or not nodes:
         return []
+    deduped = dedupe_by_exit_ip(nodes)
     verified = [
         (idx, n)
-        for idx, n in enumerate(nodes)
+        for idx, n in enumerate(deduped)
         if getattr(n, "singbox_verified", False) or getattr(n, "xray_verified", False)
     ]
     unverified = [
         (idx, n)
-        for idx, n in enumerate(nodes)
+        for idx, n in enumerate(deduped)
         if not (getattr(n, "singbox_verified", False) or getattr(n, "xray_verified", False))
     ]
-    selected = _round_robin_protocol_buckets(verified, quota)
-    if len(selected) < quota and unverified:
-        selected.extend(
-            _round_robin_protocol_buckets(unverified, quota - len(selected))
+    return _pick_diverse_round_robin(
+        (verified, unverified),
+        quota,
+        max_aistudio_share=max_aistudio_share,
+        backfill_min_nodes=backfill_min_nodes,
+    )
+
+
+def select_candidates_primary_first(
+    nodes: List[NodeInfo],
+    country_limit: int = CANDIDATES_PER_COUNTRY,
+) -> List[NodeInfo]:
+    """Select up to *country_limit* unique-exit candidates prioritizing primary feeds.
+
+    Within the primary tier (``not aistudio_only``), ``/24``-diverse nodes come
+    first, followed by remaining unique-exit primary nodes (preserving working
+    clustered carriers for inside-Iran probing), and then ``aistudio_only``
+    unique-exit backfill.
+    """
+    if country_limit <= 0 or not nodes:
+        return []
+    deduped = dedupe_by_exit_ip(nodes)
+    primary = [n for n in deduped if not getattr(n, "aistudio_only", False)]
+    backfill = [n for n in deduped if getattr(n, "aistudio_only", False)]
+
+    def _order_diverse_then_rest(pool: List[NodeInfo]) -> List[NodeInfo]:
+        if not pool:
+            return []
+        diverse = select_diverse_top_nodes(
+            pool, len(pool), max_aistudio_share=1.0
         )
-    return selected
+        diverse_ids = {id(n) for n in diverse}
+        rest = sorted(
+            (n for n in pool if id(n) not in diverse_ids),
+            key=lambda n: _singbox_rank_key(n, 0),
+        )
+        return diverse + rest
+
+    ordered = _order_diverse_then_rest(primary) + _order_diverse_then_rest(backfill)
+    return ordered[:country_limit]
+
+
+async def enrich_nodes_with_ipdata(
+    session: Optional[aiohttp.ClientSession],
+    nodes: List[NodeInfo],
+) -> int:
+    """Enrich verified nodes with ipdata.co ASN and trust_score (fail-open).
+
+    Runs only when ``IPDATA_API_KEY`` is non-empty. Queries unique ``exit_ip``
+    values directly (never through a proxy), caching for 24h in
+    ``.cache/ipdata_cache.json`` and capping lookups at 100 per run.
+    """
+    api_key = os.environ.get("IPDATA_API_KEY", "").strip()
+    if not api_key:
+        print("[info] ipdata.co enrichment skipped (IPDATA_API_KEY not set)")
+        return 0
+
+    unique_exit_ips: List[str] = []
+    seen_ips: Set[str] = set()
+    for n in nodes:
+        eip = (getattr(n, "exit_ip", None) or "").strip()
+        if eip and eip not in seen_ips:
+            seen_ips.add(eip)
+            unique_exit_ips.append(eip)
+    if not unique_exit_ips:
+        return 0
+
+    now = time.time()
+    cache: Dict[str, Dict[str, Any]] = {}
+    if os.path.exists(IPDATA_CACHE_PATH):
+        try:
+            with open(IPDATA_CACHE_PATH, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                for ip_k, entry in loaded.items():
+                    if isinstance(entry, dict) and (now - float(entry.get("ts", 0))) < IPDATA_CACHE_TTL_SECONDS:
+                        cache[str(ip_k)] = entry
+        except Exception:
+            cache = {}
+
+    own_session = session is None
+    if session is None:
+        session = aiohttp.ClientSession()
+    lookups = 0
+    cache_dirty = False
+    try:
+        for eip in unique_exit_ips:
+            if eip in cache:
+                continue
+            if lookups >= IPDATA_MAX_LOOKUPS_PER_RUN:
+                break
+            lookups += 1
+            url = f"https://api.ipdata.co/{eip}?api-key={api_key}"
+            try:
+                async with session.get(
+                    url,
+                    timeout=aiohttp.ClientTimeout(total=IPDATA_TIMEOUT),
+                ) as resp:
+                    if resp.status != 200:
+                        print(f"[warn] ipdata.co HTTP {resp.status}; continuing fail-open")
+                        if resp.status in (401, 403, 429):
+                            break
+                        continue
+                    data = await resp.json(content_type=None)
+            except Exception as exc:
+                print(f"[warn] ipdata.co lookup error: {type(exc).__name__}; continuing fail-open")
+                continue
+
+            if not isinstance(data, dict):
+                continue
+            asn_obj = data.get("asn")
+            asn_val = str(asn_obj.get("asn") or "").strip() if isinstance(asn_obj, dict) else ""
+            route_val = str(asn_obj.get("route") or "").strip() if isinstance(asn_obj, dict) else ""
+            threat_obj = data.get("threat")
+            scores_obj = threat_obj.get("scores") if isinstance(threat_obj, dict) else None
+            raw_trust = scores_obj.get("trust_score") if isinstance(scores_obj, dict) else None
+            trust_val: Optional[int] = None
+            if raw_trust is not None:
+                try:
+                    trust_val = int(round(float(raw_trust)))
+                except (TypeError, ValueError):
+                    trust_val = None
+            cache[eip] = {
+                "ts": now,
+                "asn": asn_val or None,
+                "route": route_val or None,
+                "trust_score": trust_val,
+            }
+            cache_dirty = True
+    finally:
+        if own_session:
+            await session.close()
+
+    if cache_dirty:
+        try:
+            cache_dir = os.path.dirname(IPDATA_CACHE_PATH)
+            if cache_dir:
+                os.makedirs(cache_dir, exist_ok=True)
+            with open(IPDATA_CACHE_PATH, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2)
+        except Exception as exc:
+            print(f"[warn] Could not write ipdata cache: {exc}")
+
+    enriched = 0
+    for n in nodes:
+        eip = (getattr(n, "exit_ip", None) or "").strip()
+        if not eip:
+            continue
+        entry = cache.get(eip)
+        if not entry:
+            continue
+        if entry.get("asn"):
+            n.exit_asn = str(entry["asn"])
+        if entry.get("route"):
+            n.exit_route = str(entry["route"])
+        if entry.get("trust_score") is not None:
+            n.trust_score = int(entry["trust_score"])
+        enriched += 1
+    return enriched
 
 
 def _pick_diverse_tier(
@@ -2476,12 +2820,20 @@ async def verify_nodes_with_xray(
 
 
 # ---------------------------------------------------------------------------
-# sing-box v1.14.4 end-to-end tunnel verification (generate_204)
+# sing-box v1.14.4 end-to-end tunnel verification (multi-origin real payload)
 # ---------------------------------------------------------------------------
 
-SINGBOX_PROBE_URL = "https://cp.cloudflare.com/generate_204"
-SINGBOX_FALLBACK_PROBE_URL = "http://connectivitycheck.gstatic.com/generate_204"
-SINGBOX_PROBE_TIMEOUT = 5.0
+SINGBOX_TRACE_URL = "https://1.1.1.1/cdn-cgi/trace"
+SINGBOX_TRACE_TIMEOUT = 4.5
+SINGBOX_PAYLOAD_URL = "https://www.gstatic.com/webp/gallery/1.webp"
+SINGBOX_PAYLOAD_TIMEOUT = 5.5
+MIN_PAYLOAD_BYTES = 25_000
+SINGBOX_IPIFY_URL = "https://api.ipify.org"
+SINGBOX_IPIFY_TIMEOUT = 3.0
+BLOCKED_EXIT_COUNTRIES: Set[str] = {"IR", "RU", "CN", "XX"}
+SINGBOX_PROBE_URL = SINGBOX_TRACE_URL
+SINGBOX_FALLBACK_PROBE_URL = SINGBOX_PAYLOAD_URL
+SINGBOX_PROBE_TIMEOUT = SINGBOX_PAYLOAD_TIMEOUT
 SINGBOX_CONNECT_TIMEOUT = "3s"
 SINGBOX_BATCH_SIZE = 32
 SINGBOX_MAX_CONCURRENT = 16
@@ -2584,7 +2936,10 @@ def _normalize_fp_value(fp: str) -> str:
 
 
 def build_singbox_outbound_for_node(
-    node: NodeInfo, tag: str, bind_interface: Optional[str] = None
+    node: NodeInfo,
+    tag: str,
+    bind_interface: Optional[str] = None,
+    connect_timeout: str = SINGBOX_CONNECT_TIMEOUT,
 ) -> Optional[Dict[str, Any]]:
     """Build a sing-box v1.14.4 outbound JSON object for *node*."""
     if not is_main_pool_eligible(node):
@@ -2598,7 +2953,7 @@ def build_singbox_outbound_for_node(
         if bind_interface is not None
         else os.environ.get("BRICK_SINGBOX_BIND_INTERFACE", "")
     ).strip()
-    dial_opts: Dict[str, Any] = {"connect_timeout": SINGBOX_CONNECT_TIMEOUT}
+    dial_opts: Dict[str, Any] = {"connect_timeout": connect_timeout}
     if iface:
         dial_opts["bind_interface"] = iface
 
@@ -2611,6 +2966,8 @@ def build_singbox_outbound_for_node(
         if creds is None:
             return None
         method, password, host, port = creds
+        if not is_valid_ss2022_key(method, password):
+            return None
         return {
             "type": "shadowsocks",
             "tag": tag,
@@ -2729,12 +3086,12 @@ def build_singbox_outbound_for_node(
         valid_alpn = [a for a in alpn_values if a in ("h3", "h2", "http/1.1")]
         if valid_alpn:
             tls_obj_vt["alpn"] = valid_alpn
-        if net == "tcp":
-            tls_obj_vt.update({
-                "record_fragment": True,
-                "fragment": True,
-                "fragment_fallback_delay": "500ms",
-            })
+    if net == "tcp":
+        tls_obj_vt.update({
+            "record_fragment": True,
+            "fragment": True,
+            "fragment_fallback_delay": "500ms",
+        })
 
     if scheme == "vless":
         out_vt: Dict[str, Any] = {
@@ -2856,19 +3213,122 @@ async def _bisect_valid_singbox_entries(
     return left + right
 
 
+async def _probe_singbox_port(
+    session: aiohttp.ClientSession,
+    port: int,
+    node: Optional[NodeInfo] = None,
+    trace_timeout: float = SINGBOX_TRACE_TIMEOUT,
+    payload_timeout: float = SINGBOX_PAYLOAD_TIMEOUT,
+    ipify_timeout: float = SINGBOX_IPIFY_TIMEOUT,
+    return_reason: bool = False,
+) -> Union[bool, Tuple[bool, str]]:
+    """Multi-origin strict-TLS probe through *port*:
+      Step A: https://1.1.1.1/cdn-cgi/trace -> valid exit ip= & non-blocked loc=
+      Step B: https://www.gstatic.com/webp/gallery/1.webp -> HTTP 200 & >= MIN_PAYLOAD_BYTES
+      Step C: https://api.ipify.org -> fail-open exit_ip_consistent check
+    """
+    proxy = f"http://127.0.0.1:{port}"
+
+    def _ret(ok: bool, reason: str) -> Union[bool, Tuple[bool, str]]:
+        return (ok, reason) if return_reason else ok
+
+    # Step A: exit IP & country trace with strict TLS verification.
+    exit_ip = ""
+    exit_loc = ""
+    try:
+        async with session.get(
+            SINGBOX_TRACE_URL,
+            proxy=proxy,
+            ssl=_STRICT_TLS_CTX,
+            timeout=aiohttp.ClientTimeout(total=trace_timeout),
+            allow_redirects=False,
+        ) as resp:
+            if resp.status != 200:
+                return _ret(False, "step_a_http_err")
+            trace_text = await resp.text(errors="replace")
+    except Exception:
+        return _ret(False, "step_a_timeout")
+
+    for line in trace_text.splitlines():
+        key, _, val = line.strip().partition("=")
+        if key == "ip":
+            exit_ip = val.strip()
+        elif key == "loc":
+            exit_loc = val.strip().upper()
+    if (
+        not _is_ip_literal(exit_ip)
+        or len(exit_loc) != 2
+        or not exit_loc.isalpha()
+        or exit_loc in BLOCKED_EXIT_COUNTRIES
+    ):
+        return _ret(False, "step_a_blocked_loc")
+
+    # Step B: non-Cloudflare multi-packet HTTPS payload delivery + RTT measurement.
+    started = time.monotonic()
+    try:
+        async with session.get(
+            SINGBOX_PAYLOAD_URL,
+            proxy=proxy,
+            ssl=_STRICT_TLS_CTX,
+            timeout=aiohttp.ClientTimeout(total=payload_timeout),
+            allow_redirects=False,
+        ) as resp:
+            if resp.status != 200:
+                return _ret(False, "step_b_http_err")
+            body = await resp.read()
+    except Exception:
+        return _ret(False, "step_b_timeout")
+    if len(body) < MIN_PAYLOAD_BYTES:
+        return _ret(False, "step_b_small_body")
+    rtt_ms = max(1.0, (time.monotonic() - started) * 1000.0)
+
+    # Step C: lightweight exit-consistency check (fail-open on timeout/429/error).
+    exit_consistent = True
+    try:
+        async with session.get(
+            SINGBOX_IPIFY_URL,
+            proxy=proxy,
+            ssl=_STRICT_TLS_CTX,
+            timeout=aiohttp.ClientTimeout(total=ipify_timeout),
+            allow_redirects=False,
+        ) as resp:
+            if resp.status == 200:
+                ipify_ip = (await resp.text(errors="replace")).strip()
+                if _is_ip_literal(ipify_ip) and ipify_ip != exit_ip:
+                    exit_consistent = False
+    except Exception:
+        pass
+
+    if node is not None:
+        node.exit_ip = exit_ip
+        node.exit_country = exit_loc
+        node.exit_ip_consistent = exit_consistent
+        node.avg_latency_ms = max(1, int(round(rtt_ms)))
+        node.quality_score = float(node.avg_latency_ms)
+        node.singbox_verified = True
+        if exit_loc in ALLOWED_COUNTRIES:
+            node.country_code = exit_loc
+            node.country_name = ALLOWED_COUNTRIES[exit_loc][1]
+        else:
+            node.country_code = exit_loc
+            node.country_name = None
+    return _ret(True, "ok")
+
+
 async def _probe_singbox_http_proxy(
     session: aiohttp.ClientSession,
     port: int,
-    url: str = SINGBOX_PROBE_URL,
-    timeout_s: float = SINGBOX_PROBE_TIMEOUT,
+    url: str = SINGBOX_TRACE_URL,
+    timeout_s: float = SINGBOX_PAYLOAD_TIMEOUT,
 ) -> Optional[float]:
-    """Return measured RTT in ms on HTTP 200/204, else ``None``."""
+    """Return measured RTT in ms on strict-TLS HTTP 200/204, else ``None``."""
     proxy = f"http://127.0.0.1:{port}"
     started = time.monotonic()
     try:
         async with session.get(
             url,
             proxy=proxy,
+            ssl=_STRICT_TLS_CTX,
             timeout=aiohttp.ClientTimeout(total=timeout_s),
             allow_redirects=False,
         ) as resp:
@@ -2959,17 +3419,7 @@ async def _run_singbox_batch(
         async with aiohttp.ClientSession(connector=connector) as session:
             async def _probe_one(node: NodeInfo, port: int) -> None:
                 async with sem:
-                    rtt = await _probe_singbox_http_proxy(
-                        session, port, SINGBOX_PROBE_URL, SINGBOX_PROBE_TIMEOUT
-                    )
-                    if rtt is None:
-                        rtt = await _probe_singbox_http_proxy(
-                            session, port, SINGBOX_FALLBACK_PROBE_URL, SINGBOX_PROBE_TIMEOUT
-                        )
-                    if rtt is not None:
-                        node.avg_latency_ms = max(1, int(round(rtt)))
-                        node.quality_score = float(node.avg_latency_ms)
-                        node.singbox_verified = True
+                    if await _probe_singbox_port(session, port, node):
                         survivors.append(node)
 
             await asyncio.gather(*(_probe_one(n, p) for n, p, _ in valid_entries))
@@ -2996,11 +3446,11 @@ async def verify_nodes_with_singbox(
     singbox_bin: Optional[str] = None,
     bind_interface: Optional[str] = None,
 ) -> List[NodeInfo]:
-    """Verify nodes end-to-end through sing-box v1.14.4 ``generate_204``.
+    """Verify nodes end-to-end through sing-box v1.14.4 multi-origin TLS probes.
 
-    Drops every node that fails ``sing-box check`` or ``generate_204`` and
-    records measured RTT in ``avg_latency_ms``. Fails open only if the
-    ``sing-box`` binary is missing or 0 nodes survive globally.
+    Drops every node that fails ``sing-box check``, ``cdn-cgi/trace``, or the
+    real HTTPS static payload check, re-tags country from verified ``exit_country``,
+    and fails open only if the binary is missing or 0 nodes survive globally.
     """
     if not nodes:
         return nodes
@@ -3028,7 +3478,7 @@ async def verify_nodes_with_singbox(
 
     print(
         f"[info] sing-box tunnel check: {len(survivors)}/{len(eligible)} "
-        "candidate(s) passed generate_204"
+        "candidate(s) passed multi-origin real-payload probe"
     )
     if not survivors:
         print(
@@ -3036,6 +3486,14 @@ async def verify_nodes_with_singbox(
             "failing open to preserve subscription"
         )
         return nodes
+    for node in survivors:
+        ec = (getattr(node, "exit_country", None) or "").strip().upper()
+        if ec in ALLOWED_COUNTRIES:
+            node.country_code = ec
+            node.country_name = ALLOWED_COUNTRIES[ec][1]
+        elif ec:
+            node.country_code = ec
+            node.country_name = None
     return survivors
 
 
@@ -3707,19 +4165,114 @@ def write_all_outputs(
     operators_dir = os.path.join(OUTPUT_DIR, "operators")
     os.makedirs(operators_dir, exist_ok=True)
 
-    # servers.txt / sub.txt: each country numbered independently 01..05.
-    # Only encrypted, sing-box compatible nodes compete for the main pool.
-    main_links: List[str] = []
+    # Pre-filter by country & exit_country consistency, then dedupe by exit IP.
+    eligible_by_country: Dict[str, List[NodeInfo]] = {}
     for code in sorted(ALLOWED_COUNTRIES.keys()):
-        nodes = [
-            n for n in by_country.get(code, []) if is_main_pool_eligible(n)
+        raw_nodes = [
+            n
+            for n in by_country.get(code, [])
+            if is_main_pool_eligible(n)
+            and (not getattr(n, "exit_country", None) or n.exit_country == code)
         ]
-        selected = select_diverse_top_nodes(nodes, MAIN_QUOTA_PER_COUNTRY)
+        eligible_by_country[code] = dedupe_by_exit_ip(raw_nodes)
+
+    healthy_countries = sum(
+        1
+        for lst in eligible_by_country.values()
+        if len(lst) >= MIN_COUNTRY_NODES_FOR_MAIN
+    )
+    enforce_min_country = healthy_countries >= MIN_HEALTHY_COUNTRIES_GUARD
+
+    # servers.txt / sub.txt: each country numbered independently 01..10.
+    main_links: List[str] = []
+    cand_pools: Dict[str, List[NodeInfo]] = {}
+    for code in sorted(ALLOWED_COUNTRIES.keys()):
+        nodes = eligible_by_country[code]
+        if enforce_min_country and len(nodes) < MIN_COUNTRY_NODES_FOR_MAIN:
+            continue
+        selected = select_diverse_top_nodes(
+            nodes,
+            MAIN_QUOTA_PER_COUNTRY,
+            max_aistudio_share=MAX_AISTUDIO_ONLY_SHARE,
+            backfill_min_nodes=6,
+        )
         for idx, n in enumerate(selected, start=1):
             main_links.append(rename_node(n, code, idx))
+        cand_pools[code] = select_candidates_primary_first(
+            nodes, CANDIDATES_PER_COUNTRY
+        )
 
     _write_plain(SERVERS_FILE, main_links)
     _write_b64(SUB_FILE, main_links)
+
+    # Pre-filtered Stage-2 candidate pool (output/candidates.txt, <= 100 total,
+    # primary-feed nodes ordered first globally so clustered working nodes are retained).
+    primary_cands_by_country: Dict[str, List[NodeInfo]] = {}
+    backfill_cands_by_country: Dict[str, List[NodeInfo]] = {}
+    total_cands = 0
+    # Pass A: allocate slots for primary-feed nodes across countries first.
+    max_pri_slots = max(
+        (sum(1 for n in pool if not getattr(n, "aistudio_only", False)) for pool in cand_pools.values()),
+        default=0,
+    )
+    for slot in range(max_pri_slots):
+        if total_cands >= CANDIDATES_MAX_TOTAL:
+            break
+        for code in sorted(cand_pools.keys()):
+            pri_list = [n for n in cand_pools[code] if not getattr(n, "aistudio_only", False)]
+            if slot < len(pri_list):
+                primary_cands_by_country.setdefault(code, []).append(pri_list[slot])
+                total_cands += 1
+                if total_cands >= CANDIDATES_MAX_TOTAL:
+                    break
+    # Pass B: backfill remaining slots up to CANDIDATES_MAX_TOTAL with aistudio_only.
+    max_ai_slots = max(
+        (sum(1 for n in pool if getattr(n, "aistudio_only", False)) for pool in cand_pools.values()),
+        default=0,
+    )
+    for slot in range(max_ai_slots):
+        if total_cands >= CANDIDATES_MAX_TOTAL:
+            break
+        for code in sorted(cand_pools.keys()):
+            ai_list = [n for n in cand_pools[code] if getattr(n, "aistudio_only", False)]
+            if slot < len(ai_list):
+                backfill_cands_by_country.setdefault(code, []).append(ai_list[slot])
+                total_cands += 1
+                if total_cands >= CANDIDATES_MAX_TOTAL:
+                    break
+
+    candidate_links: List[str] = []
+    candidate_tiers: List[str] = []
+    country_idx_counter: Dict[str, int] = {}
+    for code in sorted(primary_cands_by_country.keys()):
+        for n in primary_cands_by_country[code]:
+            idx = country_idx_counter.get(code, 0) + 1
+            country_idx_counter[code] = idx
+            candidate_links.append(rename_node(n, code, idx))
+            candidate_tiers.append("primary")
+    primary_cand_count = len(candidate_links)
+    for code in sorted(backfill_cands_by_country.keys()):
+        for n in backfill_cands_by_country[code]:
+            idx = country_idx_counter.get(code, 0) + 1
+            country_idx_counter[code] = idx
+            candidate_links.append(rename_node(n, code, idx))
+            candidate_tiers.append("backfill")
+
+    candidates_path = os.path.join(OUTPUT_DIR, os.path.basename(CANDIDATES_FILE))
+    _write_plain(candidates_path, candidate_links)
+    candidates_meta_path = os.path.join(OUTPUT_DIR, os.path.basename(CANDIDATES_META_FILE))
+    with open(candidates_meta_path, "w", encoding="utf-8") as mf:
+        json.dump(
+            {
+                "total": len(candidate_links),
+                "primary_count": primary_cand_count,
+                "backfill_count": len(candidate_links) - primary_cand_count,
+                "tiers": candidate_tiers,
+            },
+            mf,
+            indent=2,
+        )
+        mf.write("\n")
 
     # Xray 26+ FinalMask (fm=) mirror of servers.txt for v2rayN / v2rayNG. The
     # curated main set is mirrored verbatim: vless/trojan gain fm=, while
@@ -3741,9 +4294,7 @@ def write_all_outputs(
 
     country_report: Dict[str, Any] = {}
     for code in sorted(ALLOWED_COUNTRIES.keys()):
-        nodes = [
-            n for n in by_country.get(code, []) if is_main_pool_eligible(n)
-        ]
+        nodes = eligible_by_country[code]
         # countries/{CODE}.txt: numbered independently 01..20 per country.
         top_nodes = dedupe_by_pure_ip(nodes)[:COUNTRY_FILE_QUOTA]
         country_links = [
@@ -3805,6 +4356,7 @@ def write_all_outputs(
         "total_tested": total_tested,
         "total_passed": total_passed,
         "main_sub_count": main_count,
+        "candidates_count": len(candidate_links),
         "encrypted_sub": encrypted_sub,
         "countries": country_report,
         "operators": operator_report,
@@ -3948,7 +4500,9 @@ def write_step_summary(country_report: Dict[str, Any]) -> None:
     lines: List[str] = []
     lines.append("# 📊 BrickVPN Subscription Health Dashboard")
     lines.append("")
-    lines.append("| Country | Flag | Active / 5 | Avg Latency | Health |")
+    lines.append(
+        f"| Country | Flag | Active / {MAIN_QUOTA_PER_COUNTRY} | Avg Latency | Health |"
+    )
     lines.append("|---------|------|------------|-------------|--------|")
 
     for code in sorted(ALLOWED_COUNTRIES.keys()):
@@ -3963,7 +4517,9 @@ def write_step_summary(country_report: Dict[str, Any]) -> None:
             badge = "⚠️ Low"
         else:
             badge = "🚨 EMPTY"
-        lines.append(f"| {name} | {flag} | {count} / 5 | {avg_str} | {badge} |")
+        lines.append(
+            f"| {name} | {flag} | {count} / {MAIN_QUOTA_PER_COUNTRY} | {avg_str} | {badge} |"
+        )
 
     lines.append("")
     lines.append(
@@ -4045,6 +4601,7 @@ async def _main_impl() -> int:
             continue
         iran_ok, tags = classify_source_url(url)
         top_tier = is_top_iran_tier_url(url)
+        aistudio_feed = is_aistudio_url(url)
         links = extract_links(text)
         if is_openray_iran_feed(url):
             openray_iran_links.extend(links)
@@ -4061,7 +4618,11 @@ async def _main_impl() -> int:
             if top_tier:
                 top_iran_rank += 1
                 node.top_iran_tier = True
+                node.aistudio_only = False
                 node.openray_rank = top_iran_rank
+            elif aistudio_feed:
+                node.top_iran_tier = False
+                node.aistudio_only = True
             existing = by_key.get(node.key)
             if existing is not None:
                 _merge_provenance(existing, node)
@@ -4115,6 +4676,13 @@ async def _main_impl() -> int:
             print("[info] sing-box tunnel stage disabled (BRICK_DISABLE_SINGBOX_STAGE == 1)")
         _mark("singbox tunnel")
 
+        # --- Stage 5c: fail-open ipdata.co enrichment (ASN + trust_score) --
+        if passed:
+            enriched_count = await enrich_nodes_with_ipdata(session, passed)
+            if enriched_count:
+                print(f"[info] ipdata.co enriched {enriched_count} node(s)")
+        _mark("ipdata enrich")
+
         # --- Stage 5c: optional Xray tunnel verification (OFF by default) ---
         # The OpenRay inside-Iran feeds are already tunnel-checked upstream, and
         # batching them through Xray rejected whole VLESS/REALITY batches (17-24
@@ -4144,7 +4712,11 @@ async def _main_impl() -> int:
 
     for n in allowed:
         cc = n.country_code
-        if cc and cc in by_country:
+        ec = getattr(n, "exit_country", None)
+        if ec:
+            if ec in by_country:
+                by_country[ec].append(n)
+        elif cc and cc in by_country:
             by_country[cc].append(n)
         by_protocol[n.protocol].append(n)
 

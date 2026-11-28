@@ -291,7 +291,7 @@ class TestQuotaEnforcement(unittest.TestCase):
         try:
             nodes = []
             for i in range(20):
-                host = f"1.1.1.{i + 1}"
+                host = f"1.1.{i + 1}.1"
                 link = f"vless://uuid@{host}:443?security=tls&sni=a.example#n"
                 nodes.append(
                     collector.NodeInfo(
@@ -1194,7 +1194,7 @@ class TestSequentialNumbering(unittest.TestCase):
     def _build_nodes(self, count):
         nodes = []
         for i in range(count):
-            host = f"10.0.0.{i + 1}"
+            host = f"10.0.{i}.1"
             link = f"vless://uuid@{host}:443?security=tls&sni=example.com#node"
             node = collector.NodeInfo(
                 protocol="vless", host=host, port=443,
@@ -3308,13 +3308,14 @@ class TestOpenRayAndXrayBackfill(unittest.IsolatedAsyncioTestCase):
             top_nodes + other_verified, 7
         )
 
-        # All four working 169.40.42.* Reality nodes survive without /24 culling,
-        # interleaved with vless-tls nodes via protocol diversity round-robin.
+        # Strict /24 cap limits 169.40.42.0/24 to MAX_NODES_PER_SUBNET24 (2) and
+        # fills the remaining 5 slots with other_verified across distinct /24s.
         self.assertEqual(len(picked), 7)
-        for node in top_nodes:
-            self.assertIn(node, picked)
+        picked_169 = [n for n in picked if n in top_nodes]
+        self.assertEqual(len(picked_169), collector.MAX_NODES_PER_SUBNET24)
+        self.assertEqual(picked_169, [top_nodes[0], top_nodes[1]])
         self.assertEqual(
-            len([n for n in picked if n in other_verified]), 3
+            len([n for n in picked if n in other_verified]), 5
         )
 
     def test_iran_verified_ss_and_tls_vmess_eligible_while_xhttp_blocked(
@@ -3639,6 +3640,476 @@ class TestSingboxTunnelVerification(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res, [n_ok])
         self.assertTrue(n_ok.singbox_verified)
         self.assertEqual(n_ok.avg_latency_ms, 145)
+
+
+class TestStage1Upgrades(unittest.IsolatedAsyncioTestCase):
+    """Stage-1 hardening: SS-2022 guard, aistudio 20% cap, multi-origin probe,
+    exit-IP dedupe + /24 diversity, fail-open ipdata, candidates.txt, Active/10.
+    """
+
+    def test_ss2022_key_validation_and_enforcement(self):
+        k16 = base64.b64encode(b"0123456789abcdef").decode("ascii")
+        k32 = base64.b64encode(b"0123456789abcdef0123456789abcdef").decode("ascii")
+        k32_b = base64.b64encode(b"fedcba9876543210fedcba9876543210").decode("ascii")
+        bad_43 = k32[:43]  # 43-char malformed base64 like Singapore 08 | SS
+        urlsafe_16 = base64.urlsafe_b64encode(b"\xfb\xff" + b"a" * 14).decode("ascii")
+
+        self.assertTrue(collector.is_valid_ss2022_key("aes-256-gcm", "plainpw"))
+        self.assertTrue(collector.is_valid_ss2022_key("2022-blake3-aes-128-gcm", k16))
+        self.assertTrue(collector.is_valid_ss2022_key("2022-blake3-aes-128-gcm", f"{k16}:{k16}"))
+        self.assertTrue(collector.is_valid_ss2022_key("2022-blake3-aes-256-gcm", k32))
+        self.assertTrue(collector.is_valid_ss2022_key("2022-blake3-aes-256-gcm", f"{k32}:{k32_b}"))
+        self.assertTrue(collector.is_valid_ss2022_key("2022-blake3-chacha20-poly1305", k32))
+
+        self.assertFalse(collector.is_valid_ss2022_key("2022-blake3-aes-128-gcm", bad_43))
+        self.assertFalse(collector.is_valid_ss2022_key("2022-blake3-aes-128-gcm", k32))
+        self.assertFalse(collector.is_valid_ss2022_key("2022-blake3-aes-128-gcm", urlsafe_16))
+        self.assertFalse(collector.is_valid_ss2022_key("2022-blake3-aes-256-gcm", k16))
+        self.assertFalse(collector.is_valid_ss2022_key("2022-blake3-chacha20-poly1305", f"{k32}:{k32_b}"))
+        self.assertFalse(collector.is_valid_ss2022_key("2022-blake3-unknown", k32))
+
+        bad_link = f"ss://2022-blake3-aes-256-gcm:{bad_43}@8.8.4.4:8388#badss"
+        self.assertIsNone(collector.parse_node_info(bad_link))
+        fake_bad = collector.NodeInfo(
+            protocol="ss", host="8.8.4.4", port=8388, original_link=bad_link,
+            raw_link=bad_link, iran_verified=True,
+        )
+        self.assertFalse(collector.is_main_pool_eligible(fake_bad))
+        self.assertIsNone(collector.build_singbox_outbound_for_node(fake_bad, "tag"))
+
+        good_link = f"ss://2022-blake3-aes-128-gcm:{k16}@8.8.4.4:8388#okss"
+        parsed_ok = collector.parse_node_info(good_link)
+        self.assertIsNotNone(parsed_ok)
+        parsed_ok.iran_verified = True
+        self.assertTrue(collector.is_main_pool_eligible(parsed_ok))
+        self.assertIsNotNone(collector.build_singbox_outbound_for_node(parsed_ok, "tag"))
+
+    def test_aistudio_secondary_classification_and_20_percent_cap(self):
+        base = "https://raw.githubusercontent.com/sakha1370/OpenRay/refs/heads/main/"
+        self.assertTrue(collector.is_top_iran_tier_url(f"{base}output_iran/iran_top100_checked.txt"))
+        self.assertTrue(collector.is_top_iran_tier_url(f"{base}output_iran/mci_top100.txt"))
+        self.assertTrue(collector.is_top_iran_tier_url(f"{base}output_iran/irancell_top100.txt"))
+        self.assertFalse(collector.is_top_iran_tier_url(f"{base}output/site_access/aistudio_iran_verified.txt"))
+        self.assertTrue(collector.is_aistudio_url(f"{base}output/site_access/aistudio_iran_verified.txt"))
+
+        ai_node = collector.parse_node_info("vless://u@10.1.0.1:443?security=tls&sni=a.example#a")
+        ai_node.aistudio_only = True
+        primary_node = collector.parse_node_info("vless://u@10.1.0.1:443?security=tls&sni=a.example#b")
+        primary_node.top_iran_tier = True
+        collector._merge_provenance(ai_node, primary_node)
+        self.assertTrue(ai_node.top_iran_tier)
+        self.assertFalse(ai_node.aistudio_only)
+
+        nodes = []
+        for i in range(10):
+            n = collector.NodeInfo(
+                protocol="vless", host=f"10.10.{i}.1", port=443, tls_enabled=True,
+                sni="a.example", network="ws", security="tls",
+                original_link=f"vless://u@10.10.{i}.1:443?security=tls&sni=a.example&type=ws#ai{i}",
+                raw_link=f"vless://u@10.10.{i}.1:443?security=tls&sni=a.example&type=ws#ai{i}",
+                resolved_ip=f"10.10.{i}.1", exit_ip=f"10.10.{i}.1",
+                country_code="DE", avg_latency_ms=20 + i, quality_score=20.0 + i,
+                singbox_verified=True, aistudio_only=True,
+            )
+            nodes.append(n)
+        for i in range(8):
+            n = collector.NodeInfo(
+                protocol="vless", host=f"10.20.{i}.1", port=443, tls_enabled=True,
+                sni="b.example", network="ws", security="tls",
+                original_link=f"vless://u@10.20.{i}.1:443?security=tls&sni=b.example&type=ws#pr{i}",
+                raw_link=f"vless://u@10.20.{i}.1:443?security=tls&sni=b.example&type=ws#pr{i}",
+                resolved_ip=f"10.20.{i}.1", exit_ip=f"10.20.{i}.1",
+                country_code="DE", avg_latency_ms=200 + i, quality_score=200.0 + i,
+                singbox_verified=True, aistudio_only=False, top_iran_tier=True,
+            )
+            nodes.append(n)
+
+        picked = collector.select_diverse_top_nodes(nodes, quota=10)
+        self.assertEqual(len(picked), 10)
+        ai_picked = [n for n in picked if n.aistudio_only]
+        self.assertLessEqual(len(ai_picked), 2)
+        self.assertEqual(len(ai_picked), 2)
+        self.assertEqual(len([n for n in picked if not n.aistudio_only]), 8)
+
+    async def test_probe_singbox_port_multi_origin_strict_tls_and_retag(self):
+        class _FakeResp:
+            def __init__(self, status, body):
+                self.status = status
+                self._body = body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                return False
+
+            async def text(self, errors="replace"):
+                return self._body.decode("utf-8", errors=errors) if isinstance(self._body, bytes) else self._body
+
+            async def read(self):
+                return self._body if isinstance(self._body, bytes) else self._body.encode("utf-8")
+
+        class _FakeSession:
+            def __init__(self, routes):
+                self.routes = routes
+                self.calls = []
+
+            def get(self, url, **kwargs):
+                self.calls.append((url, kwargs))
+                return self.routes[url]
+
+        # Happy path: GB entry exits in NL, 30KB payload, ipify mismatches -> consistent=False
+        n1 = collector.NodeInfo(protocol="ss", host="1.2.3.4", port=8080, country_code="GB")
+        sess1 = _FakeSession({
+            collector.SINGBOX_TRACE_URL: _FakeResp(200, "ip=198.51.100.7\nloc=nl\n"),
+            collector.SINGBOX_PAYLOAD_URL: _FakeResp(200, b"X" * 30_000),
+            collector.SINGBOX_IPIFY_URL: _FakeResp(200, "203.0.113.99"),
+        })
+        self.assertTrue(await collector._probe_singbox_port(sess1, 1080, n1))
+        self.assertEqual(n1.exit_ip, "198.51.100.7")
+        self.assertEqual(n1.exit_country, "NL")
+        self.assertEqual(n1.country_code, "NL")
+        self.assertEqual(n1.country_name, "Netherlands")
+        self.assertFalse(n1.exit_ip_consistent)
+        self.assertTrue(n1.singbox_verified)
+        for _url, kw in sess1.calls:
+            self.assertIs(kw.get("ssl"), collector._STRICT_TLS_CTX)
+
+        # Blocked exit country IR rejected
+        n2 = collector.NodeInfo(protocol="ss", host="1.2.3.5", port=8080)
+        sess2 = _FakeSession({
+            collector.SINGBOX_TRACE_URL: _FakeResp(200, "ip=5.5.5.5\nloc=IR\n"),
+        })
+        self.assertFalse(await collector._probe_singbox_port(sess2, 1080, n2))
+
+        # Small/204 payload rejected
+        n3 = collector.NodeInfo(protocol="ss", host="1.2.3.6", port=8080)
+        sess3 = _FakeSession({
+            collector.SINGBOX_TRACE_URL: _FakeResp(200, "ip=198.51.100.8\nloc=DE\n"),
+            collector.SINGBOX_PAYLOAD_URL: _FakeResp(200, b"small"),
+        })
+        self.assertFalse(await collector._probe_singbox_port(sess3, 1080, n3))
+
+        # ipify 429 fails open (exit_ip_consistent stays True)
+        n4 = collector.NodeInfo(protocol="ss", host="1.2.3.7", port=8080)
+        sess4 = _FakeSession({
+            collector.SINGBOX_TRACE_URL: _FakeResp(200, "ip=198.51.100.9\nloc=DE\n"),
+            collector.SINGBOX_PAYLOAD_URL: _FakeResp(200, b"Y" * 26_000),
+            collector.SINGBOX_IPIFY_URL: _FakeResp(429, "rate limit"),
+        })
+        self.assertTrue(await collector._probe_singbox_port(sess4, 1080, n4))
+        self.assertTrue(n4.exit_ip_consistent)
+
+    def test_exit_ip_dedupe_and_entry_exit_subnet24_cap(self):
+        nodes = []
+        for i in range(4):
+            nodes.append(collector.NodeInfo(
+                protocol="vless", host=f"10.50.{i}.1", port=443, tls_enabled=True,
+                sni="a.example", network="ws", security="tls",
+                original_link=f"vless://u@10.50.{i}.1:443?security=tls&sni=a.example&type=ws#d{i}",
+                raw_link=f"vless://u@10.50.{i}.1:443?security=tls&sni=a.example&type=ws#d{i}",
+                resolved_ip=f"10.50.{i}.1", exit_ip="198.51.100.5",
+                country_code="DE", avg_latency_ms=80 - (i * 10), quality_score=80.0 - (i * 10),
+                singbox_verified=True,
+            ))
+        for i in range(4):
+            nodes.append(collector.NodeInfo(
+                protocol="vless", host=f"10.60.{i}.1", port=443, tls_enabled=True,
+                sni="b.example", network="ws", security="tls",
+                original_link=f"vless://u@10.60.{i}.1:443?security=tls&sni=b.example&type=ws#x{i}",
+                raw_link=f"vless://u@10.60.{i}.1:443?security=tls&sni=b.example&type=ws#x{i}",
+                resolved_ip=f"10.60.{i}.1", exit_ip=f"203.0.113.{10 + i}",
+                country_code="DE", avg_latency_ms=100 + i, quality_score=100.0 + i,
+                singbox_verified=True,
+            ))
+
+        deduped = collector.dedupe_by_exit_ip(nodes)
+        same_exit = [n for n in deduped if n.exit_ip == "198.51.100.5"]
+        self.assertEqual(len(same_exit), 1)
+        self.assertEqual(same_exit[0].avg_latency_ms, 50)
+
+        selected = collector.select_diverse_top_nodes(nodes, quota=10)
+        from_203 = [n for n in selected if n.exit_ip.startswith("203.0.113.")]
+        self.assertEqual(len(from_203), collector.MAX_NODES_PER_SUBNET24)
+        self.assertEqual(len(selected), 3)  # 1 from 198.51.100.5 + 2 from 203.0.113.0/24
+
+    async def test_ipdata_enrichment_fail_open_cache_and_soft_tiebreak(self):
+        tmp = tempfile.mkdtemp()
+        cache_file = os.path.join(tmp, "ipdata_cache.json")
+        n_a = collector.NodeInfo(protocol="vless", host="10.0.1.1", port=443, exit_ip="198.51.100.1", avg_latency_ms=120, quality_score=120.0, singbox_verified=True)
+        n_b = collector.NodeInfo(protocol="vless", host="10.0.2.1", port=443, exit_ip="198.51.100.2", avg_latency_ms=150, quality_score=150.0, singbox_verified=True)
+        try:
+            # No API key -> complete no-op
+            with mock.patch.dict(os.environ, {"IPDATA_API_KEY": ""}, clear=False), \
+                 mock.patch.object(collector, "IPDATA_CACHE_PATH", cache_file):
+                self.assertEqual(await collector.enrich_nodes_with_ipdata(None, [n_a, n_b]), 0)
+            self.assertIsNone(n_a.trust_score)
+
+            class _FakeIpdataResp:
+                def __init__(self, status, payload):
+                    self.status = status
+                    self._payload = payload
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *args):
+                    return False
+
+                async def json(self, content_type=None):
+                    return self._payload
+
+            calls = []
+
+            class _FakeIpdataSess:
+                def get(self, url, **kwargs):
+                    calls.append(url)
+                    if "198.51.100.1" in url:
+                        return _FakeIpdataResp(200, {"asn": {"asn": "AS1", "route": "198.51.100.0/24"}, "threat": {"scores": {"trust_score": 10}}})
+                    return _FakeIpdataResp(200, {"asn": {"asn": "AS2", "route": "198.51.100.0/24"}, "threat": {"scores": {"trust_score": 90}}})
+
+            with mock.patch.dict(os.environ, {"IPDATA_API_KEY": "test-placeholder-key"}, clear=False), \
+                 mock.patch.object(collector, "IPDATA_CACHE_PATH", cache_file):
+                enriched = await collector.enrich_nodes_with_ipdata(_FakeIpdataSess(), [n_a, n_b])
+            self.assertEqual(enriched, 2)
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(n_a.exit_asn, "AS1")
+            self.assertEqual(n_a.trust_score, 10)
+            self.assertEqual(n_b.trust_score, 90)
+            # Soft tiebreak: 150 - 180 = -30 < 120 - 20 = 100
+            self.assertLess(collector._singbox_rank_key(n_b, 1), collector._singbox_rank_key(n_a, 0))
+            # Re-running uses cache without additional HTTP lookups
+            with mock.patch.dict(os.environ, {"IPDATA_API_KEY": "test-placeholder-key"}, clear=False), \
+                 mock.patch.object(collector, "IPDATA_CACHE_PATH", cache_file):
+                enriched2 = await collector.enrich_nodes_with_ipdata(_FakeIpdataSess(), [n_a, n_b])
+            self.assertEqual(enriched2, 2)
+            self.assertEqual(len(calls), 2)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_min_country_nodes_candidates_and_step_summary_active_10(self):
+        tmp = tempfile.mkdtemp()
+        summary_file = os.path.join(tmp, "summary.md")
+        patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", tmp),
+            mock.patch.object(collector, "COUNTRIES_DIR", os.path.join(tmp, "countries")),
+            mock.patch.object(collector, "PROTOCOLS_DIR", os.path.join(tmp, "protocols")),
+            mock.patch.object(collector, "SERVERS_FILE", os.path.join(tmp, "servers.txt")),
+            mock.patch.object(collector, "SUB_FILE", os.path.join(tmp, "sub.txt")),
+            mock.patch.object(collector, "CANDIDATES_FILE", os.path.join(tmp, "candidates.txt")),
+            mock.patch.object(collector, "STATUS_FILE", os.path.join(tmp, "status.json")),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            def _mk(code, count):
+                out = []
+                for i in range(count):
+                    ip = f"172.{list(collector.ALLOWED_COUNTRIES).index(code) + 1}.{i}.1"
+                    link = f"vless://u@{ip}:443?security=tls&sni=a.example&type=ws#x"
+                    out.append(collector.NodeInfo(
+                        protocol="vless", host=ip, port=443, tls_enabled=True,
+                        sni="a.example", network="ws", security="tls",
+                        original_link=link, raw_link=link, resolved_ip=ip,
+                        exit_ip=ip, exit_country=code, country_code=code,
+                        avg_latency_ms=50 + i, quality_score=50.0 + i, singbox_verified=True,
+                    ))
+                return out
+
+            # 3 countries >= 2 (DE, NL, US) + 1 thin country (SG=1) + unsupported exit in GB bucket
+            bad_exit = collector.NodeInfo(
+                protocol="vless", host="172.99.1.1", port=443, tls_enabled=True,
+                sni="a.example", network="ws", security="tls",
+                original_link="vless://u@172.99.1.1:443?security=tls&sni=a.example#jp",
+                raw_link="vless://u@172.99.1.1:443?security=tls&sni=a.example#jp",
+                resolved_ip="172.99.1.1", exit_ip="198.51.100.77", exit_country="JP",
+                country_code="GB", avg_latency_ms=20, quality_score=20.0, singbox_verified=True,
+            )
+            by_country = {
+                "DE": _mk("DE", 3),
+                "NL": _mk("NL", 3),
+                "US": _mk("US", 3),
+                "SG": _mk("SG", 1),
+                "GB": [bad_exit],
+            }
+            report = collector.write_all_outputs(by_country, {}, total_tested=11, total_passed=10)
+            with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+                srv = f.read().splitlines()
+            self.assertEqual(len(srv), 9)
+            self.assertFalse(any("Singapore" in ln for ln in srv))
+            self.assertFalse(any("172.99.1.1" in ln for ln in srv))
+            self.assertEqual(report["countries"]["SG"]["status"], "low")
+            self.assertTrue(os.path.exists(os.path.join(collector.COUNTRIES_DIR, "SG.txt")))
+            self.assertTrue(os.path.exists(collector.CANDIDATES_FILE))
+            with open(collector.CANDIDATES_FILE, encoding="utf-8") as f:
+                cands = f.read().splitlines()
+            self.assertEqual(len(cands), 9)
+            self.assertEqual(report["candidates_count"], 9)
+
+            with mock.patch.dict(os.environ, {"GITHUB_STEP_SUMMARY": summary_file}, clear=False):
+                collector.write_step_summary(report["countries"])
+            with open(summary_file, encoding="utf-8") as f:
+                md = f.read()
+            self.assertIn("Active / 10", md)
+            self.assertIn("3 / 10", md)
+            self.assertNotIn("/ 5", md)
+        finally:
+            for p in patches:
+                p.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_merge_provenance_aistudio_only_uses_and_when_non_top_source_present(self):
+        ai = collector.parse_node_info("vless://u@10.2.0.1:443?security=tls&sni=a.example#ai")
+        ai.aistudio_only = True
+        ai.top_iran_tier = False
+        generic = collector.parse_node_info("vless://u@10.2.0.1:443?security=tls&sni=a.example#gen")
+        generic.aistudio_only = False
+        generic.top_iran_tier = False
+        collector._merge_provenance(ai, generic)
+        self.assertFalse(ai.aistudio_only)
+
+        ai_1 = collector.parse_node_info("vless://u@10.2.0.2:443?security=tls&sni=a.example#a1")
+        ai_1.aistudio_only = True
+        ai_2 = collector.parse_node_info("vless://u@10.2.0.2:443?security=tls&sni=a.example#a2")
+        ai_2.aistudio_only = True
+        collector._merge_provenance(ai_1, ai_2)
+        self.assertTrue(ai_1.aistudio_only)
+
+    def test_thin_country_backfill_to_six_and_rich_candidates_pool(self):
+        tmp = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", tmp),
+            mock.patch.object(collector, "COUNTRIES_DIR", os.path.join(tmp, "countries")),
+            mock.patch.object(collector, "PROTOCOLS_DIR", os.path.join(tmp, "protocols")),
+            mock.patch.object(collector, "SERVERS_FILE", os.path.join(tmp, "servers.txt")),
+            mock.patch.object(collector, "SUB_FILE", os.path.join(tmp, "sub.txt")),
+            mock.patch.object(collector, "CANDIDATES_FILE", os.path.join(tmp, "candidates.txt")),
+            mock.patch.object(collector, "STATUS_FILE", os.path.join(tmp, "status.json")),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            # 2 primary nodes + 10 aistudio_only nodes across distinct /24s
+            nodes = []
+            for i in range(2):
+                ip = f"172.30.{i}.1"
+                nodes.append(collector.NodeInfo(
+                    protocol="vless", host=ip, port=443, tls_enabled=True,
+                    sni="a.example", network="ws", security="tls",
+                    original_link=f"vless://u@{ip}:443?security=tls&sni=a.example&type=ws#p{i}",
+                    raw_link=f"vless://u@{ip}:443?security=tls&sni=a.example&type=ws#p{i}",
+                    resolved_ip=ip, exit_ip=ip, exit_country="DE", country_code="DE",
+                    avg_latency_ms=100 + i, quality_score=100.0 + i,
+                    singbox_verified=True, top_iran_tier=True, aistudio_only=False,
+                ))
+            for i in range(10):
+                ip = f"172.31.{i}.1"
+                nodes.append(collector.NodeInfo(
+                    protocol="vless", host=ip, port=443, tls_enabled=True,
+                    sni="b.example", network="ws", security="tls",
+                    original_link=f"vless://u@{ip}:443?security=tls&sni=b.example&type=ws#a{i}",
+                    raw_link=f"vless://u@{ip}:443?security=tls&sni=b.example&type=ws#a{i}",
+                    resolved_ip=ip, exit_ip=ip, exit_country="DE", country_code="DE",
+                    avg_latency_ms=50 + i, quality_score=50.0 + i,
+                    singbox_verified=True, top_iran_tier=False, aistudio_only=True,
+                ))
+            collector.write_all_outputs({"DE": nodes}, {}, total_tested=12, total_passed=12)
+            with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+                srv = f.read().splitlines()
+            with open(collector.CANDIDATES_FILE, encoding="utf-8") as f:
+                cands = f.read().splitlines()
+            # servers.txt backfills thin DE from 4 (2 primary + 2) up to 6 with /24 diversity
+            self.assertEqual(len(srv), 6)
+            # First two slots prioritize primary nodes over faster aistudio_only
+            self.assertIn("172.30.0.1", srv[0])
+            self.assertIn("172.30.1.1", srv[1])
+            # candidates.txt keeps rich 12 unique-exit nodes (no artificial 20% cutoff)
+            self.assertEqual(len(cands), 12)
+        finally:
+            for p in patches:
+                p.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_candidates_retains_clustered_primary_while_sub_caps_24_and_reality_has_fragment(self):
+        real_link = (
+            f"vless://11111111-2222-3333-4444-555555555555@169.40.42.10:443"
+            f"?security=reality&sni=www.apple.com&pbk={REALITY_PBK}&sid={REALITY_SID}&type=tcp#r"
+        )
+        real_node = collector.parse_node_info(real_link)
+        real_node.iran_verified = True
+        ob_real = collector.build_singbox_outbound_for_node(real_node, "tag-r")
+        self.assertIsNotNone(ob_real)
+        self.assertTrue(ob_real["tls"].get("fragment"))
+        self.assertTrue(ob_real["tls"].get("record_fragment"))
+        self.assertEqual(ob_real["tls"].get("fragment_fallback_delay"), "500ms")
+
+        tmp = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(collector, "OUTPUT_DIR", tmp),
+            mock.patch.object(collector, "COUNTRIES_DIR", os.path.join(tmp, "countries")),
+            mock.patch.object(collector, "PROTOCOLS_DIR", os.path.join(tmp, "protocols")),
+            mock.patch.object(collector, "SERVERS_FILE", os.path.join(tmp, "servers.txt")),
+            mock.patch.object(collector, "SUB_FILE", os.path.join(tmp, "sub.txt")),
+            mock.patch.object(collector, "CANDIDATES_FILE", os.path.join(tmp, "candidates.txt")),
+            mock.patch.object(collector, "CANDIDATES_META_FILE", os.path.join(tmp, "candidates_meta.json")),
+            mock.patch.object(collector, "STATUS_FILE", os.path.join(tmp, "status.json")),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            # 5 primary nodes clustered in 172.40.0.0/24 + 2 distinct primary + 3 aistudio_only
+            nodes = []
+            for i in range(5):
+                ip = f"172.40.0.{10 + i}"
+                nodes.append(collector.NodeInfo(
+                    protocol="vless", host=ip, port=443, tls_enabled=True,
+                    sni="a.example", network="ws", security="tls",
+                    original_link=f"vless://u@{ip}:443?security=tls&sni=a.example&type=ws#c{i}",
+                    raw_link=f"vless://u@{ip}:443?security=tls&sni=a.example&type=ws#c{i}",
+                    resolved_ip=ip, exit_ip=ip, exit_country="DE", country_code="DE",
+                    avg_latency_ms=40 + i, quality_score=40.0 + i,
+                    singbox_verified=True, top_iran_tier=True, aistudio_only=False,
+                ))
+            for i in range(2):
+                ip = f"172.41.{i}.1"
+                nodes.append(collector.NodeInfo(
+                    protocol="ss", host=ip, port=8080, tls_enabled=False,
+                    original_link=f"ss://aes-256-gcm:pw@{ip}:8080#s{i}",
+                    raw_link=f"ss://aes-256-gcm:pw@{ip}:8080#s{i}",
+                    resolved_ip=ip, exit_ip=ip, exit_country="DE", country_code="DE",
+                    avg_latency_ms=80 + i, quality_score=80.0 + i,
+                    singbox_verified=True, iran_verified=True, top_iran_tier=True, aistudio_only=False,
+                ))
+            for i in range(3):
+                ip = f"172.42.{i}.1"
+                nodes.append(collector.NodeInfo(
+                    protocol="vless", host=ip, port=443, tls_enabled=True,
+                    sni="b.example", network="ws", security="tls",
+                    original_link=f"vless://u@{ip}:443?security=tls&sni=b.example&type=ws#ai{i}",
+                    raw_link=f"vless://u@{ip}:443?security=tls&sni=b.example&type=ws#ai{i}",
+                    resolved_ip=ip, exit_ip=ip, exit_country="DE", country_code="DE",
+                    avg_latency_ms=30 + i, quality_score=30.0 + i,
+                    singbox_verified=True, top_iran_tier=False, aistudio_only=True,
+                ))
+            collector.write_all_outputs({"DE": nodes}, {}, total_tested=10, total_passed=10)
+            with open(collector.SERVERS_FILE, encoding="utf-8") as f:
+                srv = f.read().splitlines()
+            with open(collector.CANDIDATES_FILE, encoding="utf-8") as f:
+                cands = f.read().splitlines()
+            with open(collector.CANDIDATES_META_FILE, encoding="utf-8") as mf:
+                meta = json.load(mf)
+            # sub.txt enforces max 2 nodes in 172.40.0.0/24
+            self.assertEqual(sum(1 for ln in srv if "172.40.0." in ln), 2)
+            # candidates.txt keeps all 7 clustered+diverse primary nodes BEFORE 3 aistudio_only backfill
+            self.assertEqual(len(cands), 10)
+            self.assertEqual(meta["primary_count"], 7)
+            self.assertEqual(meta["tiers"][:7], ["primary"] * 7)
+            self.assertEqual(meta["tiers"][7:], ["backfill"] * 3)
+            self.assertFalse(any("172.42." in ln for ln in cands[:7]))
+        finally:
+            for p in patches:
+                p.stop()
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

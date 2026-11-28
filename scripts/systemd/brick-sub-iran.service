@@ -1,0 +1,15 @@
+[Unit]
+Description=BrickVPN Stage-2 inside-Iran wlan0 verification & tunnel-isolated publisher
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/Documents/Code/brick-sub-collector
+EnvironmentFile=%h/.config/brick-sub-collector.env
+ExecStart=/usr/bin/python3 %h/Documents/Code/brick-sub-collector/scripts/iran_verify_publish.py --interface wlan0 --output-dir output_iran --publish
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

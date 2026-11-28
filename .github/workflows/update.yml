@@ -41,6 +41,7 @@ jobs:
           GITHUB_ACTIONS: "true"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRICK_SUB_AES_KEY: ${{ secrets.BRICK_SUB_AES_KEY }}
+          IPDATA_API_KEY: ${{ secrets.IPDATA_API_KEY }}
         run: python collector.py
       - name: Publish generated files to the subscription branch
         env:
@@ -61,6 +62,9 @@ jobs:
           if [ -f output/sub_enc.txt ]; then
             cp output/sub_enc.txt "$PUBLISH_DIR"/sub_enc.txt
           fi
+          if [ -f output/candidates.txt ]; then
+            cp output/candidates.txt "$PUBLISH_DIR"/candidates.txt
+          fi
           # Xray 26+ FinalMask (fm=) mirrors for v2rayN / v2rayNG.
           for frag in servers_xray_frag.txt sub_xray_frag.txt; do
             if [ -f "output/$frag" ]; then
@@ -74,6 +78,7 @@ jobs:
           git add -A
           # Operator scoped subscriptions (operators/) ship with the rest.
           git add -A operators 2>/dev/null || true
+          git add -A candidates.txt 2>/dev/null || true
           git add -A sub_enc.txt 2>/dev/null || true
           # Xray FinalMask mirrors ship alongside the plain subscription.
           git add -A servers_xray_frag.txt sub_xray_frag.txt 2>/dev/null || true

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run BrickVPN inside-Iran Stage-2 verifier every 12 hours with jitter
+
+[Timer]
+OnCalendar=*-*-* 00/12:00:00
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
